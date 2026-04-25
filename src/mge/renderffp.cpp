@@ -220,9 +220,10 @@ void DistantLand::renderDistantStaticsFFP() {
     device->SetRenderState(D3DRS_ALPHAREF, 128);
     device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
 
-    // Z-buffer
+    // Z-buffer — push distant statics behind Morrowind's near geometry
     device->SetRenderState(D3DRS_ZENABLE, TRUE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&kDistantZBias);
 
     // Render each visible static
     IDirect3DTexture9* lastTex = nullptr;
