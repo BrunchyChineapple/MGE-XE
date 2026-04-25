@@ -3,6 +3,10 @@
 #include "dlmath.h"
 #include "memorypool.h"
 #include <vector>
+#ifdef MGE_RTX
+#include <unordered_set>
+#include <unordered_map>
+#endif
 
 
 
@@ -65,26 +69,49 @@ public:
     void RemoveAll();
 
 #ifdef MGE_RTX
-    // Merge current visible set with previous frame's set.
-    // Meshes from the previous frame are retained even if they're no longer
-    // in the current frustum, preventing pop-out flicker with Remix.
-    void RetainPrevious() {
-        if (previous_set.empty()) return;
-        // Add any mesh from previous that isn't in current
-        for (const auto* mesh : previous_set) {
-            bool found = false;
-            for (const auto* cur : visible_set) {
-                if (cur == mesh) { found = true; break; }
+    // TTL-based retention: meshes that leave the frustum are kept for a few
+    // frames before being removed, preventing pop-out flicker with Remix.
+    // TTL is in frames — meshes get this many frames of grace after leaving.
+    static constexpr int RTX_MESH_TTL = 3;
+
+    void RetainWithTTL() {
+        // Build a set of currently visible meshes for fast lookup
+        std::unordered_set<const QuadTreeMesh*> currentSet(visible_set.begin(), visible_set.end());
+
+        // Update TTL for retained meshes
+        auto it = retained.begin();
+        while (it != retained.end()) {
+            if (currentSet.count(it->first)) {
+                // Mesh is still visible — reset TTL, don't need to retain it
+                it = retained.erase(it);
+            } else {
+                // Mesh left the frustum — decrement TTL
+                it->second--;
+                if (it->second <= 0) {
+                    // TTL expired — remove
+                    it = retained.erase(it);
+                } else {
+                    // Still has TTL — add to visible set
+                    visible_set.push_back(it->first);
+                    ++it;
+                }
             }
-            if (!found) {
+        }
+
+        // Add newly departed meshes to retention (meshes in previous but not current)
+        for (const auto* mesh : previous_visible) {
+            if (!currentSet.count(mesh) && !retained.count(mesh)) {
+                retained[mesh] = RTX_MESH_TTL;
                 visible_set.push_back(mesh);
             }
         }
+
+        // Save current visible set (before retention additions) for next frame
+        previous_visible.assign(currentSet.begin(), currentSet.end());
     }
-    void SaveCurrent() {
-        previous_set = visible_set;
-    }
-    std::vector<const QuadTreeMesh*> previous_set;
+
+    std::unordered_map<const QuadTreeMesh*, int> retained;
+    std::vector<const QuadTreeMesh*> previous_visible;
 #endif
 
     size_t size() const {

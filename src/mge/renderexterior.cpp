@@ -86,12 +86,7 @@ void DistantLand::renderSky() {
 
 void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     D3DXMATRIX world, viewproj = (*view) * (*proj);
-#ifdef MGE_RTX
-    // Extend draw distance margin for temporal stability
-    D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize * 1.1f);
-#else
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
-#endif
 
     D3DXMatrixIdentity(&world);
     effect->SetMatrix(ehWorld, &world);
@@ -102,24 +97,14 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
     e->CommitChanges();
 
     // Cull and draw
-#ifdef MGE_RTX
-    // Widen culling frustum for temporal stability with Remix
-    D3DXMATRIX wideProj = *proj;
-    wideProj._11 *= 0.8f;
-    wideProj._22 *= 0.8f;
-    D3DXMATRIX wideViewproj = (*view) * wideProj;
-    ViewFrustum frustum(&wideViewproj);
-#else
     ViewFrustum frustum(&viewproj);
-#endif
     visLand.RemoveAll();
     LandQuadTree.GetVisibleMeshes(frustum, viewsphere, visLand);
 #ifdef MGE_RTX
     // Sort and retain for temporal stability
     visLand.SortByState();
-    visLand.RetainPrevious();
+    visLand.RetainWithTTL();
     visLand.SortByState();
-    visLand.SaveCurrent();
 #endif
 
     device->SetVertexDeclaration(LandDecl);
@@ -146,69 +131,38 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
 
     visDistant.RemoveAll();
 
-#ifdef MGE_RTX
-    // RTX Remix temporal stability: widen culling bounds.
-    // Frustum is widened by 25% and distance extended by 10% so meshes at
-    // boundaries don't pop in/out with small camera movements.
-    D3DXMATRIX wideCullProj = ds_proj;
-    wideCullProj._11 *= 0.8f;
-    wideCullProj._22 *= 0.8f;
-    const float rtxDistMargin = 1.1f;
-#else
-    const float rtxDistMargin = 1.0f;
-#endif
-
     zf = std::min(Configuration.DL.NearStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
         editProjectionZ(&ds_proj, zn, zf);
-#ifdef MGE_RTX
-        D3DXMATRIX wideCullProjZ = wideCullProj;
-        editProjectionZ(&wideCullProjZ, zn, zf);
-        ds_viewproj = (*view) * wideCullProjZ;
-#else
         ds_viewproj = (*view) * ds_proj;
-#endif
         ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf * rtxDistMargin;
+        viewsphere.w = zf;
         currentWorldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
     }
 
     zf = std::min(Configuration.DL.FarStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
         editProjectionZ(&ds_proj, zn, zf);
-#ifdef MGE_RTX
-        D3DXMATRIX wideCullProjZ = wideCullProj;
-        editProjectionZ(&wideCullProjZ, zn, zf);
-        ds_viewproj = (*view) * wideCullProjZ;
-#else
         ds_viewproj = (*view) * ds_proj;
-#endif
         ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf * rtxDistMargin;
+        viewsphere.w = zf;
         currentWorldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
     }
 
     zf = std::min(Configuration.DL.VeryFarStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
         editProjectionZ(&ds_proj, zn, zf);
-#ifdef MGE_RTX
-        D3DXMATRIX wideCullProjZ = wideCullProj;
-        editProjectionZ(&wideCullProjZ, zn, zf);
-        ds_viewproj = (*view) * wideCullProjZ;
-#else
         ds_viewproj = (*view) * ds_proj;
-#endif
         ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf * rtxDistMargin;
+        viewsphere.w = zf;
         currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
     }
 
     visDistant.SortByState();
 #ifdef MGE_RTX
-    // Retain meshes from previous frame to prevent pop-out flicker
-    visDistant.RetainPrevious();
-    visDistant.SortByState();  // Re-sort after merge
-    visDistant.SaveCurrent();
+    // TTL-based retention: keep recently-departed meshes for a few frames
+    visDistant.RetainWithTTL();
+    visDistant.SortByState();  // Re-sort after adding retained meshes
 #endif
 }
 
