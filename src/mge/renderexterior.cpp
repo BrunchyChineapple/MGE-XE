@@ -97,7 +97,16 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
     e->CommitChanges();
 
     // Cull and draw
+#ifdef MGE_RTX
+    // Widen culling frustum for temporal stability with Remix
+    D3DXMATRIX wideProj = *proj;
+    wideProj._11 *= 0.8f;
+    wideProj._22 *= 0.8f;
+    D3DXMATRIX wideViewproj = (*view) * wideProj;
+    ViewFrustum frustum(&wideViewproj);
+#else
     ViewFrustum frustum(&viewproj);
+#endif
     visLand.RemoveAll();
     LandQuadTree.GetVisibleMeshes(frustum, viewsphere, visLand);
 
@@ -125,10 +134,26 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
 
     visDistant.RemoveAll();
 
+#ifdef MGE_RTX
+    // Widen the culling frustum for RTX Remix temporal stability.
+    // Meshes at frustum edges pop in/out with small camera movements, causing
+    // Remix's temporal denoiser to see them as new geometry each frame (flicker).
+    // Scaling the projection by 0.8 effectively widens the FOV by ~25% for culling only.
+    D3DXMATRIX wideCullProj = ds_proj;
+    wideCullProj._11 *= 0.8f;  // Widen horizontal FOV
+    wideCullProj._22 *= 0.8f;  // Widen vertical FOV
+#endif
+
     zf = std::min(Configuration.DL.NearStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
         editProjectionZ(&ds_proj, zn, zf);
+#ifdef MGE_RTX
+        D3DXMATRIX wideCullProjZ = wideCullProj;
+        editProjectionZ(&wideCullProjZ, zn, zf);
+        ds_viewproj = (*view) * wideCullProjZ;
+#else
         ds_viewproj = (*view) * ds_proj;
+#endif
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
         currentWorldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
@@ -137,7 +162,13 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     zf = std::min(Configuration.DL.FarStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
         editProjectionZ(&ds_proj, zn, zf);
+#ifdef MGE_RTX
+        D3DXMATRIX wideCullProjZ = wideCullProj;
+        editProjectionZ(&wideCullProjZ, zn, zf);
+        ds_viewproj = (*view) * wideCullProjZ;
+#else
         ds_viewproj = (*view) * ds_proj;
+#endif
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
         currentWorldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
@@ -146,7 +177,13 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     zf = std::min(Configuration.DL.VeryFarStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
         editProjectionZ(&ds_proj, zn, zf);
+#ifdef MGE_RTX
+        D3DXMATRIX wideCullProjZ = wideCullProj;
+        editProjectionZ(&wideCullProjZ, zn, zf);
+        ds_viewproj = (*view) * wideCullProjZ;
+#else
         ds_viewproj = (*view) * ds_proj;
+#endif
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
         currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
