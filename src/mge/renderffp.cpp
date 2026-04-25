@@ -164,10 +164,10 @@ static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(IDirect3DDevice9* device
 
             // TexCoord: SHORT2N at offset 12 (4 bytes, normalized shorts)
             // SHORT2N maps [-32768, 32767] to [-1.0, 1.0]
-            // But UV coords should be [0, 1], so we need to remap
+            // The world texture uses these directly with wrap addressing
             const short* tc = (const short*)(src + 12);
-            dst->u = (tc[0] / 32767.0f) * 0.5f + 0.5f;
-            dst->v = (tc[1] / 32767.0f) * 0.5f + 0.5f;
+            dst->u = tc[0] / 32767.0f;
+            dst->v = tc[1] / 32767.0f;
 
             src += 16; // SIZEOFLANDVERT
             dst++;
@@ -294,15 +294,22 @@ void DistantLand::renderDistantLandFFP() {
 
     D3DXMATRIX identity;
     D3DXMatrixIdentity(&identity);
-    // Offset distant land slightly downward so it renders below MW's near terrain
-    // Remix ray traces both, but the near terrain will occlude the offset distant land
-    identity._43 = -8.0f;  // Push down by 8 units
+    // Offset distant land downward to match the original shader's landBias.
+    // The shader applies: pos.z += -30 + -2 * max(0, maxDist - dist)
+    // We use a fixed offset since we can't do per-vertex distance in FFP.
+    // -40 units is a good average that prevents overlap with MW's near terrain.
+    identity._43 = -40.0f;
     device->SetTransform(D3DTS_WORLD, &identity);
     device->SetTransform(D3DTS_VIEW, &mwView);
     device->SetTransform(D3DTS_PROJECTION, &distProj);
 
-    // Texture: world colour map
+    // Texture: world colour map with wrap addressing
     device->SetTexture(0, texWorldColour);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
 
     device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
