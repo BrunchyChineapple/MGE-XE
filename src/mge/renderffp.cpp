@@ -163,9 +163,11 @@ static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(IDirect3DDevice9* device
             dst->z = pos[2];
 
             // TexCoord: SHORT2N at offset 12 (4 bytes, normalized shorts)
+            // SHORT2N maps [-32768, 32767] to [-1.0, 1.0]
+            // But UV coords should be [0, 1], so we need to remap
             const short* tc = (const short*)(src + 12);
-            dst->u = tc[0] / 32767.0f;
-            dst->v = tc[1] / 32767.0f;
+            dst->u = (tc[0] / 32767.0f) * 0.5f + 0.5f;
+            dst->v = (tc[1] / 32767.0f) * 0.5f + 0.5f;
 
             src += 16; // SIZEOFLANDVERT
             dst++;
@@ -193,11 +195,10 @@ void DistantLand::renderDistantStaticsFFP() {
     device->SetPixelShader(nullptr);
     device->SetFVF(STATIC_FFP_FVF);
 
-    // Set up transforms
+    // Set up transforms — use the same view/projection that renderStage0 set up
+    // mwProj already has extended far plane from DistantLand::setProjection
     device->SetTransform(D3DTS_VIEW, &mwView);
-    D3DXMATRIX distProj = mwProj;
-    editProjectionZ(&distProj, kDistantNearPlane - 1e-2f, Configuration.DL.DrawDist * kCellSize);
-    device->SetTransform(D3DTS_PROJECTION, &distProj);
+    device->SetTransform(D3DTS_PROJECTION, &mwProj);
 
     // Enable basic lighting
     device->SetRenderState(D3DRS_LIGHTING, TRUE);
@@ -263,9 +264,8 @@ void DistantLand::renderDistantStaticsFFP() {
 void DistantLand::renderDistantLandFFP() {
     if (!MWBridge::get()->IsExterior()) return;
 
-    D3DXMATRIX distProj = mwProj;
-    editProjectionZ(&distProj, kDistantNearPlane - 1e-2f, Configuration.DL.DrawDist * kCellSize);
-    D3DXMATRIX viewproj = mwView * distProj;
+    // Use mwProj which already has extended far plane from setProjection
+    D3DXMATRIX viewproj = mwView * mwProj;
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
 
     // Cull
@@ -285,7 +285,7 @@ void DistantLand::renderDistantLandFFP() {
     D3DXMatrixIdentity(&identity);
     device->SetTransform(D3DTS_WORLD, &identity);
     device->SetTransform(D3DTS_VIEW, &mwView);
-    device->SetTransform(D3DTS_PROJECTION, &distProj);
+    device->SetTransform(D3DTS_PROJECTION, &mwProj);
 
     // Texture: world colour map
     device->SetTexture(0, texWorldColour);
