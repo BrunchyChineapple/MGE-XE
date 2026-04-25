@@ -109,6 +109,10 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
 #endif
     visLand.RemoveAll();
     LandQuadTree.GetVisibleMeshes(frustum, viewsphere, visLand);
+#ifdef MGE_RTX
+    // Sort land meshes deterministically for Remix temporal stability
+    visLand.SortByState();
+#endif
 
     device->SetVertexDeclaration(LandDecl);
     visLand.Render(device, SIZEOFLANDVERT);

@@ -71,21 +71,28 @@ QuadTreeMesh::QuadTreeMesh(const QuadTreeMesh& rh) {
 //-----------------------------------------------------------------------------
 
 bool QuadTreeMesh::CompareByState(const QuadTreeMesh* lh, const QuadTreeMesh* rh) {
-    if (lh->tex < rh->tex) {
-        return true;
+    if (lh->tex != rh->tex) {
+        return lh->tex < rh->tex;
     }
 
-    if (lh->tex == rh->tex && lh->vBuffer < rh->vBuffer) {
-        return true;
+    if (lh->vBuffer != rh->vBuffer) {
+        return lh->vBuffer < rh->vBuffer;
     }
 
-    return false;
+    // Tiebreaker: sort by mesh pointer for fully deterministic ordering.
+    // Without this, instances sharing the same texture and vertex buffer
+    // can appear in any order, causing RTX Remix temporal tracking to
+    // mismatch instances between frames (ghosting/flickering).
+    return lh < rh;
 }
 
 //-----------------------------------------------------------------------------
 
 bool QuadTreeMesh::CompareByTexture(const QuadTreeMesh* lh, const QuadTreeMesh* rh) {
-    return (lh->tex < rh->tex);
+    if (lh->tex != rh->tex) {
+        return lh->tex < rh->tex;
+    }
+    return lh < rh;
 }
 
 //-----------------------------------------------------------------------------
@@ -182,7 +189,7 @@ void VisibleSet::Render(IDirect3DDevice9* device,
 
 void VisibleSet::SortByState() {
     if (visible_set.size() > 0) {
-        std::sort(visible_set.begin(), visible_set.end(), QuadTreeMesh::CompareByState);
+        std::stable_sort(visible_set.begin(), visible_set.end(), QuadTreeMesh::CompareByState);
     }
 }
 
