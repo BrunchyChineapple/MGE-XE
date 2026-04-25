@@ -187,6 +187,13 @@ public:
     static void renderDistantLandZ();
     static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantStatics();
+
+#ifdef MGE_RTX
+    // Fixed-function pipeline rendering for RTX Remix
+    static void renderDistantStaticsFFP();
+    static void renderDistantLandFFP();
+    static void releaseFFPBuffers();
+#endif
     static void cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void buildGrassInstanceVB();
     static void renderGrassInst();

@@ -62,6 +62,21 @@ void DistantLand::renderStage0() {
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
             if (!mwBridge->IsUnderwater(eyePos.z)) {
+#ifdef MGE_RTX
+                // RTX Remix: Use fixed-function pipeline for distant land rendering.
+                // Remix can't extract proper textures from D3DX effect shaders.
+                if (mwBridge->IsExterior()) {
+                    renderDistantLandFFP();
+                }
+
+                if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+                    cullDistantStatics(&mwView, &distProj);
+                    renderDistantStaticsFFP();
+                }
+                else {
+                    visDistant.RemoveAll();
+                }
+#else
                 // Draw distant landscape
                 if (mwBridge->IsExterior()) {
                     effect->BeginPass(PASS_RENDERLAND);
@@ -84,6 +99,7 @@ void DistantLand::renderStage0() {
                 else {
                     visDistant.RemoveAll();
                 }
+#endif
             }
 
             // Sky scattering and sky objects (should be drawn late as possible)

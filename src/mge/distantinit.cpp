@@ -1326,6 +1326,10 @@ void DistantLand::release() {
 
     LOG::logline("-- Renderer unloading");
 
+#ifdef MGE_RTX
+    releaseFFPBuffers();
+#endif
+
     recordMW.clear();
     recordSky.clear();
 
