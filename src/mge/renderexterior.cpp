@@ -115,8 +115,11 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
     visLand.RemoveAll();
     LandQuadTree.GetVisibleMeshes(frustum, viewsphere, visLand);
 #ifdef MGE_RTX
-    // Sort land meshes deterministically for Remix temporal stability
+    // Sort and retain for temporal stability
     visLand.SortByState();
+    visLand.RetainPrevious();
+    visLand.SortByState();
+    visLand.SaveCurrent();
 #endif
 
     device->SetVertexDeclaration(LandDecl);
@@ -201,6 +204,12 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     }
 
     visDistant.SortByState();
+#ifdef MGE_RTX
+    // Retain meshes from previous frame to prevent pop-out flicker
+    visDistant.RetainPrevious();
+    visDistant.SortByState();  // Re-sort after merge
+    visDistant.SaveCurrent();
+#endif
 }
 
 void DistantLand::renderDistantStatics() {

@@ -64,6 +64,29 @@ public:
     void SortByTexture();
     void RemoveAll();
 
+#ifdef MGE_RTX
+    // Merge current visible set with previous frame's set.
+    // Meshes from the previous frame are retained even if they're no longer
+    // in the current frustum, preventing pop-out flicker with Remix.
+    void RetainPrevious() {
+        if (previous_set.empty()) return;
+        // Add any mesh from previous that isn't in current
+        for (const auto* mesh : previous_set) {
+            bool found = false;
+            for (const auto* cur : visible_set) {
+                if (cur == mesh) { found = true; break; }
+            }
+            if (!found) {
+                visible_set.push_back(mesh);
+            }
+        }
+    }
+    void SaveCurrent() {
+        previous_set = visible_set;
+    }
+    std::vector<const QuadTreeMesh*> previous_set;
+#endif
+
     size_t size() const {
         return visible_set.size();
     }
