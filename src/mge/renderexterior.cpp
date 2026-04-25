@@ -86,7 +86,12 @@ void DistantLand::renderSky() {
 
 void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     D3DXMATRIX world, viewproj = (*view) * (*proj);
+#ifdef MGE_RTX
+    // Extend draw distance margin for temporal stability
+    D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize * 1.1f);
+#else
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
+#endif
 
     D3DXMatrixIdentity(&world);
     effect->SetMatrix(ehWorld, &world);
@@ -139,13 +144,15 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     visDistant.RemoveAll();
 
 #ifdef MGE_RTX
-    // Widen the culling frustum for RTX Remix temporal stability.
-    // Meshes at frustum edges pop in/out with small camera movements, causing
-    // Remix's temporal denoiser to see them as new geometry each frame (flicker).
-    // Scaling the projection by 0.8 effectively widens the FOV by ~25% for culling only.
+    // RTX Remix temporal stability: widen culling bounds.
+    // Frustum is widened by 25% and distance extended by 10% so meshes at
+    // boundaries don't pop in/out with small camera movements.
     D3DXMATRIX wideCullProj = ds_proj;
-    wideCullProj._11 *= 0.8f;  // Widen horizontal FOV
-    wideCullProj._22 *= 0.8f;  // Widen vertical FOV
+    wideCullProj._11 *= 0.8f;
+    wideCullProj._22 *= 0.8f;
+    const float rtxDistMargin = 1.1f;
+#else
+    const float rtxDistMargin = 1.0f;
 #endif
 
     zf = std::min(Configuration.DL.NearStaticEnd * kCellSize, cullDist);
@@ -159,7 +166,7 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
         ds_viewproj = (*view) * ds_proj;
 #endif
         ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf;
+        viewsphere.w = zf * rtxDistMargin;
         currentWorldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
     }
 
@@ -174,7 +181,7 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
         ds_viewproj = (*view) * ds_proj;
 #endif
         ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf;
+        viewsphere.w = zf * rtxDistMargin;
         currentWorldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
     }
 
@@ -189,7 +196,7 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
         ds_viewproj = (*view) * ds_proj;
 #endif
         ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf;
+        viewsphere.w = zf * rtxDistMargin;
         currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
     }
 
