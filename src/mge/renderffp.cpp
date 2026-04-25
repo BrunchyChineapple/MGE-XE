@@ -311,17 +311,17 @@ void DistantLand::renderDistantLandFFP() {
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-    // Render each visible land chunk — skip chunks within near view range
-    // to avoid overlapping with Morrowind's own terrain
+    // Render each visible land chunk — skip chunks entirely within near view range
+    // Only skip if the ENTIRE chunk (center + radius) is within MW's render distance
     IDirect3DVertexBuffer9* lastVB = nullptr;
 
     const auto& visible = visLand.visible_set;
     for (const auto* mesh : visible) {
-        // Skip land chunks that are too close — Morrowind renders those
+        // Skip land chunks that are entirely within Morrowind's near render distance
         D3DXVECTOR3 chunkCenter = mesh->sphere.center;
         D3DXVECTOR3 toChunk = chunkCenter - D3DXVECTOR3(eyePos.x, eyePos.y, eyePos.z);
         float dist = D3DXVec3Length(&toChunk);
-        if (dist - mesh->sphere.radius < nearViewRange) {
+        if (dist + mesh->sphere.radius < nearViewRange * 0.8f) {
             continue;
         }
 
