@@ -195,10 +195,12 @@ void DistantLand::renderDistantStaticsFFP() {
     device->SetPixelShader(nullptr);
     device->SetFVF(STATIC_FFP_FVF);
 
-    // Set up transforms — use the same view/projection that renderStage0 set up
-    // mwProj already has extended far plane from DistantLand::setProjection
+    // Set up transforms
+    // Use a biased projection that pushes distant land behind Morrowind's near geometry
     device->SetTransform(D3DTS_VIEW, &mwView);
-    device->SetTransform(D3DTS_PROJECTION, &mwProj);
+    D3DXMATRIX distProj = mwProj;
+    editProjectionZ(&distProj, kDistantNearPlane, Configuration.DL.DrawDist * kCellSize);
+    device->SetTransform(D3DTS_PROJECTION, &distProj);
 
     // Enable basic lighting
     device->SetRenderState(D3DRS_LIGHTING, TRUE);
@@ -264,8 +266,10 @@ void DistantLand::renderDistantStaticsFFP() {
 void DistantLand::renderDistantLandFFP() {
     if (!MWBridge::get()->IsExterior()) return;
 
-    // Use mwProj which already has extended far plane from setProjection
-    D3DXMATRIX viewproj = mwView * mwProj;
+    // Use biased projection to push distant land behind near geometry
+    D3DXMATRIX distProj = mwProj;
+    editProjectionZ(&distProj, kDistantNearPlane, Configuration.DL.DrawDist * kCellSize);
+    D3DXMATRIX viewproj = mwView * distProj;
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
 
     // Cull
@@ -285,7 +289,7 @@ void DistantLand::renderDistantLandFFP() {
     D3DXMatrixIdentity(&identity);
     device->SetTransform(D3DTS_WORLD, &identity);
     device->SetTransform(D3DTS_VIEW, &mwView);
-    device->SetTransform(D3DTS_PROJECTION, &mwProj);
+    device->SetTransform(D3DTS_PROJECTION, &distProj);
 
     // Texture: world colour map
     device->SetTexture(0, texWorldColour);
