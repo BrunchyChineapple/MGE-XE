@@ -294,6 +294,9 @@ void DistantLand::renderDistantLandFFP() {
 
     D3DXMATRIX identity;
     D3DXMatrixIdentity(&identity);
+    // Offset distant land slightly downward so it renders below MW's near terrain
+    // Remix ray traces both, but the near terrain will occlude the offset distant land
+    identity._43 = -8.0f;  // Push down by 8 units
     device->SetTransform(D3DTS_WORLD, &identity);
     device->SetTransform(D3DTS_VIEW, &mwView);
     device->SetTransform(D3DTS_PROJECTION, &distProj);
@@ -311,19 +314,13 @@ void DistantLand::renderDistantLandFFP() {
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-    // Render each visible land chunk — skip chunks entirely within near view range
-    // Only skip if the ENTIRE chunk (center + radius) is within MW's render distance
+    // Render each visible land chunk
+    // Distant land renders with Z-test but no Z-write, so it only fills
+    // where Morrowind hasn't already drawn (behind MW's near terrain)
     IDirect3DVertexBuffer9* lastVB = nullptr;
 
     const auto& visible = visLand.visible_set;
     for (const auto* mesh : visible) {
-        // Skip land chunks that are entirely within Morrowind's near render distance
-        D3DXVECTOR3 chunkCenter = mesh->sphere.center;
-        D3DXVECTOR3 toChunk = chunkCenter - D3DXVECTOR3(eyePos.x, eyePos.y, eyePos.z);
-        float dist = D3DXVec3Length(&toChunk);
-        if (dist + mesh->sphere.radius < nearViewRange * 0.8f) {
-            continue;
-        }
 
         IDirect3DVertexBuffer9* ffpVB = getOrCreateLandFFPBuffer(device, mesh->vBuffer, mesh->verts);
         if (!ffpVB) continue;
