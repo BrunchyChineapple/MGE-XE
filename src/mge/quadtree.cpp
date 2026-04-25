@@ -154,6 +154,13 @@ void VisibleSet::Render(IDirect3DDevice9* device,
         if (texture_handle && last_texture != mesh->tex) {
             effectPool->SetTexture(*texture_handle, mesh->tex);
 
+#ifdef MGE_RTX
+            // Also set texture directly on device so RTX Remix can see it.
+            // D3DX effects set textures internally, but Remix may not intercept
+            // the effect's internal SetTexture calls reliably.
+            device->SetTexture(0, mesh->tex);
+#endif
+
             if (has_alpha_handle) {
                 // Depth-only rendering, control if texture alpha channel reads are required in shader
                 effectPool->SetBool(*has_alpha_handle, mesh->hasAlpha);
