@@ -228,12 +228,19 @@ void DistantLand::renderDistantStaticsFFP() {
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&kDistantZBias);
 
-    // Render each visible static
+    // Render each visible static — skip ones within near view range
     IDirect3DTexture9* lastTex = nullptr;
     IDirect3DVertexBuffer9* lastVB = nullptr;
 
     const auto& visible = visDistant.visible_set;
     for (const auto* mesh : visible) {
+        // Skip statics that are too close — Morrowind renders those
+        D3DXVECTOR3 meshCenter = mesh->sphere.center;
+        D3DXVECTOR3 toMesh = meshCenter - D3DXVECTOR3(eyePos.x, eyePos.y, eyePos.z);
+        float dist = D3DXVec3Length(&toMesh);
+        if (dist - mesh->sphere.radius < nearViewRange * 0.5f) {
+            continue;
+        }
         // Set texture if changed
         if (mesh->tex != lastTex) {
             device->SetTexture(0, mesh->tex);
@@ -304,11 +311,20 @@ void DistantLand::renderDistantLandFFP() {
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-    // Render each visible land chunk
+    // Render each visible land chunk — skip chunks within near view range
+    // to avoid overlapping with Morrowind's own terrain
     IDirect3DVertexBuffer9* lastVB = nullptr;
 
     const auto& visible = visLand.visible_set;
     for (const auto* mesh : visible) {
+        // Skip land chunks that are too close — Morrowind renders those
+        D3DXVECTOR3 chunkCenter = mesh->sphere.center;
+        D3DXVECTOR3 toChunk = chunkCenter - D3DXVECTOR3(eyePos.x, eyePos.y, eyePos.z);
+        float dist = D3DXVec3Length(&toChunk);
+        if (dist - mesh->sphere.radius < nearViewRange) {
+            continue;
+        }
+
         IDirect3DVertexBuffer9* ffpVB = getOrCreateLandFFPBuffer(device, mesh->vBuffer, mesh->verts);
         if (!ffpVB) continue;
 
