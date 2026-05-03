@@ -59,65 +59,71 @@ static void syncRemixSky() {
     snprintf(buf, sizeof(buf), "%.2f", rotation);
     api->SetConfigVariable("rtx.atmosphere.sunRotation", buf);
 
-    // Moon orbit: independent smooth arc from west to east.
-    // Rises at sunset (~18:00), peaks near zenith at midnight, sets at sunrise (~6:00).
-    float moonHourAngle;
-    if (hour >= 18.0f) {
-        moonHourAngle = (hour - 18.0f) / 12.0f;  // 18:00 = 0.0, 06:00 = 1.0
-    } else if (hour < 6.0f) {
-        moonHourAngle = (hour + 6.0f) / 12.0f;   // 00:00 = 0.5, 06:00 = 1.0
+    // ================================================================
+    // Moon positions: read directly from Morrowind's scenegraph.
+    // GetMoonDir returns the normalized world-space direction to the
+    // vanilla billboard moon. Morrowind uses Z-up (x=east, y=north,
+    // z=up), so elevation = asin(z), rotation = atan2(x, y).
+    // This gives us pixel-perfect match with vanilla moon positions.
+    // ================================================================
+    float mx, my, mz;
+
+    // Secunda (smaller, brighter moon)
+    if (mwBridge->GetMoonDir(true, mx, my, mz)) {
+        float moonElev = asinf(std::max(-1.0f, std::min(1.0f, mz))) * (180.0f / 3.14159265f);
+        float moonRot = atan2f(mx, my) * (180.0f / 3.14159265f);
+
+        snprintf(buf, sizeof(buf), "%.2f", moonElev);
+        api->SetConfigVariable("rtx.atmosphere.moonElevation", buf);
+
+        snprintf(buf, sizeof(buf), "%.2f", moonRot);
+        api->SetConfigVariable("rtx.atmosphere.moonRotation", buf);
     } else {
-        moonHourAngle = -1.0f;  // Daytime — moon below horizon
+        // Moon not in scenegraph (loading screen, interior, etc.) — hide it
+        api->SetConfigVariable("rtx.atmosphere.moonElevation", "-20.0");
+        api->SetConfigVariable("rtx.atmosphere.moonRotation", "180.0");
     }
 
-    float moonElev, moonRot;
-    if (moonHourAngle >= 0.0f && moonHourAngle <= 1.0f) {
-        // High arc peaking near zenith (80°) at midnight
-        moonElev = 80.0f * sinf(moonHourAngle * 3.14159265f);
-        // West to east: 270 (west) -> 180 (south/overhead) -> 90 (east)
-        moonRot = 270.0f - moonHourAngle * 180.0f;
+    // Masser (larger, red moon) — completely independent orbit
+    if (mwBridge->GetMoonDir(false, mx, my, mz)) {
+        float masserElev = asinf(std::max(-1.0f, std::min(1.0f, mz))) * (180.0f / 3.14159265f);
+        float masserRot = atan2f(mx, my) * (180.0f / 3.14159265f);
+
+        snprintf(buf, sizeof(buf), "%.2f", masserElev);
+        api->SetConfigVariable("rtx.atmosphere.masserElevation", buf);
+
+        snprintf(buf, sizeof(buf), "%.2f", masserRot);
+        api->SetConfigVariable("rtx.atmosphere.masserRotation", buf);
     } else {
-        moonElev = -20.0f;
-        moonRot = 180.0f;
+        api->SetConfigVariable("rtx.atmosphere.masserElevation", "-20.0");
+        api->SetConfigVariable("rtx.atmosphere.masserRotation", "180.0");
     }
 
-    snprintf(buf, sizeof(buf), "%.2f", moonElev);
-    api->SetConfigVariable("rtx.atmosphere.moonElevation", buf);
-
-    snprintf(buf, sizeof(buf), "%.2f", moonRot);
-    api->SetConfigVariable("rtx.atmosphere.moonRotation", buf);
-
-    // Moon phase synced to Morrowind's actual lunar cycles.
-    // Morrowind uses 8 discrete phases per cycle:
+    // ================================================================
+    // Moon phases: synced to Morrowind's actual lunar cycles.
+    // Morrowind uses 8 discrete phases per moon:
     //   0=new, 1=waxing crescent, 2=first quarter, 3=waxing gibbous,
     //   4=full, 5=waning gibbous, 6=third quarter, 7=waning crescent
+    //
+    // Our shader's getPhaseIllumination() maps phase [0..1] as:
+    //   0.0 = new (dark), 0.5 = full (bright), 1.0 = new again
+    //
+    // So vanilla phase index 0 (new) → 0.0, index 4 (full) → 0.5.
+    // Direct mapping: shaderPhase = phaseIndex / 8.0
+    // We add 0.5/8 to center within each 2-day (or 3-day) step.
+    //
     // Secunda: 16-day cycle (2 days per phase)
     // Masser:  24-day cycle (3 days per phase)
-    // We map the discrete phase index [0..7] to a continuous [0..1] value
-    // centered on each phase step, so the terminator matches vanilla exactly.
+    // ================================================================
     int daysPassed = mwBridge->getDaysPassed();
 
-    // Secunda phase: 16-day cycle, 8 phases, 2 days each
     int secundaPhaseIndex = ((int)daysPassed % 16) / 2;  // 0..7
-    float secundaPhase = ((float)secundaPhaseIndex + 0.5f) / 8.0f;  // center of each phase step
+    float secundaPhase = ((float)secundaPhaseIndex + 0.5f) / 8.0f;
     snprintf(buf, sizeof(buf), "%.4f", secundaPhase);
     api->SetConfigVariable("rtx.atmosphere.moonPhase", buf);
 
-    // Masser trails close to Secunda with a slight offset
-    // The offset oscillates so they cross over each other during the night
-    float crossPhase = sinf(moonHourAngle * 3.14159265f * 2.0f);  // oscillates twice per night
-    float masserElev = moonElev + 3.0f * crossPhase;   // swings above and below Secunda
-    float masserRot = moonRot - 2.0f * crossPhase;     // swings left and right
-
-    snprintf(buf, sizeof(buf), "%.2f", masserElev);
-    api->SetConfigVariable("rtx.atmosphere.masserElevation", buf);
-
-    snprintf(buf, sizeof(buf), "%.2f", masserRot);
-    api->SetConfigVariable("rtx.atmosphere.masserRotation", buf);
-
-    // Masser phase: 24-day cycle, 8 phases, 3 days each
     int masserPhaseIndex = ((int)daysPassed % 24) / 3;  // 0..7
-    float masserPhase = ((float)masserPhaseIndex + 0.5f) / 8.0f;  // center of each phase step
+    float masserPhase = ((float)masserPhaseIndex + 0.5f) / 8.0f;
     snprintf(buf, sizeof(buf), "%.4f", masserPhase);
     api->SetConfigVariable("rtx.atmosphere.masserPhase", buf);
 }
