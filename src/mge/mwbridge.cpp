@@ -636,19 +636,18 @@ bool MWBridge::GetMoonDir(bool secunda, float& x, float& y, float& z) {
     DWORD moonHolder = read_dword(addr + (secunda ? 0x44 : 0x48));
     if (!moonHolder) return false;
 
-    // The moon holder node contains a child billboard node
+    // Follow pointer at offset 0x10 to get the billboard node
     DWORD moonNode = read_dword(moonHolder + 0x10);
     if (!moonNode) return false;
 
-    // Read the world-space translation of the moon billboard
-    // NiAVObject world transform translation is at offset 0x68
-    float wx = read_float(moonNode + 0x68);
-    float wy = read_float(moonNode + 0x6C);
-    float wz = read_float(moonNode + 0x70);
+    // NiAVObject world translation at offset 0x64 (vec3: x, y, z)
+    // Confirmed via debug logging — this tracks the moon billboard position.
+    float wx = read_float(moonNode + 0x64);
+    float wy = read_float(moonNode + 0x68);
+    float wz = read_float(moonNode + 0x6C);
 
-    // The moon billboard is a child of the sky root which follows the camera.
-    // Its world position = playerPos + skyDirection * distance.
-    // Subtract player position to get the sky-relative direction vector.
+    // Subtract player position — the billboard is a child of the sky root
+    // which follows the camera, so world pos = playerPos + skyDirection * distance
     float px = PlayerPositionX();
     float py = PlayerPositionY();
     float pz = PlayerPositionZ();
