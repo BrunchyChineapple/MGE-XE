@@ -8,10 +8,120 @@
 #include "mwbridge.h"
 #include "../../../source/d3d8.hpp"
 
+#ifdef MGE_RTX
+#include "remix_api_test.h"
+#define REMIX_ALLOW_X86
+#include "remix_c.h"
+#include <cmath>
+#include <cstdio>
+#endif
+
 
 
 using std::string;
 using std::unordered_map;
+
+#ifdef MGE_RTX
+// Sync Morrowind's sun position to Remix's Hillaire physical sky.
+static void syncRemixSky() {
+    remixapi_Interface* api = RemixAPITest::getInterface();
+    if (!api || !api->SetConfigVariable) return;
+
+    auto mwBridge = MWBridge::get();
+    if (!mwBridge->IsLoaded() || !mwBridge->CellHasWeather()) return;
+
+    float sx, sy, sz;
+    mwBridge->GetSunDir(sx, sy, sz);
+    float len = sqrtf(sx * sx + sy * sy + sz * sz);
+    if (len < 0.001f) return;
+    sx /= len; sy /= len; sz /= len;
+
+    float elevation = asinf(std::max(-1.0f, std::min(1.0f, sz))) * (180.0f / 3.14159265f);
+    float rotation = atan2f(sx, sy) * (180.0f / 3.14159265f);
+
+    // Morrowind's scenegraph bounces the sun at the horizon — use game hour
+    // to detect night and push the sun below the horizon for Remix.
+    float hour = mwBridge->getGameHour();
+    if (hour < 6.0f || hour > 20.0f) {
+        elevation = -elevation;
+    } else if (hour < 8.0f) {
+        float t = (hour - 6.0f) / 2.0f;
+        elevation = elevation * (2.0f * t - 1.0f);
+    } else if (hour > 18.0f) {
+        float t = (hour - 18.0f) / 2.0f;
+        elevation = elevation * (1.0f - 2.0f * t);
+    }
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f", elevation);
+    api->SetConfigVariable("rtx.atmosphere.sunElevation", buf);
+
+    snprintf(buf, sizeof(buf), "%.2f", rotation);
+    api->SetConfigVariable("rtx.atmosphere.sunRotation", buf);
+
+    // Moon orbit: independent smooth arc from west to east.
+    // Rises at sunset (~18:00), peaks near zenith at midnight, sets at sunrise (~6:00).
+    float moonHourAngle;
+    if (hour >= 18.0f) {
+        moonHourAngle = (hour - 18.0f) / 12.0f;  // 18:00 = 0.0, 06:00 = 1.0
+    } else if (hour < 6.0f) {
+        moonHourAngle = (hour + 6.0f) / 12.0f;   // 00:00 = 0.5, 06:00 = 1.0
+    } else {
+        moonHourAngle = -1.0f;  // Daytime — moon below horizon
+    }
+
+    float moonElev, moonRot;
+    if (moonHourAngle >= 0.0f && moonHourAngle <= 1.0f) {
+        // High arc peaking near zenith (80°) at midnight
+        moonElev = 80.0f * sinf(moonHourAngle * 3.14159265f);
+        // West to east: 270 (west) -> 180 (south/overhead) -> 90 (east)
+        moonRot = 270.0f - moonHourAngle * 180.0f;
+    } else {
+        moonElev = -20.0f;
+        moonRot = 180.0f;
+    }
+
+    snprintf(buf, sizeof(buf), "%.2f", moonElev);
+    api->SetConfigVariable("rtx.atmosphere.moonElevation", buf);
+
+    snprintf(buf, sizeof(buf), "%.2f", moonRot);
+    api->SetConfigVariable("rtx.atmosphere.moonRotation", buf);
+
+    // Moon phase synced to Morrowind's actual lunar cycles.
+    // Morrowind uses 8 discrete phases per cycle:
+    //   0=new, 1=waxing crescent, 2=first quarter, 3=waxing gibbous,
+    //   4=full, 5=waning gibbous, 6=third quarter, 7=waning crescent
+    // Secunda: 16-day cycle (2 days per phase)
+    // Masser:  24-day cycle (3 days per phase)
+    // We map the discrete phase index [0..7] to a continuous [0..1] value
+    // centered on each phase step, so the terminator matches vanilla exactly.
+    int daysPassed = mwBridge->getDaysPassed();
+
+    // Secunda phase: 16-day cycle, 8 phases, 2 days each
+    int secundaPhaseIndex = ((int)daysPassed % 16) / 2;  // 0..7
+    float secundaPhase = ((float)secundaPhaseIndex + 0.5f) / 8.0f;  // center of each phase step
+    snprintf(buf, sizeof(buf), "%.4f", secundaPhase);
+    api->SetConfigVariable("rtx.atmosphere.moonPhase", buf);
+
+    // Masser trails close to Secunda with a slight offset
+    // The offset oscillates so they cross over each other during the night
+    float crossPhase = sinf(moonHourAngle * 3.14159265f * 2.0f);  // oscillates twice per night
+    float masserElev = moonElev + 3.0f * crossPhase;   // swings above and below Secunda
+    float masserRot = moonRot - 2.0f * crossPhase;     // swings left and right
+
+    snprintf(buf, sizeof(buf), "%.2f", masserElev);
+    api->SetConfigVariable("rtx.atmosphere.masserElevation", buf);
+
+    snprintf(buf, sizeof(buf), "%.2f", masserRot);
+    api->SetConfigVariable("rtx.atmosphere.masserRotation", buf);
+
+    // Masser phase: 24-day cycle, 8 phases, 3 days each
+    int masserPhaseIndex = ((int)daysPassed % 24) / 3;  // 0..7
+    float masserPhase = ((float)masserPhaseIndex + 0.5f) / 8.0f;  // center of each phase step
+    snprintf(buf, sizeof(buf), "%.4f", masserPhase);
+    api->SetConfigVariable("rtx.atmosphere.masserPhase", buf);
+}
+#endif
 
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
@@ -29,6 +139,9 @@ void DistantLand::renderStage0() {
     // Set variables derived from current game state and camera configuration
     setView(&mwView);
     adjustFog();
+#ifdef MGE_RTX
+    syncRemixSky();
+#endif
     setupCommonEffect(&mwView, &mwProj);
     FixedFunctionShader::updateLighting(lightSunMult, lightAmbMult);
 
@@ -726,20 +839,29 @@ bool DistantLand::selectDistantCell() {
             cellname = mwBridge->getInteriorName();
         }
 
-        const auto iWS = mapWorldSpaces.find(cellname);
-        if (iWS != mapWorldSpaces.end()) {
-            currentWorldSpace = &iWS->second;
-            return true;
+        if (Configuration.UseSharedMemory) {
+            DistantLandShare::hasCurrentWorldSpace = ipcClient.setWorldSpaceBlocking(cellname);
+            if (DistantLandShare::hasCurrentWorldSpace) {
+                return true;
+            }
+        } else {
+            const auto iWS = DistantLandShare::mapWorldSpaces.find(cellname);
+            if (iWS != DistantLandShare::mapWorldSpaces.end()) {
+                DistantLandShare::currentWorldSpace = &iWS->second;
+                DistantLandShare::hasCurrentWorldSpace = true;
+                return true;
+            }
         }
     }
 
-    currentWorldSpace = nullptr;
+    DistantLandShare::currentWorldSpace = nullptr;
+    DistantLandShare::hasCurrentWorldSpace = false;
     return false;
 }
 
 // isDistantCell - Check if there is distant land selected for this cell
 bool DistantLand::isDistantCell() {
-    return currentWorldSpace != nullptr;
+    return DistantLandShare::hasCurrentWorldSpace;
 }
 
 // resolveDynamicVisGroups - Resolve pointers to game objects on load/reload
@@ -781,9 +903,14 @@ void DistantLand::resolveDynamicVisGroups() {
 // scanDynamicVisGroups - Scan through game data for visibility changes
 void DistantLand::scanDynamicVisGroups() {
     auto mwBridge = MWBridge::get();
+    if (Configuration.UseSharedMemory) {
+        dynVisFlagsShared.clear();
+    }
 
+    std::uint16_t i = 0;
     for (auto& vis : dynamicVisGroups) {
         int value;
+        auto groupIndex = i++;
 
         // Ignore unresolved objects
         if (!vis.gameObject) {
@@ -815,10 +942,18 @@ void DistantLand::scanDynamicVisGroups() {
         // If enable state has changed, propagate to distant land mesh instances
         if (enable ^ vis.enabled) {
             vis.enabled = enable;
-            for (auto& m : vis.references) {
-                m->enabled = enable;
+            if (Configuration.UseSharedMemory) {
+                dynVisFlagsShared.push_back({ groupIndex, enable });
+            } else {
+                for (auto& m : vis.references) {
+                    m->enabled = enable;
+                }
             }
         }
+    }
+
+    if (Configuration.UseSharedMemory && !dynVisFlagsShared.empty()) {
+        ipcClient.updateDynVis(dynVisFlagsSharedId);
     }
 }
 
