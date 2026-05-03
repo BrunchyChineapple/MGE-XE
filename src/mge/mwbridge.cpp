@@ -5,7 +5,6 @@
 #include "assert.h"
 
 #include <cmath>
-#include "../../../source/d3d8to9.hpp"
 
 
 
@@ -623,6 +622,48 @@ void MWBridge::GetSunDir(float& x, float& y, float& z) {
     x = read_float(eSunDir);
     y = read_float(eSunDir + 0x4);
     z = read_float(eSunDir + 0x8);
+}
+
+bool MWBridge::GetMoonDir(bool secunda, float& x, float& y, float& z) {
+    assert(m_loaded);
+
+    DWORD addr = read_dword(eMaster);
+    if (!addr) return false;
+    addr = read_dword(addr + 0x58);
+    if (!addr) return false;
+
+    // Secunda at offset 0x44, Masser at offset 0x48
+    DWORD moonHolder = read_dword(addr + (secunda ? 0x44 : 0x48));
+    if (!moonHolder) return false;
+
+    // The moon holder node contains a child billboard node
+    DWORD moonNode = read_dword(moonHolder + 0x10);
+    if (!moonNode) return false;
+
+    // Read the world-space translation of the moon billboard
+    // NiAVObject world transform translation is at offset 0x68
+    float wx = read_float(moonNode + 0x68);
+    float wy = read_float(moonNode + 0x6C);
+    float wz = read_float(moonNode + 0x70);
+
+    // The moon billboard is a child of the sky root which follows the camera.
+    // Its world position = playerPos + skyDirection * distance.
+    // Subtract player position to get the sky-relative direction vector.
+    float px = PlayerPositionX();
+    float py = PlayerPositionY();
+    float pz = PlayerPositionZ();
+
+    x = wx - px;
+    y = wy - py;
+    z = wz - pz;
+
+    // Normalize to get direction
+    float len = sqrtf(x * x + y * y + z * z);
+    if (len < 0.001f) return false;
+    x /= len;
+    y /= len;
+    z /= len;
+    return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -1432,6 +1473,39 @@ void MWBridge::patchLightParticleMaterialModifier() {
     // Jump over code that affects the particle emissive material
     VirtualMemWriteAccessor vw((void*)addr, 1);
     write_byte(addr, 0xEB);
+}
+
+//-----------------------------------------------------------------------------
+
+static void __fastcall patchCameraClick(void* camera, int edx, bool dontFinishAccumulating) {
+    const auto NiCamera_Click = reinterpret_cast<void (__thiscall*)(void*, bool)>(0x6CC7B0);
+
+    if (dontFinishAccumulating) {
+        // Call original code.
+        NiCamera_Click(camera, true);
+    }
+    else {
+        auto scenePtr = *reinterpret_cast<char**>(reinterpret_cast<char*>(camera) + 0x128);
+        WORD *flagsPtr = reinterpret_cast<WORD*>(scenePtr + 0x14);
+
+        // Render, but split accumulation to a new scene.
+        NiCamera_Click(camera, true);
+
+        // Hide scene and only render accumulator contents.
+        auto previousFlags = *flagsPtr;
+        *flagsPtr = 0x9; // AppCulled + IsVisual
+        NiCamera_Click(camera, false);
+        *flagsPtr = previousFlags;
+    }
+}
+
+// patchWorldRenderingAccumulation - Alter rendering of cells without water, so that alphas are deferred to a new scene, enabling detection
+void MWBridge::patchWorldRenderingAccumulation() {
+    DWORD addr = 0x41C654;
+
+    // Patch main scene rendering function.
+    VirtualMemWriteAccessor vw((void*)addr, 4);
+    write_dword(addr + 1, reinterpret_cast<DWORD>(&patchCameraClick) - addr - 5);
 }
 
 //-----------------------------------------------------------------------------
