@@ -641,7 +641,6 @@ bool MWBridge::GetMoonDir(bool secunda, float& x, float& y, float& z) {
     if (!moonNode) return false;
 
     // NiAVObject world translation at offset 0x64 (vec3: x, y, z)
-    // Confirmed via debug logging — this tracks the moon billboard position.
     float wx = read_float(moonNode + 0x64);
     float wy = read_float(moonNode + 0x68);
     float wz = read_float(moonNode + 0x6C);
