@@ -100,6 +100,8 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
         // Apply patch to load distant land before the main menu, and on renderer restart
         mwBridge->patchGameLoading(&initOnLoad);
+        // Patch world rendering (on a branch without the water) to split alphas to their own scene
+        mwBridge->patchWorldRenderingAccumulation();
         // Disable MW screenshot function to allow MGE to use the same key
         mwBridge->disableScreenshotFunc();
         // Mark water material to allow MGEProxyDevice to detect it
@@ -193,6 +195,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
     // Reset scene identifiers
     sceneCount = -1;
+    rendertargetNormal = true;
     stage0Complete = false;
     waterDrawn = false;
     isFrameComplete = false;
@@ -204,20 +207,28 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 // SetRenderTarget
 // Remember if MW is rendering to back buffer
 HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3DSurface8* b) {
-#ifndef MGE_RTX
     if (a) {
-        IDirect3DSurface9* back = nullptr;
-        ProxyInterface->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
-        auto ds = static_cast<Direct3DSurface8*>(a);
-        auto s = ds->GetProxyInterface();
-        rendertargetNormal = (s == back);
+        // Try D3D8-level comparison first
+        IDirect3DSurface8* backD3D8 = nullptr;
+        Direct3DDevice8::GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backD3D8);
+        bool isBack = (a == backD3D8);
+        if (backD3D8) backD3D8->Release();
 
-        back->Release();
+        // Fallback: compare underlying D3D9 surfaces
+        if (!isBack) {
+            IDirect3DSurface9* back9 = nullptr;
+            ProxyInterface->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back9);
+            IDirect3DSurface9* target9 = static_cast<Direct3DSurface8*>(a)->GetProxyInterface();
+            isBack = (target9 == back9);
+            if (back9) back9->Release();
+        }
+
+        rendertargetNormal = isBack;
     }
-#endif // !MGE_RTX
 
     return Direct3DDevice8::SetRenderTarget(a, b);
 }
+
 
 // BeginScene - Multiple scenes per frame, non-alpha / 2x stencil / post-stencil redraw / alpha / 1st person / UI
 // Fogging needs to be set for Morrowind rendering at start of scene
@@ -235,7 +246,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             StatusOverlay::init(ProxyInterface);
             StatusOverlay::setStatus(XE_VERSION_STRING);
 #ifndef MGE_RTX
-MGEhud::init(ProxyInterface);
+            MGEhud::init(ProxyInterface);
 #endif // MGE_RTX
 
             // Set scaling on Morrowind's UI system
@@ -283,12 +294,6 @@ MGEhud::init(ProxyInterface);
 // MGE intercepts first scene to draw distant land before it finishes, others it applies shadows to
 HRESULT _stdcall MGEProxyDevice::EndScene() {
     if (DistantLand::ready && rendertargetNormal) {
-        // The following Morrowind scenes get past the filters:
-        // ~ Opaque meshes, plus alpha meshes with 'No Sorter' property (which should use alpha test)
-        // ~ If stencil shadows are active, then shadow casters are deferred to be drawn in a scene after
-        //    shadows are fully applied to avoid self-shadowing problems with simplified shadow meshes
-        // ~ If any alpha meshes are visible, they are sorted and drawn in another scene (except those with 'No Sorter' property)
-        // ~ If 1st person or sunglare is visible, they are drawn in another scene after a Z clear
         if (sceneCount == 0) {
             // Edge case, render distant land even if Morrowind has culled everything
             if (!stage0Complete) {
@@ -299,6 +304,14 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Opaque features
 #ifndef MGE_RTX
             DistantLand::renderStage1();
+#else
+            // RTX: Render grass via FFP (stage1's shader-based grass is incompatible)
+            if (DistantLand::isDistantCell()) {
+                DistantLand::cullGrass(&DistantLand::mwView, &DistantLand::mwProj);
+                if (Configuration.MGEFlags & USE_GRASS) {
+                    DistantLand::renderGrassFFP();
+                }
+            }
 #endif
 
             // Blend close objects over distant land
@@ -310,7 +323,6 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 #endif
 
             // Draw water if the Morrowind water plane doesn't appear in view
-            // it may be too distant or stencil scene order is non-normative
             if (distantWater && !waterDrawn && !isStencilScene) {
                 DistantLand::renderStageWater();
                 waterDrawn = true;
@@ -325,7 +337,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         // Render status overlay
         StatusOverlay::setFPS(calcFPS());
         StatusOverlay::show(ProxyInterface);
-       
+
         isHUDComplete = true;
     }
 
@@ -333,7 +345,6 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 }
 
 // Clear - Occurs at start of frame, and also a z-clear before rendering 1st person and sunglare
-// Skybox mesh doesn't extend over whole background; cleared background colour is visible at horizon
 HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
     DistantLand::setHorizonColour(d);
     return Direct3DDevice8::Clear(a, b, c, d, e, f);
@@ -374,7 +385,6 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
 }
 
 // SetMaterial
-// Check for materials marked for hiding
 HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
     captureMaterial(a);
     isWaterMaterial = (a->Power == 99999.0f);
@@ -383,20 +393,63 @@ HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
 }
 
 // SetLight
-// Capture what the sun is doing
 HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
     captureLight(a, b);
 
     // Exterior sunlight/interior "sun" appears to always be light 6
     if (a == 6 && DistantLand::ready) {
         DistantLand::setSunLight(b);
+
+#ifdef MGE_RTX
+        // At night, redirect light 6 to act as moonlight.
+        // Instead of zeroing it (which removes all night GI), we point it
+        // from Secunda's orbit position with a dim blue-white color.
+        // This gives Remix a directional light source for moonlight shadows.
+        //
+        // To revert to no moonlight: change the if-block below to zero
+        // Diffuse/Ambient/Specular as before (see git history).
+        auto mwBridge = MWBridge::get();
+        if (mwBridge->IsLoaded() && mwBridge->CellHasWeather()) {
+            float hour = mwBridge->getGameHour();
+            if (hour < 6.0f || hour > 20.0f) {
+                D3DLIGHT8 moonLight = *b;
+
+                // Get Secunda's direction (brighter moon = primary moonlight source)
+                float mx, my, mz;
+                if (mwBridge->GetMoonDir(true, mx, my, mz)) {
+                    // GetMoonDir returns direction TO the moon (Z-up: x=east, y=north, z=up).
+                    // Light direction should point FROM the moon toward the ground.
+                    // D3D light direction = direction the light travels = -moonDir.
+                    moonLight.Direction.x = -mx;
+                    moonLight.Direction.y = -my;
+                    moonLight.Direction.z = -mz;
+                }
+                // else: keep Bethesda's original direction as fallback
+
+                // Moonlight color: dim blue-white, scaled by Secunda's phase.
+                // Phase 0.5 = full moon = brightest, phase 0/1 = new = darkest.
+                int daysPassed = mwBridge->getDaysPassed();
+                int phaseIndex = ((int)daysPassed % 16) / 2;  // 0..7
+                // Map phase index to brightness: 0(new)=0, 4(full)=1
+                float phaseBrightness = 1.0f - fabsf((float)phaseIndex - 4.0f) / 4.0f;
+                phaseBrightness = std::max(0.05f, phaseBrightness);  // minimum ambient even at new moon
+
+                // Dim blue-white moonlight
+                float intensity = 0.08f * phaseBrightness;
+                moonLight.Diffuse  = { intensity * 0.7f, intensity * 0.8f, intensity * 1.0f, 1.0f };
+                moonLight.Ambient  = { intensity * 0.3f, intensity * 0.35f, intensity * 0.4f, 1.0f };
+                moonLight.Specular = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+                return Direct3DDevice8::SetLight(a, &moonLight);
+            }
+        }
+#endif
     }
 
     return Direct3DDevice8::SetLight(a, b);
 }
 
 // SetRenderState
-// Ignore Morrowind fog settings, and run stage 0 rendering after lighting setup
 HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     captureRenderState(a, b);
 
@@ -415,12 +468,9 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 
     // Ambient is used for scene detection
     if (a == D3DRS_AMBIENT) {
-        // Pure white ambient occurs with skydome and menu mode rendering
-        // Ambient is also never set properly when high enough outside that Morrowind renders nothing
         isAmbientWhite = (b == 0xffffffff);
 
         if (!isAmbientWhite) {
-            // Save real ambient, can be used in future frames if no draw calls are provoked
             RGBVECTOR amb = D3DCOLOR(b);
             DistantLand::setAmbientColour(amb);
             lightrs.globalAmbient.r = amb.r;
@@ -433,12 +483,9 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 }
 
 // SetTextureStageState
-// Override some sampler options
 HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c) {
     captureFragmentRenderState(a, b, c);
 
-    // Sampler overrides to ensure trilinear/anisotropic filtering works
-    // Note that DX8 had sampling state bound to texture stages instead of samplers
     if (b == D3DTSS_MINFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? Configuration.ScaleFilter : D3DTEXF_NONE;
         return ProxyInterface->SetSamplerState(a, D3DSAMP_MINFILTER, filter);
@@ -450,10 +497,8 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
     return Direct3DDevice8::SetTextureStageState(a, b, c);
 }
 
-// DrawIndexedPrimitive - Where all the drawing happens
-// Inspect draw calls for re-use later
+// DrawIndexedPrimitive
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
-    // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
     if (DistantLand::ready && rendertargetNormal && isMainView && !isShadowStencil) {
         rs.primType = a;
@@ -464,14 +509,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         rs.primCount = e;
 
         if (!stage0Complete && !isAmbientWhite) {
-            // At this point, only the sky is rendered in exteriors, or nothing in interiors
             DistantLand::renderStage0();
             stage0Complete = true;
         }
 
         if (isWaterMaterial) {
             if (distantWater) {
-                // Call distant land instead of drawing water grid
                 if (!waterDrawn) {
                     DistantLand::renderStageWater();
                     waterDrawn = true;
@@ -479,7 +522,6 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 return D3D_OK;
             }
         } else {
-            // Let distant land record call and skip if signalled
             if (!DistantLand::inspectIndexedPrimitive(sceneCount, &rs, &frs, &lightrs)) {
                 return D3D_OK;
             }
@@ -489,7 +531,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     return Direct3DDevice8::DrawIndexedPrimitive(a, b, c, d, e);
 }
 
-// Release - Free all resources when refcount hits 0
+// Release
 ULONG _stdcall MGEProxyDevice::Release() {
     ULONG r = Direct3DDevice8::Release();
 
@@ -504,15 +546,12 @@ ULONG _stdcall MGEProxyDevice::Release() {
     return r;
 }
 
+
 // --------------------------------------------------------
 
-// initOnLoad
-// Initializes distant land
-// Called after new game or load game is selected from the main menu
 void initOnLoad() {
     auto mwBridge = MWBridge::get();
 
-    // Compose loading message from translated string
     char buffer[64];
     const char* loadingMessage = *(const char**)mwBridge->getGMSTPointer(602);
     int firstWordLength = 0;
@@ -525,9 +564,7 @@ void initOnLoad() {
     std::snprintf(buffer, sizeof(buffer), "%.*s MGE XE...", firstWordLength, loadingMessage);
     mwBridge->showLoadingBar(buffer, 95.0);
 
-    // Initialize distant land
     if (DistantLand::init()) {
-        // Initially force view distance to max, required for full extent shadows and grass
         if (Configuration.MGEFlags & USE_DISTANT_LAND) {
             mwBridge->SetViewDistance(7168.0);
         }
@@ -536,15 +573,11 @@ void initOnLoad() {
         StatusOverlay::setStatus("MGE XE serious error condition. Exit Morrowind and check mgeXE.log for details.", StatusOverlay::PriorityError);
     }
 
-    // Clean up loading bar menu, otherwise it persists in the background
     mwBridge->destroyLoadingBar();
 
     VideoPatch::start(DistantLand::device);
 }
 
-// detectMenu
-// detects if view matrix is for UI / load bars
-// the projection matrix is never set to ortho, making it unusable for detection
 bool detectMenu(const D3DMATRIX* m) {
     if (m->_41 != 0.0f || !(m->_42 == 0.0f || m->_42 == -600.0f) || m->_43 != 0.0f) {
         return false;
@@ -577,7 +610,6 @@ HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {
 HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8* b, UINT c) {
     if (a == 0) {
         rs.vb = static_cast<Direct3DVertexBuffer8*>(b)->GetProxyInterface();
-        //rs.vb = (IDirect3DVertexBuffer9*)b;
         rs.vbOffset = 0;
         rs.vbStride = c;
     }
@@ -586,7 +618,6 @@ HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8*
 
 HRESULT _stdcall MGEProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
     rs.ib = static_cast<Direct3DIndexBuffer8*>(a)->GetProxyInterface();
-    //rs.ib = (IDirect3DIndexBuffer9*)a;
     return Direct3DDevice8::SetIndices(a, b);
 }
 
@@ -731,12 +762,8 @@ void captureTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
 }
 
 void captureLight(DWORD a, const D3DLIGHT8* b) {
-    // Morrowind uses non-contigous light IDs up to a large number (>512)
     LightState::Light* light = &lightrs.lights[a];
 
-    // Copy values relevant to Morrowind
-    // i.e. Morrowind has no spotlights and always sets range to FLT_MAX
-    // The only light source with ambient is sunlight
     light->type = b->Type;
     light->diffuse = b->Diffuse;
 
@@ -754,7 +781,6 @@ void captureLight(DWORD a, const D3DLIGHT8* b) {
 }
 
 void captureMaterial(const D3DMATERIAL8* a) {
-    // Morrowind does not use specular lighting
     rs.diffuseMaterial = a->Diffuse;
     frs.material.diffuse = a->Diffuse;
     frs.material.ambient = a->Ambient;
@@ -763,7 +789,7 @@ void captureMaterial(const D3DMATERIAL8* a) {
 }
 
 // --------------------------------------------------------
-// FPS meter - Updates every 500ms. Morrowind's internal meter changes too fast and falsely clamps the fps.
+// FPS meter
 
 float calcFPS() {
     static int lastMillis, framesSinceUpdate;
