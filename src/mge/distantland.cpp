@@ -126,6 +126,46 @@ static void syncRemixSky() {
     float masserPhase = ((float)masserPhaseIndex + 0.5f) / 8.0f;
     snprintf(buf, sizeof(buf), "%.4f", masserPhase);
     api->SetConfigVariable("rtx.atmosphere.masserPhase", buf);
+
+    // ================================================================
+    // Clouds: map Morrowind weather state to a [0, 1] coverage value.
+    // Morrowind weather IDs:
+    //   0 = Clear       -> 0.00
+    //   1 = Cloudy      -> 0.35
+    //   2 = Foggy       -> 0.20   (fog is ground-level; keep sky lightly clouded)
+    //   3 = Overcast    -> 0.85
+    //   4 = Rain        -> 0.95
+    //   5 = Thunder     -> 1.00
+    //   6 = Ash         -> 0.80   (ash storm — heavy sky)
+    //   7 = Blight      -> 0.85
+    //   8 = Snow        -> 0.75
+    //   9 = Blizzard    -> 1.00
+    // Interior cells with no exterior weather fall back to clear.
+    auto weatherCoverage = [](DWORD w) -> float {
+        switch (w) {
+            case 0: return 0.00f;
+            case 1: return 0.35f;
+            case 2: return 0.20f;
+            case 3: return 0.85f;
+            case 4: return 0.95f;
+            case 5: return 1.00f;
+            case 6: return 0.80f;
+            case 7: return 0.85f;
+            case 8: return 0.75f;
+            case 9: return 1.00f;
+            default: return 0.00f;
+        }
+    };
+
+    DWORD curW = mwBridge->GetCurrentWeather();
+    DWORD nxtW = mwBridge->GetNextWeather();
+    float ratio = mwBridge->GetWeatherRatio();  // 0 = fully current, 1 = fully next
+    if (ratio < 0.0f) ratio = 0.0f;
+    if (ratio > 1.0f) ratio = 1.0f;
+
+    float coverage = weatherCoverage(curW) * (1.0f - ratio) + weatherCoverage(nxtW) * ratio;
+    snprintf(buf, sizeof(buf), "%.3f", coverage);
+    api->SetConfigVariable("rtx.atmosphere.cloudCoverage", buf);
 }
 #endif
 
