@@ -65,38 +65,42 @@ static void syncRemixSky() {
     // vanilla billboard moon. Morrowind uses Z-up (x=east, y=north,
     // z=up), so elevation = asin(z), rotation = atan2(x, y).
     // This gives us pixel-perfect match with vanilla moon positions.
+    //
+    // Per the 2026-05-06 merge with RemixProjGroup Kim's fork, Remix
+    // now uses an indexed moon array (rtx.atmosphere.moon0/moon1/...).
+    // Secunda = moon0, Masser = moon1.
     // ================================================================
     float mx, my, mz;
 
-    // Secunda (smaller, brighter moon)
+    // Secunda (smaller, brighter moon) — moon0
     if (mwBridge->GetMoonDir(true, mx, my, mz)) {
         float moonElev = asinf(std::max(-1.0f, std::min(1.0f, mz))) * (180.0f / 3.14159265f);
         float moonRot = atan2f(mx, my) * (180.0f / 3.14159265f);
 
         snprintf(buf, sizeof(buf), "%.2f", moonElev);
-        api->SetConfigVariable("rtx.atmosphere.moonElevation", buf);
+        api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", buf);
 
         snprintf(buf, sizeof(buf), "%.2f", moonRot);
-        api->SetConfigVariable("rtx.atmosphere.moonRotation", buf);
+        api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", buf);
     } else {
         // Moon not in scenegraph (loading screen, interior, etc.) — hide it
-        api->SetConfigVariable("rtx.atmosphere.moonElevation", "-20.0");
-        api->SetConfigVariable("rtx.atmosphere.moonRotation", "180.0");
+        api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", "-20.0");
+        api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", "180.0");
     }
 
-    // Masser (larger, red moon) — completely independent orbit
+    // Masser (larger, red moon) — moon1, completely independent orbit
     if (mwBridge->GetMoonDir(false, mx, my, mz)) {
         float masserElev = asinf(std::max(-1.0f, std::min(1.0f, mz))) * (180.0f / 3.14159265f);
         float masserRot = atan2f(mx, my) * (180.0f / 3.14159265f);
 
         snprintf(buf, sizeof(buf), "%.2f", masserElev);
-        api->SetConfigVariable("rtx.atmosphere.masserElevation", buf);
+        api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", buf);
 
         snprintf(buf, sizeof(buf), "%.2f", masserRot);
-        api->SetConfigVariable("rtx.atmosphere.masserRotation", buf);
+        api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", buf);
     } else {
-        api->SetConfigVariable("rtx.atmosphere.masserElevation", "-20.0");
-        api->SetConfigVariable("rtx.atmosphere.masserRotation", "180.0");
+        api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", "-20.0");
+        api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", "180.0");
     }
 
     // ================================================================
@@ -120,38 +124,40 @@ static void syncRemixSky() {
     int secundaPhaseIndex = ((int)daysPassed % 16) / 2;  // 0..7
     float secundaPhase = ((float)secundaPhaseIndex + 0.5f) / 8.0f;
     snprintf(buf, sizeof(buf), "%.4f", secundaPhase);
-    api->SetConfigVariable("rtx.atmosphere.moonPhase", buf);
+    api->SetConfigVariable("rtx.atmosphere.moon0.phase0", buf);
 
     int masserPhaseIndex = ((int)daysPassed % 24) / 3;  // 0..7
     float masserPhase = ((float)masserPhaseIndex + 0.5f) / 8.0f;
     snprintf(buf, sizeof(buf), "%.4f", masserPhase);
-    api->SetConfigVariable("rtx.atmosphere.masserPhase", buf);
+    api->SetConfigVariable("rtx.atmosphere.moon1.phase1", buf);
 
     // ================================================================
     // Clouds: map Morrowind weather state to a [0, 1] coverage value.
-    // Morrowind weather IDs:
+    // Morrowind weather IDs (tuned 2026-05-07 after first round of
+    // daylight playtest — Cloudy was reading as too sparse for a
+    // Nubis-style spatial distribution; heavy storms nudged up):
     //   0 = Clear       -> 0.00
-    //   1 = Cloudy      -> 0.35
-    //   2 = Foggy       -> 0.20   (fog is ground-level; keep sky lightly clouded)
-    //   3 = Overcast    -> 0.85
+    //   1 = Cloudy      -> 0.55
+    //   2 = Foggy       -> 0.15   (sky above ground-fog is often clear)
+    //   3 = Overcast    -> 0.90
     //   4 = Rain        -> 0.95
     //   5 = Thunder     -> 1.00
-    //   6 = Ash         -> 0.80   (ash storm — heavy sky)
-    //   7 = Blight      -> 0.85
-    //   8 = Snow        -> 0.75
+    //   6 = Ash         -> 0.90   (ashstorms render opaque overhead)
+    //   7 = Blight      -> 0.90
+    //   8 = Snow        -> 0.85   (Solstheim snowfall is a heavy grey)
     //   9 = Blizzard    -> 1.00
     // Interior cells with no exterior weather fall back to clear.
     auto weatherCoverage = [](DWORD w) -> float {
         switch (w) {
             case 0: return 0.00f;
-            case 1: return 0.35f;
-            case 2: return 0.20f;
-            case 3: return 0.85f;
+            case 1: return 0.55f;
+            case 2: return 0.15f;
+            case 3: return 0.90f;
             case 4: return 0.95f;
             case 5: return 1.00f;
-            case 6: return 0.80f;
-            case 7: return 0.85f;
-            case 8: return 0.75f;
+            case 6: return 0.90f;
+            case 7: return 0.90f;
+            case 8: return 0.85f;
             case 9: return 1.00f;
             default: return 0.00f;
         }
@@ -165,7 +171,10 @@ static void syncRemixSky() {
 
     float coverage = weatherCoverage(curW) * (1.0f - ratio) + weatherCoverage(nxtW) * ratio;
     snprintf(buf, sizeof(buf), "%.3f", coverage);
-    api->SetConfigVariable("rtx.atmosphere.cloudCoverage", buf);
+    // Remix Plus renamed cloudCoverage -> cloudCoverageMean on 2026-05-06
+    // (Nubis-style spatial variation: Mean + Spread + NoiseScale).
+    // We only drive the mean; spread/noise are artist-tuned.
+    api->SetConfigVariable("rtx.atmosphere.cloudCoverageMean", buf);
 }
 #endif
 
