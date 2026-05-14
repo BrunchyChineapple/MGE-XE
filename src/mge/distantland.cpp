@@ -181,6 +181,27 @@ static void syncRemixSky() {
         api->SetGameValue("__weather.blend_seconds", "20.0");
         api->SetGameValue("__weather.target", targetPreset);
     }
+
+    // Cloud wind: derive speed and direction from Morrowind's wind state
+    // per-frame. windScaling (0–1) is already blended between current and
+    // next weather by adjustFog() which runs before syncRemixSky().
+    // Both options are NoSave in rtx_options.h so these writes go to the
+    // Derived layer and never pollute rtx.conf or user.conf.
+    {
+        float cloudSpeed = 0.11f + DistantLand::windScaling * 0.05f;
+        if (cloudSpeed > 0.155f) cloudSpeed = 0.155f;
+        snprintf(buf, sizeof(buf), "%.4f", cloudSpeed);
+        api->SetConfigVariable("rtx.atmosphere.cloudWindSpeed", buf);
+
+        const float* wind = mwBridge->GetWindVector();
+        float windMag = sqrtf(wind[0] * wind[0] + wind[1] * wind[1]);
+        if (windMag > 0.001f) {
+            float windDir = atan2f(wind[1], wind[0]) * (180.0f / 3.14159265f);
+            if (windDir < 0.0f) windDir += 360.0f;
+            snprintf(buf, sizeof(buf), "%.1f", windDir);
+            api->SetConfigVariable("rtx.atmosphere.cloudWindDirection", buf);
+        }
+    }
 }
 #endif
 
