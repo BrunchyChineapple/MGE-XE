@@ -72,16 +72,30 @@ static void syncRemixSky() {
     // ================================================================
     float mx, my, mz;
 
+    // Camera position for moon direction calculation. The moon billboard
+    // is parented to the sky root which tracks the camera, so its world
+    // position = cameraPos + skyDirection * domeRadius. Subtracting the
+    // camera (not the player) eliminates parallax when crouching or
+    // orbiting in third person.
+    float camX = DistantLand::eyePos.x;
+    float camY = DistantLand::eyePos.y;
+    float camZ = DistantLand::eyePos.z;
+
     // Secunda (smaller, brighter moon) — moon0
     if (mwBridge->GetMoonDir(true, mx, my, mz)) {
-        float moonElev = asinf(std::max(-1.0f, std::min(1.0f, mz))) * (180.0f / 3.14159265f);
-        float moonRot = atan2f(mx, my) * (180.0f / 3.14159265f);
+        float dx = mx - camX, dy = my - camY, dz = mz - camZ;
+        float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (len > 0.001f) {
+            dx /= len; dy /= len; dz /= len;
+            float moonElev = asinf(std::max(-1.0f, std::min(1.0f, dz))) * (180.0f / 3.14159265f);
+            float moonRot = atan2f(dx, dy) * (180.0f / 3.14159265f);
 
-        snprintf(buf, sizeof(buf), "%.2f", moonElev);
-        api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", buf);
+            snprintf(buf, sizeof(buf), "%.2f", moonElev);
+            api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", buf);
 
-        snprintf(buf, sizeof(buf), "%.2f", moonRot);
-        api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", buf);
+            snprintf(buf, sizeof(buf), "%.2f", moonRot);
+            api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", buf);
+        }
     } else {
         // Moon not in scenegraph (loading screen, interior, etc.) — hide it
         api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", "-20.0");
@@ -90,14 +104,19 @@ static void syncRemixSky() {
 
     // Masser (larger, red moon) — moon1, completely independent orbit
     if (mwBridge->GetMoonDir(false, mx, my, mz)) {
-        float masserElev = asinf(std::max(-1.0f, std::min(1.0f, mz))) * (180.0f / 3.14159265f);
-        float masserRot = atan2f(mx, my) * (180.0f / 3.14159265f);
+        float dx = mx - camX, dy = my - camY, dz = mz - camZ;
+        float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (len > 0.001f) {
+            dx /= len; dy /= len; dz /= len;
+            float masserElev = asinf(std::max(-1.0f, std::min(1.0f, dz))) * (180.0f / 3.14159265f);
+            float masserRot = atan2f(dx, dy) * (180.0f / 3.14159265f);
 
-        snprintf(buf, sizeof(buf), "%.2f", masserElev);
-        api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", buf);
+            snprintf(buf, sizeof(buf), "%.2f", masserElev);
+            api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", buf);
 
-        snprintf(buf, sizeof(buf), "%.2f", masserRot);
-        api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", buf);
+            snprintf(buf, sizeof(buf), "%.2f", masserRot);
+            api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", buf);
+        }
     } else {
         api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", "-20.0");
         api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", "180.0");
