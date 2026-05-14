@@ -132,36 +132,26 @@ static void syncRemixSky() {
     api->SetConfigVariable("rtx.atmosphere.moon1.phase1", buf);
 
     // ================================================================
-    // Clouds: map Morrowind weather state to a [0, 1] coverage value.
-    // Morrowind weather IDs (tuned 2026-05-07 after first round of
-    // daylight playtest — Cloudy was reading as too sparse for a
-    // Nubis-style spatial distribution; heavy storms nudged up):
-    //   0 = Clear       -> 0.00
-    //   1 = Cloudy      -> 0.55
-    //   2 = Foggy       -> 0.15   (sky above ground-fog is often clear)
-    //   3 = Overcast    -> 0.90
-    //   4 = Rain        -> 0.95
-    //   5 = Thunder     -> 1.00
-    //   6 = Ash         -> 0.90   (ashstorms render opaque overhead)
-    //   7 = Blight      -> 0.90
-    //   8 = Snow        -> 0.85   (Solstheim snowfall is a heavy grey)
-    //   9 = Blizzard    -> 1.00
-    // Interior cells with no exterior weather fall back to clear.
-    auto weatherCoverage = [](DWORD w) -> float {
-        switch (w) {
-            case 0: return 0.00f;
-            case 1: return 0.55f;
-            case 2: return 0.15f;
-            case 3: return 0.90f;
-            case 4: return 0.95f;
-            case 5: return 1.00f;
-            case 6: return 0.90f;
-            case 7: return 0.90f;
-            case 8: return 0.85f;
-            case 9: return 1.00f;
-            default: return 0.00f;
-        }
+    // Weather presets: drive Kim's WeatherBlender via SetGameValue.
+    // Maps Morrowind's 10 weather IDs to Remix weather preset names.
+    // The blender handles smooth interpolation internally — we only
+    // fire SetGameValue when the target weather changes, not every
+    // frame. Morrowind's own transition ratio drives blend_seconds so
+    // the visual blend tracks the game's weather transition timing.
+    // ================================================================
+    static const char* weatherPresetMap[] = {
+        "clear",         // 0 = Clear
+        "partlyCloudy",  // 1 = Cloudy
+        "foggy",         // 2 = Foggy
+        "overcast",      // 3 = Overcast
+        "rainstorm",     // 4 = Rain
+        "thunderstorm",  // 5 = Thunder
+        "sandstorm",     // 6 = Ash
+        "sandstorm",     // 7 = Blight
+        "snow",          // 8 = Snow
+        "blizzard",      // 9 = Blizzard
     };
+    constexpr int kWeatherPresetCount = 10;
 
     DWORD curW = mwBridge->GetCurrentWeather();
     DWORD nxtW = mwBridge->GetNextWeather();
@@ -169,12 +159,28 @@ static void syncRemixSky() {
     if (ratio < 0.0f) ratio = 0.0f;
     if (ratio > 1.0f) ratio = 1.0f;
 
-    float coverage = weatherCoverage(curW) * (1.0f - ratio) + weatherCoverage(nxtW) * ratio;
-    snprintf(buf, sizeof(buf), "%.3f", coverage);
-    // Remix Plus renamed cloudCoverage -> cloudCoverageMean on 2026-05-06
-    // (Nubis-style spatial variation: Mean + Spread + NoiseScale).
-    // We only drive the mean; spread/noise are artist-tuned.
-    api->SetConfigVariable("rtx.atmosphere.cloudCoverageMean", buf);
+    // Determine the effective target: if a transition is in progress
+    // (ratio > 0), the target is the next weather; otherwise current.
+    DWORD effectiveTarget = (ratio > 0.01f && nxtW < (DWORD)kWeatherPresetCount)
+                            ? nxtW : curW;
+    if (effectiveTarget >= (DWORD)kWeatherPresetCount)
+        effectiveTarget = 0;
+
+    const char* targetPreset = weatherPresetMap[effectiveTarget];
+
+    // Only push SetGameValue when the target actually changes to avoid
+    // resetting the blender's internal lerp state every frame.
+    static DWORD s_lastPushedTarget = 0xFFFFFFFF;
+    if (effectiveTarget != s_lastPushedTarget) {
+        s_lastPushedTarget = effectiveTarget;
+
+        // Blend duration: Morrowind transitions take ~20-30 seconds
+        // depending on weather pair. Use a fixed 20s default that
+        // feels natural; the blender handles mid-blend retargeting
+        // cleanly if weather changes again before completion.
+        api->SetGameValue("__weather.blend_seconds", "20.0");
+        api->SetGameValue("__weather.target", targetPreset);
+    }
 }
 #endif
 
