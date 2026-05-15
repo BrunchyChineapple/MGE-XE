@@ -28,7 +28,19 @@ static void syncRemixSky() {
     if (!api || !api->SetConfigVariable) return;
 
     auto mwBridge = MWBridge::get();
-    if (!mwBridge->IsLoaded() || !mwBridge->CellHasWeather()) return;
+    if (!mwBridge->IsLoaded()) return;
+
+    // Volumetric fog: the master switch (enableFog) stays on always so
+    // Remix's volumetric pipeline is available. But we disable the legacy
+    // D3D fog REMAP in interiors — Morrowind sets D3D fog for depth cueing
+    // in enclosed spaces, and with remap enabled Remix converts that into
+    // volumetric haze that looks wrong indoors.
+    bool isExteriorWeather = mwBridge->CellHasWeather();
+    bool isExterior = mwBridge->IsExterior();
+    api->SetConfigVariable("rtx.volumetrics.enableFogRemap", isExterior ? "True" : "False");
+    api->SetConfigVariable("rtx.volumetrics.enableFogColorRemap", isExterior ? "True" : "False");
+
+    if (!isExteriorWeather) return;
 
     float sx, sy, sz;
     mwBridge->GetSunDir(sx, sy, sz);
@@ -200,6 +212,15 @@ static void syncRemixSky() {
         api->SetGameValue("__weather.blend_seconds", "20.0");
         api->SetGameValue("__weather.target", targetPreset);
     }
+
+    // Volumetric fog density: for foggy (2) and rain (4) weather, set
+    // both legacy max distance bounds to 40m (forces thick fog). All
+    // other weathers use defaults (min=1, max=40) which lets the fog
+    // remap system scale naturally with Morrowind's D3D fog distance.
+    bool isThickFogWeather = (effectiveTarget == 2 || effectiveTarget == 4);
+    api->SetConfigVariable("rtx.volumetrics.fogRemapMaxDistanceMinMeters",
+                           isThickFogWeather ? "40.0" : "1.0");
+    api->SetConfigVariable("rtx.volumetrics.fogRemapMaxDistanceMaxMeters", "40.0");
 
     // Cloud wind: derive speed and direction from Morrowind's wind state
     // per-frame. windScaling (0–1) is already blended between current and
