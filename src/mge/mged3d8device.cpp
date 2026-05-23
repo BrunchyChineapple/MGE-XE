@@ -107,6 +107,14 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         // Mark water material to allow MGEProxyDevice to detect it
 #ifndef MGE_RTX
         mwBridge->markWaterNode(99999.0f);
+#else
+        // Under MGE_RTX we still mark the vanilla water node — not to skip
+        // the draw, but to detect it.  When the engine binds the marked
+        // material we capture the texture pointer so the distant-water FFP
+        // pass can re-use it (matching Remix material hashes between near
+        // and distant water → both inherit E-man's translucent replacement).
+        // The vanilla water DIPs themselves still pass through to D3D9.
+        mwBridge->markWaterNode(99999.0f);
 #endif // !MGE_RTX
     }
 
@@ -316,17 +324,28 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 
             // Blend close objects over distant land
             DistantLand::renderStageBlend();
+
+#ifdef MGE_RTX
+            // RTX: draw the distant-water radial plane as part of scene 0,
+            // not gated on whether vanilla water also drew.  Vanilla near
+            // water (drawn later, z-write on, 1 unit above) takes over on
+            // the overlap region.  Both surfaces share E-man's replacement
+            // because cachedWaterTex matches the vanilla material hash.
+            if (distantWater) {
+                DistantLand::renderStageWaterFFP();
+            }
+#endif
         } else if (!isFrameComplete) {
             // Everything else except UI
 #ifndef MGE_RTX
             DistantLand::renderStage2();
-#endif
 
             // Draw water if the Morrowind water plane doesn't appear in view
             if (distantWater && !waterDrawn && !isStencilScene) {
                 DistantLand::renderStageWater();
                 waterDrawn = true;
             }
+#endif
         }
     }
 
@@ -514,6 +533,38 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
 
         if (isWaterMaterial) {
+#ifdef MGE_RTX
+            // RTX: capture vanilla water's stage-0 texture on the FIRST
+            // water DIP of each frame.  Morrowind cycles through 32
+            // textures (water_00..water_31) at ~25 FPS to animate the
+            // surface, and E-man's mod has a separate replacement keyed
+            // off each frame's hash — but only the first DIP per frame
+            // binds the cycling colour texture.  Subsequent water DIPs
+            // bind normal maps and reflection effect textures that do
+            // not cycle; capturing those would freeze the distant plane
+            // on a non-animating texture.  waterDrawn (also used to gate
+            // the post-DIP fallback) doubles as our once-per-frame guard.
+            //
+            // After capture, fall through so the engine's own water draw
+            // still reaches D3D9 — Remix needs to see it to apply the
+            // replacement on the near-water surface.
+            if (!waterDrawn) {
+                IDirect3DBaseTexture9* base = nullptr;
+                ProxyInterface->GetTexture(0, &base);
+                if (base) {
+                    IDirect3DTexture9* asTex = nullptr;
+                    if (SUCCEEDED(base->QueryInterface(IID_IDirect3DTexture9, (void**)&asTex)) && asTex) {
+                        if (DistantLand::cachedWaterTex && DistantLand::cachedWaterTex != asTex) {
+                            DistantLand::cachedWaterTex->Release();
+                        }
+                        DistantLand::cachedWaterTex = asTex;  // owns one AddRef ref
+                    }
+                    base->Release();
+                }
+                waterDrawn = true;
+            }
+            // Fall through to Direct3DDevice8::DrawIndexedPrimitive below
+#else
             if (distantWater) {
                 if (!waterDrawn) {
                     DistantLand::renderStageWater();
@@ -521,6 +572,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 }
                 return D3D_OK;
             }
+#endif
         } else {
             if (!DistantLand::inspectIndexedPrimitive(sceneCount, &rs, &frs, &lightrs)) {
                 return D3D_OK;
