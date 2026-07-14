@@ -54,6 +54,9 @@ namespace MGEgui.DistantLand {
             this.lTexWorldResolution = new System.Windows.Forms.Label();
             this.cmbTexWorldNormalRes = new System.Windows.Forms.ComboBox();
             this.lTexWorldNormalRes = new System.Windows.Forms.Label();
+            this.cbTexComposite = new System.Windows.Forms.CheckBox();
+            this.cmbTexCompositeRes = new System.Windows.Forms.ComboBox();
+            this.lTexCompositeRes = new System.Windows.Forms.Label();
             this.bTexSkip = new System.Windows.Forms.Button();
             this.bTexRun = new System.Windows.Forms.Button();
             this.tabMesh = new System.Windows.Forms.TabPage();
@@ -352,6 +355,9 @@ namespace MGEgui.DistantLand {
             this.tabTex.Controls.Add(this.lTexWorldResolution);
             this.tabTex.Controls.Add(this.cmbTexWorldNormalRes);
             this.tabTex.Controls.Add(this.lTexWorldNormalRes);
+            this.tabTex.Controls.Add(this.cbTexComposite);
+            this.tabTex.Controls.Add(this.cmbTexCompositeRes);
+            this.tabTex.Controls.Add(this.lTexCompositeRes);
             this.tabTex.Controls.Add(this.bTexSkip);
             this.tabTex.Controls.Add(this.bTexRun);
             this.tabTex.Location = new System.Drawing.Point(4, 27);
@@ -446,6 +452,44 @@ namespace MGEgui.DistantLand {
             this.lTexWorldNormalRes.TabIndex = 0;
             this.lTexWorldNormalRes.Text = "World normalmap resolution";
             // 
+            // cbTexComposite
+            // 
+            this.cbTexComposite.AutoSize = true;
+            this.cbTexComposite.Location = new System.Drawing.Point(11, 140);
+            this.cbTexComposite.Name = "cbTexComposite";
+            this.cbTexComposite.Size = new System.Drawing.Size(290, 19);
+            this.cbTexComposite.TabIndex = 2;
+            this.cbTexComposite.Text = "Bake per-cell composite textures (sharper distant terrain)";
+            this.cbTexComposite.UseVisualStyleBackColor = true;
+            this.cbTexComposite.CheckedChanged += new System.EventHandler(this.cbTexComposite_CheckedChanged);
+            // 
+            // cmbTexCompositeRes
+            // 
+            this.cmbTexCompositeRes.ContextMenuStrip = this.DudMenu;
+            this.cmbTexCompositeRes.FormattingEnabled = true;
+            this.cmbTexCompositeRes.Items.AddRange(new object[] {
+                                    "128",
+                                    "256",
+                                    "512",
+                                    "1024",
+                                    "2048",
+                                    "4096",
+                                    "8192"});
+            this.cmbTexCompositeRes.Location = new System.Drawing.Point(11, 165);
+            this.cmbTexCompositeRes.Name = "cmbTexCompositeRes";
+            this.cmbTexCompositeRes.Size = new System.Drawing.Size(100, 23);
+            this.cmbTexCompositeRes.TabIndex = 3;
+            this.cmbTexCompositeRes.KeyPress += new System.Windows.Forms.KeyPressEventHandler(this.IgnoreKeyPress);
+            // 
+            // lTexCompositeRes
+            // 
+            this.lTexCompositeRes.AutoSize = true;
+            this.lTexCompositeRes.Location = new System.Drawing.Point(117, 168);
+            this.lTexCompositeRes.Name = "lTexCompositeRes";
+            this.lTexCompositeRes.Size = new System.Drawing.Size(160, 15);
+            this.lTexCompositeRes.TabIndex = 0;
+            this.lTexCompositeRes.Text = "Per-cell composite resolution";
+            // 
             // bTexSkip
             // 
             this.bTexSkip.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
@@ -516,6 +560,7 @@ namespace MGEgui.DistantLand {
             this.cmbMeshWorldDetail.ContextMenuStrip = this.DudMenu;
             this.cmbMeshWorldDetail.FormattingEnabled = true;
             this.cmbMeshWorldDetail.Items.AddRange(new object[] {
+                                    "Mega Detail",
                                     "Ultra High",
                                     "Very High",
                                     "High",
@@ -1001,6 +1046,9 @@ namespace MGEgui.DistantLand {
         private System.Windows.Forms.Label lTexWorldResolution;
         private System.Windows.Forms.ComboBox cmbTexWorldNormalRes;
         private System.Windows.Forms.Label lTexWorldNormalRes;
+        private System.Windows.Forms.CheckBox cbTexComposite;
+        private System.Windows.Forms.ComboBox cmbTexCompositeRes;
+        private System.Windows.Forms.Label lTexCompositeRes;
         private System.Windows.Forms.Button bTexSkip;
         private System.Windows.Forms.Button bTexRun;
         private System.Windows.Forms.Label lMeshDesc;

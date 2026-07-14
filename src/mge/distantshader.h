@@ -37,4 +37,4 @@ enum RenderDepthID {
 };
 
 static const int SIZEOFSTATICVERT = 20;
-static const int SIZEOFLANDVERT = 16;
+static const int SIZEOFLANDVERT = 20;   // was 16; +4 for the appended UBYTE4N vertex normal (Normal[4] @16)

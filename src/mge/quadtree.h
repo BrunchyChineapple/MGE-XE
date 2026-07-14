@@ -2,25 +2,16 @@
 
 #include "dlmath.h"
 #include "memorypool.h"
+#include "ipc/bridge.h"
+
+#include <algorithm>
 #include <vector>
-#ifdef MGE_RTX
-#include <unordered_set>
-#include <unordered_map>
-#endif
 
 
 
-struct QuadTreeMesh {
+struct QuadTreeMesh: public RenderMesh {
     BoundingSphere sphere;
     BoundingBox box;
-    bool enabled, hasAlpha, animateUV;
-
-    IDirect3DTexture9* tex;
-    D3DXMATRIX transform;
-    int verts;
-    IDirect3DVertexBuffer9* vBuffer;
-    int faces;
-    IDirect3DIndexBuffer9* iBuffer;
 
     QuadTreeMesh(
         const BoundingSphere& b_sphere,
@@ -28,11 +19,11 @@ struct QuadTreeMesh {
         const D3DXMATRIX& transform,
         bool hasAlpha,
         bool animateUV,
-        IDirect3DTexture9* tex,
+        ptr32<IDirect3DTexture9> tex,
         int verts,
-        IDirect3DVertexBuffer9* vBuffer,
+        ptr32<IDirect3DVertexBuffer9> vBuffer,
         int faces,
-        IDirect3DIndexBuffer9* iBuffer
+        ptr32<IDirect3DIndexBuffer9> iBuffer
     );
 
     ~QuadTreeMesh();
@@ -41,19 +32,43 @@ struct QuadTreeMesh {
 
     bool operator==(const QuadTreeMesh& rh);
 
-    static bool CompareByState(const QuadTreeMesh* lh, const QuadTreeMesh* rh);
-    static bool CompareByTexture(const QuadTreeMesh* lh, const QuadTreeMesh* rh);
+    static bool CompareByState(const RenderMesh& lh, const RenderMesh& rh);
+    static bool CompareByTexture(const RenderMesh& lh, const RenderMesh& rh);
 };
 
 //-----------------------------------------------------------------------------
-
+template<class T>
 class VisibleSet {
 public:
     VisibleSet() {}
+    VisibleSet(T&& container): visible_set(container) {}
     ~VisibleSet() {}
 
     void Render(IDirect3DDevice9* device,
-                unsigned int vertex_size);
+                unsigned int vertex_size,
+                bool parallelRead = false) {
+        IDirect3DVertexBuffer9* last_buffer = 0;
+
+        if (parallelRead) {
+            visible_set.start_read();
+        }
+        visible_set.restart();
+        while (!visible_set.at_end()) {
+            const RenderMesh& mesh = visible_set.next();
+            // Set buffer if it has changed
+            if (last_buffer != mesh.vBuffer) {
+                device->SetIndices(mesh.iBuffer);
+                device->SetStreamSource(0, mesh.vBuffer, 0, vertex_size);
+                last_buffer = mesh.vBuffer;
+            }
+
+            device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, mesh.verts, 0, mesh.faces);
+        }
+
+        if (parallelRead) {
+            visible_set.end_read();
+        }
+    }
 
     void Render(IDirect3DDevice9* device,
                 ID3DXEffect* effect,
@@ -62,63 +77,135 @@ public:
                 const D3DXHANDLE* has_alpha_handle,
                 const D3DXHANDLE* animate_uv_handle,
                 const D3DXHANDLE* world_matrix_handle,
-                unsigned int vertex_size);
+                unsigned int vertex_size,
+                bool parallelRead = false) {
+        IDirect3DTexture9* last_texture = nullptr;
+        IDirect3DVertexBuffer9* last_buffer = nullptr;
+        bool last_animateUV = false;
 
-    void SortByState();
-    void SortByTexture();
-    void RemoveAll();
+        // Reset UV animation variables
+        if (animate_uv_handle) {
+            effectPool->SetBool(*animate_uv_handle, false);
+            effect->CommitChanges();
+        }
+
+        if (parallelRead) {
+            visible_set.start_read();
+        }
+        visible_set.restart();
+        while (!visible_set.at_end()) {
+            const RenderMesh& mesh = visible_set.next();
+
+            // Set texture and texture related variables if it has changed
+            if (texture_handle && last_texture != mesh.tex) {
+                effectPool->SetTexture(*texture_handle, mesh.tex);
 
 #ifdef MGE_RTX
-    // TTL-based retention: meshes that leave the frustum are kept for a few
-    // frames before being removed, preventing pop-out flicker with Remix.
-    // TTL is in frames — meshes get this many frames of grace after leaving.
-    static constexpr int RTX_MESH_TTL = 3;
-
-    void RetainWithTTL() {
-        // Build a set of currently visible meshes for fast lookup
-        std::unordered_set<const QuadTreeMesh*> currentSet(visible_set.begin(), visible_set.end());
-
-        // Update TTL for retained meshes
-        auto it = retained.begin();
-        while (it != retained.end()) {
-            if (currentSet.count(it->first)) {
-                // Mesh is still visible — reset TTL, don't need to retain it
-                it = retained.erase(it);
-            } else {
-                // Mesh left the frustum — decrement TTL
-                it->second--;
-                if (it->second <= 0) {
-                    // TTL expired — remove
-                    it = retained.erase(it);
-                } else {
-                    // Still has TTL — add to visible set
-                    visible_set.push_back(it->first);
-                    ++it;
-                }
-            }
-        }
-
-        // Add newly departed meshes to retention (meshes in previous but not current)
-        for (const auto* mesh : previous_visible) {
-            if (!currentSet.count(mesh) && !retained.count(mesh)) {
-                retained[mesh] = RTX_MESH_TTL;
-                visible_set.push_back(mesh);
-            }
-        }
-
-        // Save current visible set (before retention additions) for next frame
-        previous_visible.assign(currentSet.begin(), currentSet.end());
-    }
-
-    std::unordered_map<const QuadTreeMesh*, int> retained;
-    std::vector<const QuadTreeMesh*> previous_visible;
+                // Also set texture directly on device so RTX Remix can see it.
+                // D3DX effects set textures internally, but Remix may not intercept
+                // the effect's internal SetTexture calls reliably.
+                device->SetTexture(0, mesh.tex);
 #endif
 
-    size_t size() const {
+                if (has_alpha_handle) {
+                    // Depth-only rendering, control if texture alpha channel reads are required in shader
+                    effectPool->SetBool(*has_alpha_handle, mesh.hasAlpha);
+                }
+                else {
+                    // World rendering, alpha test state is compatible with transparency supersampling, while clip() isn't
+                    device->SetRenderState(D3DRS_ALPHATESTENABLE, mesh.hasAlpha);
+                }
+                last_texture = mesh.tex;
+            }
+
+            // Set UV animation variables. Different objects may use the same texture, but animate differently
+            if (animate_uv_handle && mesh.animateUV != last_animateUV) {
+                effectPool->SetBool(*animate_uv_handle, mesh.animateUV);
+                last_animateUV = mesh.animateUV;
+            }
+
+            // Set buffer if it has changed
+            if (last_buffer != mesh.vBuffer) {
+                device->SetIndices(mesh.iBuffer);
+                device->SetStreamSource(0, mesh.vBuffer, 0, vertex_size);
+                last_buffer = mesh.vBuffer;
+            }
+
+            // Set transform matrix
+            effectPool->SetMatrix(*world_matrix_handle, &mesh.transform);
+
+            effect->CommitChanges();
+            device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, mesh.verts, 0, mesh.faces);
+        }
+
+        if (parallelRead) {
+            visible_set.end_read();
+        }
+    }
+
+    void SortByState() {
+        visible_set.sort_by_state();
+    }
+
+    void SortByTexture() {
+        visible_set.sort_by_texture();
+    }
+
+#ifdef MGE_RTX
+    void RetainWithTTL() {
+        visible_set.retain_with_ttl();
+    }
+#endif
+
+    void RemoveAll() {
+        visible_set.clear();
+    }
+
+    void SetVector(const T& vector) {
+        visible_set = vector;
+    }
+
+    size_t Size() const {
         return visible_set.size();
     }
 
-    std::vector<const QuadTreeMesh*> visible_set;
+    bool Empty() const {
+        return visible_set.size() == 0;
+    }
+
+    void Truncate(std::size_t count) {
+        visible_set.truncate(count);
+    }
+
+    void StartWrite() {
+        visible_set.start_write();
+    }
+
+    void EndWrite() {
+        visible_set.end_write();
+    }
+
+    void Reset() {
+        visible_set.restart();
+    }
+
+    const RenderMesh& First() {
+        return visible_set.first();
+    }
+
+    const RenderMesh& Next() {
+        return visible_set.next();
+    }
+
+    void PushBack(const RenderMesh& mesh) {
+        visible_set.push_back(mesh);
+    }
+
+    bool AtEnd() {
+        return visible_set.at_end();
+    }
+
+    T visible_set;
 };
 
 //-----------------------------------------------------------------------------
@@ -136,8 +223,117 @@ struct QuadTreeNode {
     QuadTreeNode(QuadTree* owner);
     ~QuadTreeNode();
 
-    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet& visible_set, bool inside = false);
-    void GetVisibleMeshesCoarse(const ViewFrustum& frustum, VisibleSet& visible_set, bool inside = false);
+    template<class T>
+    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set, bool inside = false) {
+        // Check if this node is fully outside the frustum.
+        // If inside = true then that means it has already been determined that this entire branch is visible
+        if (inside == false) {
+            ViewFrustum::Containment result = frustum.ContainsSphere(sphere);
+
+            if (result == ViewFrustum::OUTSIDE) {
+                return;
+            }
+            if (result == ViewFrustum::INSIDE) {
+                inside = true;
+            }
+        }
+
+        // If this node has children, check them
+        if (children[0]) {
+            children[0]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+        }
+        if (children[1]) {
+            children[1]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+        }
+        if (children[2]) {
+            children[2]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+        }
+        if (children[3]) {
+            children[3]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+        }
+        if (meshes.empty()) {
+            return;
+        }
+
+        // If this node has any meshes, check each of their visibility and add them to the list if they're not completely outside the frustum
+        D3DXVECTOR3 eyepos(viewsphere.x, viewsphere.y, viewsphere.z);
+
+        for (const QuadTreeMesh* mesh : meshes) {
+            if (!mesh->enabled) {
+                continue;
+            }
+
+            if (inside == false) {
+                ViewFrustum::Containment res = frustum.ContainsSphere(mesh->sphere);
+                if (res == ViewFrustum::OUTSIDE) {
+                    continue;
+                }
+                if (res == ViewFrustum::INTERSECTS) {
+                    // The sphere intersects one of the edges of the screen, so try the box test
+                    if (frustum.ContainsBox(mesh->box) == ViewFrustum::OUTSIDE) {
+                        continue;
+                    }
+                }
+            }
+
+            // Avoid camera rotation dependent clipping by using a spherical far clip plane
+            // Test mesh against view sphere (eyepos.xyz, radius)
+            D3DXVECTOR3 d = mesh->sphere.center - eyepos;
+            float range_squared = d.x * d.x + d.y * d.y + d.z * d.z;
+            float view_limit = viewsphere.w + mesh->sphere.radius;
+
+            if (range_squared <= view_limit * view_limit) {
+                visible_set.PushBack(*mesh);
+            }
+        }
+    }
+
+    template<class T>
+    void GetVisibleMeshesCoarse(const ViewFrustum& frustum, VisibleSet<T>& visible_set, bool inside = false) {
+        // Check if this node is fully outside the frustum.
+        // If inside = true then that means it has already been determined that this entire branch is visible
+        if (inside == false) {
+            ViewFrustum::Containment result = frustum.ContainsSphere(sphere);
+
+            if (result == ViewFrustum::OUTSIDE) {
+                return;
+            }
+            if (result == ViewFrustum::INSIDE) {
+                inside = true;
+            }
+        }
+
+        // If this node has children, check them
+        if (children[0]) {
+            children[0]->GetVisibleMeshesCoarse(frustum, visible_set, inside);
+        }
+        if (children[1]) {
+            children[1]->GetVisibleMeshesCoarse(frustum, visible_set, inside);
+        }
+        if (children[2]) {
+            children[2]->GetVisibleMeshesCoarse(frustum, visible_set, inside);
+        }
+        if (children[3]) {
+            children[3]->GetVisibleMeshesCoarse(frustum, visible_set, inside);
+        }
+        if (meshes.empty()) {
+            return;
+        }
+
+        // If this node has any meshes, check each of their visibility and add them to the list if they're not completely outside the frustum
+        for (const QuadTreeMesh* mesh : meshes) {
+            if (!mesh->enabled) {
+                continue;
+            }
+
+            // Only test bounding sphere
+            if (inside == false && frustum.ContainsSphere(mesh->sphere) == ViewFrustum::OUTSIDE) {
+                continue;
+            }
+
+            visible_set.PushBack(*mesh);
+        }
+    }
 
     void AddMesh(QuadTreeMesh* new_mesh, int depth);
     void PushDown(QuadTreeMesh* new_mesh, int depth);
@@ -160,17 +356,23 @@ public:
         const D3DXMATRIX& transform,
         bool hasAlpha,
         bool animateUV,
-        IDirect3DTexture9* tex,
+        ptr32<IDirect3DTexture9> tex,
         int verts,
-        IDirect3DVertexBuffer9* vBuffer,
+        ptr32<IDirect3DVertexBuffer9> vBuffer,
         int faces,
-        IDirect3DIndexBuffer9* iBuffer
+        ptr32<IDirect3DIndexBuffer9> iBuffer
     );
 
     bool Optimize();
     void Clear();
-    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet& visible_set);
-    void GetVisibleMeshesCoarse(const ViewFrustum& frustum, VisibleSet& visible_set);
+    template<class T>
+    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set) {
+        m_root_node->GetVisibleMeshes(frustum, viewsphere, visible_set);
+    }
+    template<class T>
+    void GetVisibleMeshesCoarse(const ViewFrustum& frustum, VisibleSet<T>& visible_set) {
+        m_root_node->GetVisibleMeshesCoarse(frustum, visible_set);
+    }
     void SetBox(float size, const D3DXVECTOR2& center);
     void CalcVolume();
 
@@ -188,11 +390,11 @@ protected:
         const D3DXMATRIX& transform,
         bool hasAlpha,
         bool animateUV,
-        IDirect3DTexture9* tex,
+        ptr32<IDirect3DTexture9> tex,
         int verts,
-        IDirect3DVertexBuffer9* vBuffer,
+        ptr32<IDirect3DVertexBuffer9> vBuffer,
         int faces,
-        IDirect3DIndexBuffer9* iBuffer
+        ptr32<IDirect3DIndexBuffer9> iBuffer
     );
 private:
     // Disallow copy and assignment

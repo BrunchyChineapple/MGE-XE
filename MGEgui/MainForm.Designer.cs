@@ -97,6 +97,7 @@ namespace MGEgui {
             this.bSShotDirClear = new System.Windows.Forms.Button();
             this.gbScene = new System.Windows.Forms.GroupBox();
             this.cbReduceTextureMemUse = new System.Windows.Forms.CheckBox();
+            this.cbUseSharedMemory = new System.Windows.Forms.CheckBox();
             this.cbAutoFOV = new System.Windows.Forms.CheckBox();
             this.udUIScale = new System.Windows.Forms.NumericUpDown();
             this.lUIScale = new System.Windows.Forms.Label();
@@ -1150,6 +1151,7 @@ namespace MGEgui {
             this.gbScene.Anchor = ((System.Windows.Forms.AnchorStyles)(((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left) 
                                     | System.Windows.Forms.AnchorStyles.Right)));
             this.gbScene.Controls.Add(this.cbReduceTextureMemUse);
+            this.gbScene.Controls.Add(this.cbUseSharedMemory);
             this.gbScene.Controls.Add(this.cbAutoFOV);
             this.gbScene.Controls.Add(this.udUIScale);
             this.gbScene.Controls.Add(this.lUIScale);
@@ -1178,6 +1180,16 @@ namespace MGEgui {
             this.cbReduceTextureMemUse.TabIndex = 24;
             this.cbReduceTextureMemUse.Text = "Reduce texture memory use";
             this.cbReduceTextureMemUse.UseVisualStyleBackColor = true;
+            // 
+            // cbUseSharedMemory
+            // 
+            this.cbUseSharedMemory.AutoSize = true;
+            this.cbUseSharedMemory.Location = new System.Drawing.Point(12, 110);
+            this.cbUseSharedMemory.Name = "cbUseSharedMemory";
+            this.cbUseSharedMemory.Size = new System.Drawing.Size(133, 19);
+            this.cbUseSharedMemory.TabIndex = 25;
+            this.cbUseSharedMemory.Text = "Use shared memory";
+            this.cbUseSharedMemory.UseVisualStyleBackColor = true;
             // 
             // cbAutoFOV
             // 
@@ -3266,6 +3278,7 @@ namespace MGEgui {
         private System.Windows.Forms.CheckBox cbD3D8To9Only;
         private System.Windows.Forms.ComboBox cmbDLShadowDetail;
         private System.Windows.Forms.CheckBox cbReduceTextureMemUse;
+        private System.Windows.Forms.CheckBox cbUseSharedMemory;
         private System.Windows.Forms.Panel panelSShotDirButtons;
         private System.Windows.Forms.Label lScreenshotHelp;
         private System.Windows.Forms.CheckBox cbAutoFOV;

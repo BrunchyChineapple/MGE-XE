@@ -183,6 +183,12 @@
     <ClCompile Include="src\mge\api.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\compositecache.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\compositetelemetry.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\proxydx\d3d8device.h">
@@ -246,6 +252,15 @@
       <Filter>Header Files\mwse</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\distantland.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\compositecache.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\compositetelemetry.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\dlcomposite.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\distantshader.h">

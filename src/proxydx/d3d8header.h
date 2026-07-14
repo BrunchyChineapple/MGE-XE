@@ -1,7 +1,7 @@
 #pragma once
 
 #include "d3d9header.h"
-#ifndef MGE_XE
+
 // Direct3D8 definitions (since SDK includes are DX9)
 
 #define IDirect3DIndexBuffer8 void
@@ -81,7 +81,7 @@ typedef struct _D3DSURFACE_DESC8 {
     UINT                Width;
     UINT                Height;
 } D3DSURFACE_DESC8;
-#endif // MGE_XE
+
 typedef IDirect3DVertexBuffer9 IDirect3DVertexBuffer;
 typedef IDirect3DIndexBuffer9 IDirect3DIndexBuffer;
 typedef IDirect3DSurface9 IDirect3DSurface;
@@ -143,7 +143,7 @@ public:
 
 // RGBVECTOR method definitions
 #include "d3d8header.inl"
-#ifndef MGE_XE
+
 typedef struct _D3DCAPS8 {
     /* Device Info */
     D3DDEVTYPE  DeviceType;
@@ -218,4 +218,3 @@ typedef struct _D3DCAPS8 {
     float   MaxPixelShaderValue;        // max value of pixel shader arithmetic component
 
 } D3DCAPS8;
-#endif // MGE_XE

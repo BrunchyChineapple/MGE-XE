@@ -90,6 +90,14 @@ namespace MGEgui.DistantLand {
         private List<AtlasRegion> Atlas;
         private int AtlasSpanX, AtlasSpanY;
 
+        // Per-cell composite texturing settings (Req 1.5 / 6.2 / 9.3), loaded from / saved to the
+        // DLWizard Settings INI section alongside TexRes/NormRes. compositeEnabled is the additive
+        // enable toggle (default on); compositeResIndex is the texRes dictionary index of the per-cell
+        // composite resolution (default index 3 == 1024). The actual edge texel count is 128 <<
+        // compositeResIndex, mirroring how WorldRes is derived from cmbTexWorldResolution.SelectedIndex.
+        private bool compositeEnabled = true;
+        private int compositeResIndex = 3; // 128 << 3 == 1024 (CompositeBaker.DefaultEdgeTexels)
+
         /* Common handlers */
 
         private void IgnoreKeyPress(object sender, KeyPressEventArgs e) {
@@ -193,8 +201,20 @@ namespace MGEgui.DistantLand {
             { "Very High", 1 },
             { "High", 2 },
             { "Medium", 3 },
-            { "Low", 4 }
+            { "Low", 4 },
+            { "Mega Detail", 5 }
         };
+
+        // The detail index stored in the WorldMesh INI key is decoupled from the dropdown's
+        // display position so "Mega Detail" can sit at the top of the list without renumbering
+        // the existing tiers (Ultra High..Low keep detail indices 0..4; Mega is the new index 5).
+        // MeshDetailOrder maps a combo position to its detail index; the inverse maps back.
+        private static readonly int[] MeshDetailOrder = { 5, 0, 1, 2, 3, 4 };
+        private static readonly int[] MeshDetailOrderInverse = { 1, 2, 3, 4, 5, 0 };
+
+        // Mega Detail tolerance: a single tunable constant, finer than Ultra High (15.0) so ROAM
+        // subdivides curved terrain toward the source grid.
+        private const float kMegaTolerance = 2.0f;
 
         private static Dictionary<string, double> sMeshDet = new Dictionary<string, double> {
             { "Full", 0 },
@@ -214,6 +234,12 @@ namespace MGEgui.DistantLand {
         private static INIFile.INIVariableDef iniPlugSort = new INIFile.INIVariableDef("PlugSort", iniDLWizardSets, "Plugins view sort order", INIFile.INIVariableType.Dictionary, "Load order", sortOrder);
         private static INIFile.INIVariableDef iniTexRes = new INIFile.INIVariableDef("TexRes", iniDLWizardSets, "World texture resolution", INIFile.INIVariableType.Dictionary, "2048", texRes);
         private static INIFile.INIVariableDef iniNormRes = new INIFile.INIVariableDef("NormRes", iniDLWizardSets, "World normalmap resolution", INIFile.INIVariableType.Dictionary, "1024", texRes);
+        // Per-cell composite texturing (Req 1.5 / 6.2 / 9.3). Composite is the enable toggle for the
+        // additive Composite_Baker stage; CompositeRes is the per-cell composite resolution (default
+        // 1024). Both reuse the existing DLWizard Settings INI section + texRes dictionary so they are
+        // declared, read, and persisted exactly like the existing world texture settings.
+        private static INIFile.INIVariableDef iniComposite = new INIFile.INIVariableDef("Composite", iniDLWizardSets, "Bake per-cell composite textures", INIFile.INIBoolType.OnOff, "On");
+        private static INIFile.INIVariableDef iniCompositeRes = new INIFile.INIVariableDef("CompositeRes", iniDLWizardSets, "Per-cell composite resolution", INIFile.INIVariableType.Dictionary, "1024", texRes);
         private static INIFile.INIVariableDef iniTex2Step = new INIFile.INIVariableDef("Tex2Step", iniDLWizardSets, "Create world texture in two steps", INIFile.INIBoolType.Text, "False");
         private static INIFile.INIVariableDef iniWorldMesh = new INIFile.INIVariableDef("WorldMesh", iniDLWizardSets, "World mesh detail", INIFile.INIVariableType.Dictionary, "Auto", wMeshDet);
         private static INIFile.INIVariableDef iniMinStat = new INIFile.INIVariableDef("MinStat", iniDLWizardSets, "Minimum static size", INIFile.INIVariableType.UInt16, "150", 0, 9999);
@@ -233,6 +259,8 @@ namespace MGEgui.DistantLand {
             iniPlugSort,
             iniTexRes,
             iniNormRes,
+            iniComposite,
+            iniCompositeRes,
             iniTex2Step,
             iniWorldMesh,
             iniMinStat,
@@ -258,6 +286,8 @@ namespace MGEgui.DistantLand {
             INIFile.iniDefEmpty,
             iniTexRes,
             iniNormRes,
+            iniComposite,
+            iniCompositeRes,
             iniTex2Step
         };
 
@@ -341,7 +371,26 @@ namespace MGEgui.DistantLand {
 
             cmbTexWorldResolution.SelectedIndex = (int)iniFile.getKeyValue("TexRes");
             cmbTexWorldNormalRes.SelectedIndex = (int)iniFile.getKeyValue("NormRes");
-            cmbMeshWorldDetail.SelectedIndex = (int)iniFile.getKeyValue("WorldMesh");
+            // Per-cell composite settings (Req 1.5 / 6.2 / 9.3). Read from the same INI section as the
+            // world texture settings and bound to the Land Texture tab controls (cbTexComposite enable
+            // toggle + cmbTexCompositeRes resolution dropdown, mirroring cmbTexWorldResolution). The
+            // backing fields mirror the controls so the bake worker reads a stable value.
+            compositeEnabled = (iniFile.getKeyValue("Composite") == 1);
+            compositeResIndex = (int)iniFile.getKeyValue("CompositeRes");
+            cbTexComposite.Checked = compositeEnabled;
+            cmbTexCompositeRes.SelectedIndex = compositeResIndex;
+            cmbTexCompositeRes.Enabled = compositeEnabled;
+            // The WorldMesh INI key stores a detail index (-1 Auto, 0..5), decoupled from the
+            // dropdown's display position. Map the stored detail index back to its combo position via
+            // MeshDetailOrderInverse so the existing tiers keep their meaning and "Mega Detail" (detail
+            // index 5) lands at combo position 0. A stored -1 (Auto) keeps the -1 "no selection"
+            // sentinel so the existing Auto-resolution path (which targets High via MeshDetailOrderInverse[2])
+            // still fires downstream. The bounds check keeps the lookup safe for stored values -1..5.
+            int storedMeshDetail = (int)iniFile.getKeyValue("WorldMesh");
+            cmbMeshWorldDetail.SelectedIndex =
+                (storedMeshDetail >= 0 && storedMeshDetail < MeshDetailOrderInverse.Length)
+                    ? MeshDetailOrderInverse[storedMeshDetail]
+                    : -1;
             udStatMinSize.Value = (int)iniFile.getKeyValue("MinStat");
             udStatGrassDensity.Value = (int)iniFile.getKeyValue("GrassDens");
             cmbStatSkipMipLevels.SelectedIndex = (int)iniFile.getKeyValue("SkipMip");
@@ -390,13 +439,22 @@ namespace MGEgui.DistantLand {
             var iniFile = new INIFile(Statics.fn_inifile, iniTexTab, true);
             iniFile.setKey("TexRes", cmbTexWorldResolution.SelectedIndex);
             iniFile.setKey("NormRes", cmbTexWorldNormalRes.SelectedIndex);
+            iniFile.setKey("Composite", cbTexComposite.Checked);
+            iniFile.setKey("CompositeRes", cmbTexCompositeRes.SelectedIndex);
             iniFile.save();
         }
 
         // saving settings after land mesh creation
         private void SaveMeshSettings() {
             var iniFile = new INIFile(Statics.fn_inifile, iniMeshTab, true);
-            iniFile.setKey("WorldMesh", (cmbMeshWorldDetail_auto ? -1 : (double)cmbMeshWorldDetail.SelectedIndex));
+            // Persist the detail index (not the combo position) so saved files stay stable across the
+            // display-order change: Auto stores -1, otherwise map the selected combo position to its
+            // detail index via MeshDetailOrder. A pre-feature save (where combo position == detail
+            // index for 0..4) reads back identically because those detail indices are unchanged.
+            double meshDetailToStore = (cmbMeshWorldDetail_auto || cmbMeshWorldDetail.SelectedIndex < 0)
+                ? -1
+                : (double)MeshDetailOrder[cmbMeshWorldDetail.SelectedIndex];
+            iniFile.setKey("WorldMesh", meshDetailToStore);
             iniFile.save();
         }
 
@@ -662,6 +720,10 @@ namespace MGEgui.DistantLand {
         private struct CreateTextureArgs {
             public int WorldRes;
             public int WorldNormal;
+            // Per-cell composite bake (Req 1.5 / 1.6 / 9.3). Composite gates the additive Composite_Baker
+            // stage; CompositeRes is the per-cell composite edge resolution in texels (default 1024).
+            public bool Composite;
+            public int CompositeRes;
         }
 
         void workerCreateTextures(object sender, System.ComponentModel.DoWorkEventArgs e) {
@@ -720,6 +782,106 @@ namespace MGEgui.DistantLand {
             wtc.Dispose();
 
             ctc.Dispose();
+
+            // --- Per-cell composite bake (Composite_Baker) -------------------------------------------
+            // Additive stage (Req 1.5, 1.6, 9.3). The province atlas (world.dds / world_n.dds) above is
+            // the primary output and has already been written and disposed; this stage only emits the
+            // extra composite.index / composite.data pair alongside it. When the toggle is off the whole
+            // block is skipped, so the worker's observable output is bit-identical to stock (Req 6.2).
+            if (args.Composite) {
+                BakeCompositeSet(args.CompositeRes);
+            }
+        }
+
+        // Bakes one dedicated DXT1 composite per exterior cell and writes the additive Composite_Set
+        // (composite.index + composite.data) into the distantland directory next to the unchanged
+        // world / world.dds / world_n.dds outputs. Reuses the same per-cell LandMap walk the atlas bake
+        // uses (every non-null, non-default cell the generator processes), so one composite entry is
+        // produced per processed cell (Req 1.1). Per-cell failures are absorbed by CompositeBaker's
+        // placeholder path and never abort the run (Req 1.7); a whole-stage failure is logged and the
+        // already-written atlas outputs remain valid for the Single_Atlas_Path.
+        private void BakeCompositeSet(int edgeTexels) {
+            if (edgeTexels <= 0) {
+                edgeTexels = CompositeBaker.DefaultEdgeTexels;
+            }
+
+            try {
+                backgroundWorker.ReportProgress(0, strings["LandTextureCreate"]);
+
+                // Per-cell [0,1] UVs are pure CPU math (no GPU) and small, and CompositeSetWriter pairs
+                // every bake to its UVs by CellId, so it needs the full UV set up front. Emit eagerly.
+                int cellCount;
+                List<PerCellUV> uvs = EmitCompositeUVs(out cellCount);
+
+                using (var baker = new CompositeBaker(edgeTexels)) {
+                    // Stream the bake into composite.index + composite.data under Data Files\distantland
+                    // (Req 1.6, 3.1). CompositeSetWriter writes each cell's DXT1 to composite.data as it
+                    // is produced (one cell resident at a time) rather than materializing every
+                    // CompositeBakeResult first: the map's composites total ~1 GB of DXT1, and
+                    // accumulating them exhausted the 32-bit generator's address space, throwing an
+                    // OutOfMemoryException that aborted the whole stage with zero files written. The
+                    // writer's data pass is single-pass, so a lazy enumerable suffices and the baker
+                    // stays alive for the Write call. The existing world / world.dds / world_n.dds files
+                    // are never read or rewritten.
+                    var writer = new CompositeSetWriter();
+                    writer.Write(Statics.fn_dl, BakeCellsStreaming(baker, edgeTexels), uvs, edgeTexels);
+                }
+
+                if (DEBUG) {
+                    allWarnings.Add("Per-cell composites baked: " + cellCount + " cells at " + edgeTexels + "px");
+                }
+            } catch (Exception ex) {
+                // Never fail the run on the additive composite stage: the atlas outputs are already
+                // written, so distant land still loads via the Single_Atlas_Path. Log and continue.
+                try {
+                    File.AppendAllText(Statics.fn_dlLog,
+                        "Composite_Set bake failed (atlas outputs retained, Single_Atlas_Path used): " + ex + "\r\n");
+                } catch {
+                }
+            }
+        }
+
+        // Emits the per-cell [0,1] UV set for every occupied exterior cell, in the same row-major
+        // (y outer, x inner) order BakeCellsStreaming walks, assigning each occupied cell the next dense
+        // chunkId. CompositeSetWriter pairs each bake to its UVs by CellId, so the two walks only need to
+        // agree on which cells are occupied and on the chunkId each cell gets - both of which this shared
+        // ordering guarantees. cellCount returns the number of occupied cells emitted.
+        private List<PerCellUV> EmitCompositeUVs(out int cellCount) {
+            var uvs = new List<PerCellUV>();
+            var uvEmitter = new CompositeUVEmitter();
+            int chunkId = 0;
+            for (int y = MapMinY; y <= MapMaxY; y++) {
+                for (int x = MapMinX; x <= MapMaxX; x++) {
+                    LAND land = LandMap[x, y];
+                    if (land == null || land == DefaultLand) {
+                        continue;
+                    }
+                    uvs.Add(uvEmitter.EmitCellGrid(land, chunkId, CompositeUVEmitter.DefaultCellSubdivisions));
+                    chunkId++;
+                }
+            }
+            cellCount = chunkId;
+            return uvs;
+        }
+
+        // Lazily bakes one composite per occupied exterior cell, yielding each CompositeBakeResult as it
+        // is produced so CompositeSetWriter can stream it to composite.data and let it be collected
+        // before the next cell is baked. This keeps only one cell's DXT1 (~0.7 MB at 1024) resident at a
+        // time instead of the whole ~1 GB set, which is what overflowed the 32-bit generator. The walk
+        // order matches EmitCompositeUVs exactly so chunkId/UV pairing stays consistent. Per-cell
+        // failures are absorbed inside BakeCell (placeholder emitted), so this never throws per cell.
+        private IEnumerable<CompositeBakeResult> BakeCellsStreaming(CompositeBaker baker, int edgeTexels) {
+            int progress = 0;
+            for (int y = MapMinY; y <= MapMaxY; y++) {
+                backgroundWorker.ReportProgress(Math.Min(++progress, statusProgress.Maximum));
+                for (int x = MapMinX; x <= MapMaxX; x++) {
+                    LAND land = LandMap[x, y];
+                    if (land == null || land == DefaultLand) {
+                        continue;
+                    }
+                    yield return baker.BakeCell(land, edgeTexels);
+                }
+            }
         }
 
         private class AtlasRegion {
@@ -1590,7 +1752,7 @@ namespace MGEgui.DistantLand {
             + ": To use a ':' (colon) character as a part of object edid, and not a comment, you must precede it by '\\'. Then to use also a '\\' character in edid, you must precede it by another '\\' (this only applies to other than main sections)\r\n"
             + "\r\n"
             + ": NOTE: This file needs UTF-8 character encoding for non-ASCII characters that can be used in name of file or entity or interior\r\n"
-            + ": If you don't see here '«»' something like '<<>>' then your text editor's current character encoding is not set to UTF-8\r\n");
+            + ": If you don't see here 'ï¿½ï¿½' something like '<<>>' then your text editor's current character encoding is not set to UTF-8\r\n");
             sw.Write(": This list was generated with 'min. static size' = ");
             sw.WriteLine(args.MinSize);
             sw.WriteLine();
@@ -2056,7 +2218,7 @@ namespace MGEgui.DistantLand {
             }
             if (cmbMeshWorldDetail.SelectedIndex == -1) {
                 cmbMeshWorldDetail_auto = true;
-                cmbMeshWorldDetail.SelectedIndex = 2;
+                cmbMeshWorldDetail.SelectedIndex = MeshDetailOrderInverse[2];  // Auto -> detail index 2 (High) -> combo position
                 cmbMeshWorldDetail.SelectedIndexChanged += new EventHandler(cmbMeshWorldDetail_SelectedIndexChanged);
                 lMeshAutoInfo.Visible = true;
                 if (DEBUG) {
@@ -2091,7 +2253,7 @@ namespace MGEgui.DistantLand {
             }
             if (cmbMeshWorldDetail.SelectedIndex == -1) {
                 cmbMeshWorldDetail_auto = true;
-                cmbMeshWorldDetail.SelectedIndex = 2;
+                cmbMeshWorldDetail.SelectedIndex = MeshDetailOrderInverse[2];  // Auto -> detail index 2 (High) -> combo position
                 cmbMeshWorldDetail.SelectedIndexChanged += new EventHandler(cmbMeshWorldDetail_SelectedIndexChanged);
                 lMeshAutoInfo.Visible = true;
                 if (DEBUG) {
@@ -2118,6 +2280,11 @@ namespace MGEgui.DistantLand {
             var args = new CreateTextureArgs();
             args.WorldRes = 128 << cmbTexWorldResolution.SelectedIndex;
             args.WorldNormal = 128 << cmbTexWorldNormalRes.SelectedIndex;
+            // Per-cell composite bake (Req 1.5 / 1.6 / 9.3). Resolution is derived from the texRes
+            // dictionary index the same way WorldRes/WorldNormal are (128 << index, so index 3 == 1024).
+            // Sourced from the Land Texture tab controls so the user's choices drive the bake.
+            args.Composite = cbTexComposite.Checked;
+            args.CompositeRes = 128 << cmbTexCompositeRes.SelectedIndex;
             backgroundWorker.RunWorkerAsync(args);
         }
 
@@ -2152,7 +2319,12 @@ namespace MGEgui.DistantLand {
             statusWarnings.Enabled = false;
 
             var cma = new CreateMeshArgs();
-            cma.MeshDetail = cmbMeshWorldDetail.SelectedIndex;
+            // Pass the detail index (not the combo position) to the bake. Auto resolves upstream to
+            // High's combo position, so SelectedIndex is normally 0..5 here; guard the -1 case so an
+            // unresolved Auto still falls through to the High default in GenerateWorldMesh.
+            cma.MeshDetail = (cmbMeshWorldDetail.SelectedIndex >= 0)
+                ? MeshDetailOrder[cmbMeshWorldDetail.SelectedIndex]
+                : -1;
             backgroundWorker.RunWorkerAsync(cma);
         }
 
@@ -2221,10 +2393,16 @@ namespace MGEgui.DistantLand {
         private void GenerateWorldMesh(int detail, string path) {
             // Landscape detail selection
             float tolerance = 125.0f;
-            if (detail >= 0 && detail <= 4) {
-                var toleranceOptions = new float[] { 15.0f, 70.0f, 125.0f, 180.0f, 235.0f };
+            if (detail >= 0 && detail <= 5) {
+                var toleranceOptions = new float[] { 15.0f, 70.0f, 125.0f, 180.0f, 235.0f, kMegaTolerance };
                 tolerance = toleranceOptions[detail];
             }
+
+            // ROAM tree depth is now supplied per-tier to the tessellator. Every existing tier
+            // (Auto/High = -1..4) keeps depth 10, byte-identical to the previous hard-coded value;
+            // only the Mega Detail tier (detail index 5) raises it to 12 so a near-zero tolerance can
+            // subdivide to the 65x65 source grid (leaf size 8192/2^(12/2) = 128 world units).
+            uint tree_depth = (detail == 5) ? 12u : 10u;
 
             // Produce packed atlas data
             var atlas_data = new float[8 * Atlas.Count];
@@ -2248,25 +2426,56 @@ namespace MGEgui.DistantLand {
 
             // Generate optimized landscape mesh
             foreach (var r in Atlas) {
-                // Produce atlas region heightmap array
+                // Produce atlas region heightmap array.
+                //
+                // Inclusive 65x65 source-grid sampling (Req 6.1/6.2): the per-region grid carries
+                // RegionSpan*64 + 1 samples per edge so every cell contributes its full source
+                // indices 0..64, including the trailing seam sample at index 64 that the
+                // pre-feature builder dropped (it used RegionSpan*64 with x2/y2 < 64). Interior
+                // seams are already shared (cell c's index 64 == cell c+1's index 0); the only new
+                // sample per region edge is the last cell's trailing index-64 seam, which without
+                // this would be clamped/flattened and leave a hairline gap. The tessellator
+                // (task 4.2) derives one patch per cell from this inclusive span.
                 int RegionSpanX = r.MaxX - r.MinX + 1;
                 int RegionSpanY = r.MaxY - r.MinY + 1;
-                int DataSpanX = RegionSpanX * 64;
-                int DataSpanY = RegionSpanY * 64;
+                int DataSpanX = RegionSpanX * 64 + 1;
+                int DataSpanY = RegionSpanY * 64 + 1;
                 var height_data = new float[DataSpanX * DataSpanY];
+                // Parallel surface-normal field, xyz per height sample (same inclusive grid layout
+                // as height_data). Sourced from LAND.Normals with the identical inclusive seam
+                // extension so the per-vertex normals the tessellator (task 5.1) carries into the
+                // land vertex are seamless across cell boundaries too.
+                var normal_data = new float[DataSpanX * DataSpanY * 3];
     
-                for (int y1 = r.MinY; y1 <= r.MaxY; y1++) {
-                    for (int y2 = 0; y2 < 64; y2++) {
-                        for (int x1 = r.MinX; x1 <= r.MaxX; x1++) {
-                            for (int x2 = 0; x2 < 64; x2++) {
-                                int y = (y1 - r.MinY) * 64 + y2;
-                                int x = (x1 - r.MinX) * 64 + x2;
-                                if (LandMap[x1, y1] != null) {
-                                    height_data[y * DataSpanX + x] = (float)LandMap[x1, y1].Heights[x2, y2] * 8.0f;
-                                } else {
-                                    height_data[y * DataSpanX + x] = -2048.0f;
-                                }
-                            }
+                // Walk the region grid by destination sample index. Each index maps to a source
+                // cell and an inclusive within-cell index (0..64): cell = idx / 64, sub = idx % 64.
+                // The final index of each edge (idx == RegionSpan*64) clamps to the last cell's
+                // trailing seam (sub = 64) -> LAND.Heights[64,*] / [*,64], the inclusive seam
+                // sample. For all interior indices this reproduces the pre-feature mapping exactly
+                // (idx 64 still reads the next cell's index 0), so existing data is unchanged and
+                // only the trailing seam row/column is added. Scale (*8.0), 128-unit spacing, and
+                // origin are preserved (Req 6.3).
+                for (int y = 0; y < DataSpanY; y++) {
+                    int cy = y / 64;
+                    int y2 = y % 64;
+                    if (cy >= RegionSpanY) { cy = RegionSpanY - 1; y2 = 64; }
+                    int y1 = r.MinY + cy;
+                    for (int x = 0; x < DataSpanX; x++) {
+                        int cx = x / 64;
+                        int x2 = x % 64;
+                        if (cx >= RegionSpanX) { cx = RegionSpanX - 1; x2 = 64; }
+                        int x1 = r.MinX + cx;
+                        int n = (y * DataSpanX + x) * 3;
+                        if (LandMap[x1, y1] != null) {
+                            height_data[y * DataSpanX + x] = (float)LandMap[x1, y1].Heights[x2, y2] * 8.0f;
+                            normal_data[n + 0] = LandMap[x1, y1].Normals[x2, y2].X;
+                            normal_data[n + 1] = LandMap[x1, y1].Normals[x2, y2].Y;
+                            normal_data[n + 2] = LandMap[x1, y1].Normals[x2, y2].Z;
+                        } else {
+                            height_data[y * DataSpanX + x] = -2048.0f;
+                            normal_data[n + 0] = 0.0f;
+                            normal_data[n + 1] = 0.0f;
+                            normal_data[n + 2] = 1.0f;
                         }
                     }
                 }
@@ -2277,7 +2486,7 @@ namespace MGEgui.DistantLand {
                 float maxY = (float)(r.MaxY + 1) * 8192.0f;
     
                 backgroundWorker.ReportProgress(10, strings["LandTessellating"]);
-                NativeMethods.TessellateLandscapeAtlased(path, height_data, (uint)DataSpanX, (uint)DataSpanY, atlas_data, (uint)Atlas.Count, minX, minY, maxX, maxY, tolerance);
+                NativeMethods.TessellateLandscapeAtlased(path, height_data, normal_data, (uint)DataSpanX, (uint)DataSpanY, atlas_data, (uint)Atlas.Count, minX, minY, maxX, maxY, tolerance, tree_depth);
             }
         }
 
@@ -3095,8 +3304,8 @@ namespace MGEgui.DistantLand {
         /* Finish tab methods */
 
         private void setFinishDesc(int stage) {
-            const string spc = "   ";
-            const string mark = "» ";
+            const string spc = "ï¿½ï¿½ï¿½";
+            const string mark = "ï¿½ï¿½";
             var text = new StringBuilder();
 
             if (SetupFlags["ChkLandTex"]) {
@@ -3141,6 +3350,13 @@ namespace MGEgui.DistantLand {
             extent = (extent * extent * 1333 / 1000 + 131072) / 262144;
 
             lTexNormalMemUse.Text = strings["VideoMemUse"] + extent.ToString() + "MB";
+        }
+
+        // Per-cell composite enable toggle (Req 1.5 / 6.2 / 9.3). Greys out the resolution dropdown
+        // when composites are disabled, and keeps the backing field in sync for the bake worker.
+        void cbTexComposite_CheckedChanged(object sender, EventArgs e) {
+            compositeEnabled = cbTexComposite.Checked;
+            cmbTexCompositeRes.Enabled = cbTexComposite.Checked;
         }
     }
 }

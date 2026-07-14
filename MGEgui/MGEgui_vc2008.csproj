@@ -102,6 +102,9 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="DirectX\CompositeBaker.cs" />
+    <Compile Include="DirectX\CompositeUVEmitter.cs" />
+    <Compile Include="DirectX\CompositeSetWriter.cs" />
     <Compile Include="DirectX\DistantLandTextures.cs" />
     <Compile Include="DirectX\DXMain.cs" />
     <Compile Include="DistantLand\BetterCheckedListBox.cs">
@@ -305,4 +308,13 @@
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
   </PropertyGroup>
+  <!-- MGEgui drives the distant-land bake (TessellateLandscapeAtlased) in-process; the dense
+       "Mega Detail" tier exhausts the default 2GB user address space of a 32-bit process and
+       crashes with an out-of-memory during tessellation. The exe must run Large-Address-Aware
+       (4GB on 64-bit Windows). C#/MSBuild has no built-in LAA switch for an x86 exe, so set the
+       IMAGE_FILE_LARGE_ADDRESS_AWARE bit on the built exe here. Dependency-free (no editbin),
+       idempotent, and re-applied on every build so a rebuild never silently regresses to 2GB. -->
+  <Target Name="SetLargeAddressAware" AfterTargets="Build">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;$bytes=[System.IO.File]::ReadAllBytes('$(TargetPath)'); $co=[System.BitConverter]::ToInt32($bytes,0x3C)+22; if((($bytes[$co]) -band 0x20) -eq 0){ $bytes[$co]=[byte](($bytes[$co]) -bor 0x20); [System.IO.File]::WriteAllBytes('$(TargetPath)',$bytes); Write-Host 'LAA: enabled on $(TargetFileName)' } else { Write-Host 'LAA: already enabled on $(TargetFileName)' }&quot;" />
+  </Target>
 </Project>

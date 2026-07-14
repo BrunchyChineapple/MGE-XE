@@ -12,8 +12,10 @@
 #include "remix_api_test.h"
 #define REMIX_ALLOW_X86
 #include "remix_c.h"
+#include "sky_config.h"   // skyConfig() — live MCM/env master toggles (distant fog, constellations, meteors)
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #endif
 
 
@@ -22,54 +24,282 @@ using std::string;
 using std::unordered_map;
 
 #ifdef MGE_RTX
+// File-scope state for syncRemixSky's self-healing watchdog and the
+// weather-blender re-push gate. Both live outside the function so the
+// interior-gating block (which early-returns) can poke s_*lastPushedTarget
+// to force the next exterior frame to re-issue the WeatherBlender target.
+//
+// volatile because the interior-gate write and the main-body read happen
+// from the same thread but the compiler should not be free to hoist or
+// elide the read across the early-return path.
+volatile DWORD s_syncRemixSky_lastPushedTarget = 0xFFFFFFFFu;
+static  DWORD s_syncRemixSky_watchdogFrames    = 0u;
+
+// Watchdog cadence. Every kSyncRemixSky_WatchdogPeriod frames in exterior,
+// force a full re-push of all master toggles + the WeatherBlender target.
+// 240 frames ≈ 4s at 60fps, ≈ 2.7s at 90fps — fast enough to self-heal a
+// transient API-state desync without spamming SetConfigVariable when
+// nothing's wrong. The watchdog only runs in exterior cells; interior is
+// already self-correcting because the interior-gate block clears the
+// last-pushed-target sentinel on every interior frame.
+static const DWORD kSyncRemixSky_WatchdogPeriod = 240u;
+
+// ----------------------------------------------------------------------------
+// Sky reliability guard (2026-06-11): make syncRemixSky "nuke-proof" against
+// scenegraph teardown/rebuild during loads, teleports, and interior<->exterior
+// transitions. Cost is a couple of cheap reads + isfinite-style checks per frame
+// plus edge-triggered resets; nothing new runs heavy continuously.
+//
+//  * Freeze: while a load screen is up the scenegraph is mid-rebuild, so all
+//    reads (sun/moon nodes, weather, daysPassed) are stale/garbage. We push
+//    nothing and let Remix hold its last-good Derived state (no garbage in).
+//  * Last-good cache: every position/phase value is validated (finite, sane)
+//    before it is pushed; the last validated value is cached so a transition
+//    can re-assert a correct sky immediately instead of waiting for a fresh read.
+//  * Edge resync: on a load-screen falling edge OR a cell-token change we force
+//    a full re-push (clear the weather sentinel + re-assert cached sun/moon/phase
+//    the SAME frame), so the sky can't stay latched in a half-updated state
+//    (the "sun stuck below horizon / moons black or frozen until reload" class).
+//  * The 240-frame time-watchdog above remains as a final backstop.
+struct SkySyncCache {
+    bool  haveSun   = false; float sunElev    = 0.0f,  sunRot    = 0.0f;
+    bool  haveMoon0 = false; float moon0Elev  = -20.0f, moon0Rot = 180.0f;
+    bool  haveMoon1 = false; float moon1Elev  = -20.0f, moon1Rot = 180.0f;
+    bool  havePhase = false; float moon0Phase = 0.5f,  moon1Phase = 0.5f;
+};
+static SkySyncCache s_skyCache;
+static DWORD s_syncRemixSky_lastCellToken = 0xFFFFFFFFu;
+static bool  s_syncRemixSky_wasLoading    = false;
+
+// Finite + sane-magnitude guard: self-compare catches NaN, the bound catches inf.
+static inline bool skySane(float v) { return (v == v) && v > -1.0e18f && v < 1.0e18f; }
+
 // Sync Morrowind's sun position to Remix's Hillaire physical sky.
 static void syncRemixSky() {
     remixapi_Interface* api = RemixAPITest::getInterface();
     if (!api || !api->SetConfigVariable) return;
 
+    // Live master toggles (MGE Sky MCM / mge_sky.cfg, polled ~500ms; env fallback). The wrapper
+    // honors these when driving the Derived layer, so the toggles are not stomped by our own writes.
+    const SkyConfig& sky = skyConfig();
+
     auto mwBridge = MWBridge::get();
     if (!mwBridge->IsLoaded()) return;
 
-    // Volumetric fog: the master switch (enableFog) stays on always so
-    // Remix's volumetric pipeline is available. But we disable the legacy
-    // D3D fog REMAP in interiors — Morrowind sets D3D fog for depth cueing
-    // in enclosed spaces, and with remap enabled Remix converts that into
-    // volumetric haze that looks wrong indoors.
+    // --- Sky reliability guard: freeze during scenegraph rebuild ---
+    // While a load screen is up, Morrowind is tearing down / rebuilding the
+    // cell + sky scenegraph; sun/moon node reads, weather, and daysPassed are
+    // stale or garbage on these frames. Push nothing and hold Remix's last-good
+    // Derived state. The falling edge (below) then forces one clean resync.
+    if (mwBridge->IsLoadScreen()) {
+        s_syncRemixSky_wasLoading = true;
+        return;
+    }
+
+    // --- Sky reliability guard: edge-triggered full resync ---
+    // Fire on a load-screen falling edge (any load/teleport just finished) OR a
+    // cell-identity change (interior<->exterior, different interior, load-into-
+    // cell). All exterior cells share one token so ordinary border crossings
+    // don't thrash. On resync we clear the weather sentinel so the target
+    // re-fires, and (in the exterior path below) re-assert cached sun/moon/phase
+    // the same frame. Cheap: 1-2 reads, edge-triggered.
+    const DWORD cellToken = mwBridge->IsExterior()
+        ? 0xE0000000u
+        : (0x10000000u | (mwBridge->IntCurCellAddr() & 0x0FFFFFFFu));
+    bool forceResync = false;
+    if (s_syncRemixSky_wasLoading) { forceResync = true; s_syncRemixSky_wasLoading = false; }
+    if (cellToken != s_syncRemixSky_lastCellToken) { forceResync = true; s_syncRemixSky_lastCellToken = cellToken; }
+    if (forceResync) {
+        s_syncRemixSky_lastPushedTarget = 0xFFFFFFFFu;  // re-fire weather target below
+    }
+
+    // Volumetric fog: the legacy D3D fog REMAP is RE-ENABLED in exteriors. Disabling it was a mistake:
+    // the remap is what supplies the flat in-scatter floor (multiScatteringEstimate = fogColor *
+    // fogRemapColorMultiscatteringScale) AND the medium density. That flat floor is what makes fog
+    // actually VISIBLE without the sun-lit fogSunVisibilityGain term (which blows out over water).
+    // With gain=0 + remap on you get flat fog glow + extinction and no over-water blowout.
+    // (2026-06-13 — reverted the remap-off experiment.)
     bool isExteriorWeather = mwBridge->CellHasWeather();
     bool isExterior = mwBridge->IsExterior();
     api->SetConfigVariable("rtx.volumetrics.enableFogRemap", isExterior ? "True" : "False");
     api->SetConfigVariable("rtx.volumetrics.enableFogColorRemap", isExterior ? "True" : "False");
 
-    if (!isExteriorWeather) return;
+    // Forward the water-surface world Z so Remix can split the volumetric sun-visibility gain at the
+    // water plane: fog below the surface uses rtx.volumetrics.fogSunVisibilityGainUnderwater, fog
+    // above it uses the regular gain. Standing on shore, raising the above-water gain for sun shafts
+    // otherwise blows the fog seen through the water into a white wall. A very-low sentinel (no water
+    // in cell) leaves the split inert -- mirrors the BelowWaterFog sentinel used for distant-land fog.
+    const float waterPlaneZ = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1.0e9f;
+    char waterBuf[32];
+    snprintf(waterBuf, sizeof(waterBuf), "%.3f", waterPlaneZ);
+    api->SetConfigVariable("rtx.volumetrics.waterPlaneWorldZ", waterBuf);
+
+    // Interior sky gating: when entering a true interior (no weather flag),
+    // suppress all sky illumination so light doesn't leak through cracks.
+    // The sun position from the last exterior frame is otherwise stuck at a
+    // high angle and bleeds onto walls/floors via Remix's atmosphere.
+    //
+    // We push -90deg sun + zero intensity + disable clouds/moons/stars/milkyway.
+    // Cells flagged 'behaves as exterior' (caves with weather, grottos, etc.)
+    // pass CellHasWeather() so they never hit this branch and render normally.
+    //
+    // All target options are flagged NoSave in rtx_options.h so these writes
+    // route to the Derived layer and never pollute user.conf / rtx.conf.
+    if (!isExteriorWeather) {
+        api->SetConfigVariable("rtx.atmosphere.sunElevation", "-90.0");
+        api->SetConfigVariable("rtx.atmosphere.sunIntensity", "0.0");
+        api->SetConfigVariable("rtx.atmosphere.cloudEnabled", "False");
+        api->SetConfigVariable("rtx.atmosphere.moon0.enabled0", "False");
+        api->SetConfigVariable("rtx.atmosphere.moon1.enabled1", "False");
+        api->SetConfigVariable("rtx.atmosphere.starBrightness", "0.0");
+        api->SetConfigVariable("rtx.atmosphere.nightSkyBrightness", "0.0");
+        api->SetConfigVariable("rtx.atmosphere.milkyWayEnabled", "False");
+        // Constellation overlay is night-only but bypasses starBrightness;
+        // explicitly suppress it so it doesn't bleed through interior cracks.
+        api->SetConfigVariable("rtx.atmosphere.constellationsEnabled", "False");
+        // Meteors run independent of starBrightness too — sporadic background
+        // (meteorBaseRate) plus calendar showers both need a master gate.
+        api->SetConfigVariable("rtx.atmosphere.meteorsEnabled", "False");
+        // No exterior volumetric fog medium bleeding into true interiors.
+        api->SetConfigVariable("rtx.volumetrics.enable", "False");
+
+        // Force the WeatherBlender into dormant mode while we're in an
+        // interior. Without this, the blender keeps lerping the last
+        // exterior preset and writes nightSkyBrightness (~0.008) to the
+        // Derived layer every frame via writeBlendedToDerivedLayer,
+        // overwriting our nightSkyBrightness="0.0" interior write —
+        // observable as faint airglow leaking through cell-edge cracks.
+        // Same shape as the cloudWindSpeed regression in QUICKSTART
+        // override #4. Clearing __weather.target trips the dormancy gate
+        // in WeatherBlender::update so it stops writing entirely. On
+        // exterior return, the s_lastPushedTarget reset above guarantees
+        // a fresh SetGameValue("__weather.target", ...) below, which
+        // re-arms the blender naturally — no extra restore code needed.
+        api->SetGameValue("__weather.target", "");
+
+        // Force the weather blender to re-push its target on the first
+        // exterior frame after this interior one. Without this, when the
+        // player transitions interior → exterior to the same weather they
+        // had before going inside, s_lastPushedTarget below matches the
+        // current target and we skip the SetGameValue. The blender then
+        // stays frozen at its pre-interior blended state and overwrites
+        // our exterior-restore writes via writeBlendedToDerivedLayer —
+        // observable as "stars missing, moons unlit, sun never rises"
+        // after teleporting around.
+        s_syncRemixSky_lastPushedTarget = 0xFFFFFFFFu;
+        return;
+    }
+
+    // Exterior return: restore the defaults the wrapper drove down for
+    // interior gating. The actual sun/moon positions are written below.
+    api->SetConfigVariable("rtx.atmosphere.sunIntensity", "1.0");
+    api->SetConfigVariable("rtx.atmosphere.cloudEnabled", "True");
+    api->SetConfigVariable("rtx.atmosphere.moon0.enabled0", "True");
+    api->SetConfigVariable("rtx.atmosphere.moon1.enabled1", "True");
+    api->SetConfigVariable("rtx.atmosphere.starBrightness", "1.0");
+    api->SetConfigVariable("rtx.atmosphere.nightSkyBrightness", "0.008");
+    // Constellation overlay + meteors + distant fog: gated by the live MGE Sky toggles. The per-frame
+    // writes were stomping the Derived-layer UI checkboxes; now the wrapper honors the user's master
+    // toggle instead. The interior gating block above already forces all three off (bleed-through).
+    api->SetConfigVariable("rtx.atmosphere.constellationsEnabled", sky.constellations ? "True" : "False");
+    api->SetConfigVariable("rtx.atmosphere.meteorsEnabled", sky.meteors ? "True" : "False");
+    api->SetConfigVariable("rtx.volumetrics.enable", sky.distantFog ? "True" : "False");
+    // milkyWayEnabled: drive True on exterior return to match the
+    // source-level default we flipped to true for this project. The
+    // interior block writes False; the symmetrical write here keeps
+    // the Derived layer in sync as the player crosses cell boundaries.
+    // user.conf can still override (User layer wins over Derived).
+    api->SetConfigVariable("rtx.atmosphere.milkyWayEnabled", "True");
+
+    // Watchdog: every kWatchdogPeriod exterior frames, force a full
+    // resync — clear the WeatherBlender's last-pushed target sentinel
+    // so the SetGameValue below re-fires unconditionally. This is a
+    // belt-and-suspenders self-heal for any racy API-state desync we
+    // haven't caught explicitly (e.g. teleport-induced blender freeze).
+    // Cheap: ~5 SetConfigVariable + 1 SetGameValue every 4 seconds.
+    if ((++s_syncRemixSky_watchdogFrames % kSyncRemixSky_WatchdogPeriod) == 0u) {
+        s_syncRemixSky_lastPushedTarget = 0xFFFFFFFFu;
+    }
+
+    // On a resync edge, re-assert the last-good sun/moon/phase immediately so the
+    // freshly-restored exterior sky is correct THIS frame, before new scenegraph
+    // reads settle. This closes the post-transition gap that otherwise shows as
+    // "sun stuck below horizon", "moons black" (moon enabled while the stale sun
+    // sits at nadir), or "moon frozen". Fresh valid reads below overwrite these.
+    if (forceResync) {
+        char rb[64];
+        if (s_skyCache.haveSun) {
+            snprintf(rb, sizeof(rb), "%.2f", s_skyCache.sunElev);
+            api->SetConfigVariable("rtx.atmosphere.sunElevation", rb);
+            snprintf(rb, sizeof(rb), "%.2f", s_skyCache.sunRot);
+            api->SetConfigVariable("rtx.atmosphere.sunRotation", rb);
+        }
+        if (s_skyCache.haveMoon0) {
+            snprintf(rb, sizeof(rb), "%.2f", s_skyCache.moon0Elev);
+            api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", rb);
+            snprintf(rb, sizeof(rb), "%.2f", s_skyCache.moon0Rot);
+            api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", rb);
+        }
+        if (s_skyCache.haveMoon1) {
+            snprintf(rb, sizeof(rb), "%.2f", s_skyCache.moon1Elev);
+            api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", rb);
+            snprintf(rb, sizeof(rb), "%.2f", s_skyCache.moon1Rot);
+            api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", rb);
+        }
+        if (s_skyCache.havePhase) {
+            snprintf(rb, sizeof(rb), "%.4f", s_skyCache.moon0Phase);
+            api->SetConfigVariable("rtx.atmosphere.moon0.phase0", rb);
+            snprintf(rb, sizeof(rb), "%.4f", s_skyCache.moon1Phase);
+            api->SetConfigVariable("rtx.atmosphere.moon1.phase1", rb);
+        }
+    }
 
     float sx, sy, sz;
     mwBridge->GetSunDir(sx, sy, sz);
     float len = sqrtf(sx * sx + sy * sy + sz * sz);
-    if (len < 0.001f) return;
-    sx /= len; sy /= len; sz /= len;
-
-    float elevation = asinf(std::max(-1.0f, std::min(1.0f, sz))) * (180.0f / 3.14159265f);
-    float rotation = atan2f(sx, sy) * (180.0f / 3.14159265f);
-
-    // Morrowind's scenegraph bounces the sun at the horizon — use game hour
-    // to detect night and push the sun below the horizon for Remix.
-    float hour = mwBridge->getGameHour();
-    if (hour < 6.0f || hour > 20.0f) {
-        elevation = -elevation;
-    } else if (hour < 8.0f) {
-        float t = (hour - 6.0f) / 2.0f;
-        elevation = elevation * (2.0f * t - 1.0f);
-    } else if (hour > 18.0f) {
-        float t = (hour - 18.0f) / 2.0f;
-        elevation = elevation * (1.0f - 2.0f * t);
+    bool haveSun = (len >= 0.001f);
+    if (haveSun) {
+        sx /= len; sy /= len; sz /= len;
     }
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.2f", elevation);
-    api->SetConfigVariable("rtx.atmosphere.sunElevation", buf);
+    // Only push sun position when the scenegraph gives us a valid direction.
+    // On a freshly-loaded cell the sun node can briefly read all zeroes;
+    // skip just this push and let the rest of the sky update proceed so
+    // we don't lose moons/weather/clouds for the same frame. The previous
+    // tick's sun position remains in Remix's Derived layer, which is fine
+    // because the bad reading clears within a frame or two.
+    if (haveSun) {
+        float elevation = asinf(std::max(-1.0f, std::min(1.0f, sz))) * (180.0f / 3.14159265f);
+        float rotation = atan2f(sx, sy) * (180.0f / 3.14159265f);
 
-    snprintf(buf, sizeof(buf), "%.2f", rotation);
-    api->SetConfigVariable("rtx.atmosphere.sunRotation", buf);
+        // Morrowind's scenegraph bounces the sun at the horizon — use game hour
+        // to detect night and push the sun below the horizon for Remix.
+        float hour = mwBridge->getGameHour();
+        if (hour < 6.0f || hour > 20.0f) {
+            elevation = -elevation;
+        } else if (hour < 8.0f) {
+            float t = (hour - 6.0f) / 2.0f;
+            elevation = elevation * (2.0f * t - 1.0f);
+        } else if (hour > 18.0f) {
+            float t = (hour - 18.0f) / 2.0f;
+            elevation = elevation * (1.0f - 2.0f * t);
+        }
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f", elevation);
+        api->SetConfigVariable("rtx.atmosphere.sunElevation", buf);
+
+        snprintf(buf, sizeof(buf), "%.2f", rotation);
+        api->SetConfigVariable("rtx.atmosphere.sunRotation", buf);
+
+        // Cache the validated sun position for transition re-assertion.
+        if (skySane(elevation) && skySane(rotation)) {
+            s_skyCache.haveSun = true;
+            s_skyCache.sunElev = elevation;
+            s_skyCache.sunRot  = rotation;
+        }
+    }
+    char buf[64];
 
     // ================================================================
     // Moon positions: read directly from Morrowind's scenegraph.
@@ -107,11 +337,22 @@ static void syncRemixSky() {
 
             snprintf(buf, sizeof(buf), "%.2f", moonRot);
             api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", buf);
+
+            if (skySane(moonElev) && skySane(moonRot)) {
+                s_skyCache.haveMoon0 = true;
+                s_skyCache.moon0Elev = moonElev;
+                s_skyCache.moon0Rot  = moonRot;
+            }
         }
     } else {
         // Moon not in scenegraph (loading screen, interior, etc.) — hide it
         api->SetConfigVariable("rtx.atmosphere.moon0.elevation0", "-20.0");
         api->SetConfigVariable("rtx.atmosphere.moon0.rotation0", "180.0");
+        // Cache the hidden state so a resync re-asserts "hidden" (correct for a
+        // moon that has genuinely set), not a stale above-horizon position.
+        s_skyCache.haveMoon0 = true;
+        s_skyCache.moon0Elev = -20.0f;
+        s_skyCache.moon0Rot  = 180.0f;
     }
 
     // Masser (larger, red moon) — moon1, completely independent orbit
@@ -128,10 +369,19 @@ static void syncRemixSky() {
 
             snprintf(buf, sizeof(buf), "%.2f", masserRot);
             api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", buf);
+
+            if (skySane(masserElev) && skySane(masserRot)) {
+                s_skyCache.haveMoon1 = true;
+                s_skyCache.moon1Elev = masserElev;
+                s_skyCache.moon1Rot  = masserRot;
+            }
         }
     } else {
         api->SetConfigVariable("rtx.atmosphere.moon1.elevation1", "-20.0");
         api->SetConfigVariable("rtx.atmosphere.moon1.rotation1", "180.0");
+        s_skyCache.haveMoon1 = true;
+        s_skyCache.moon1Elev = -20.0f;
+        s_skyCache.moon1Rot  = 180.0f;
     }
 
     // ================================================================
@@ -154,13 +404,30 @@ static void syncRemixSky() {
 
     int secundaPhaseIndex = ((int)daysPassed % 16) / 2;  // 0..7
     float secundaPhase = ((float)secundaPhaseIndex + 0.5f) / 8.0f;
-    snprintf(buf, sizeof(buf), "%.4f", secundaPhase);
-    api->SetConfigVariable("rtx.atmosphere.moon0.phase0", buf);
 
     int masserPhaseIndex = ((int)daysPassed % 24) / 3;  // 0..7
     float masserPhase = ((float)masserPhaseIndex + 0.5f) / 8.0f;
-    snprintf(buf, sizeof(buf), "%.4f", masserPhase);
-    api->SetConfigVariable("rtx.atmosphere.moon1.phase1", buf);
+
+    if (daysPassed >= 0) {
+        // Valid calendar read — push and cache.
+        snprintf(buf, sizeof(buf), "%.4f", secundaPhase);
+        api->SetConfigVariable("rtx.atmosphere.moon0.phase0", buf);
+
+        snprintf(buf, sizeof(buf), "%.4f", masserPhase);
+        api->SetConfigVariable("rtx.atmosphere.moon1.phase1", buf);
+
+        s_skyCache.havePhase  = true;
+        s_skyCache.moon0Phase = secundaPhase;
+        s_skyCache.moon1Phase = masserPhase;
+    } else if (s_skyCache.havePhase) {
+        // Garbage daysPassed read (mid-transition): re-assert last-good phase
+        // instead of letting it collapse to new-moon (phase 0 = unlit = the
+        // "moons are 100% black" symptom).
+        snprintf(buf, sizeof(buf), "%.4f", s_skyCache.moon0Phase);
+        api->SetConfigVariable("rtx.atmosphere.moon0.phase0", buf);
+        snprintf(buf, sizeof(buf), "%.4f", s_skyCache.moon1Phase);
+        api->SetConfigVariable("rtx.atmosphere.moon1.phase1", buf);
+    }
 
     // ================================================================
     // Weather presets: drive Kim's WeatherBlender via SetGameValue.
@@ -200,10 +467,13 @@ static void syncRemixSky() {
     const char* targetPreset = weatherPresetMap[effectiveTarget];
 
     // Only push SetGameValue when the target actually changes to avoid
-    // resetting the blender's internal lerp state every frame.
-    static DWORD s_lastPushedTarget = 0xFFFFFFFF;
-    if (effectiveTarget != s_lastPushedTarget) {
-        s_lastPushedTarget = effectiveTarget;
+    // resetting the blender's internal lerp state every frame. The
+    // file-scope volatile is referenced by the interior-gating block
+    // above to force a re-push on exterior return (so the blender
+    // doesn't stay frozen across interior teleports). Watchdog below
+    // also clears it periodically as a self-healing mechanism.
+    if (effectiveTarget != s_syncRemixSky_lastPushedTarget) {
+        s_syncRemixSky_lastPushedTarget = effectiveTarget;
 
         // Blend duration: Morrowind transitions take ~20-30 seconds
         // depending on weather pair. Use a fixed 20s default that
@@ -227,9 +497,18 @@ static void syncRemixSky() {
     // next weather by adjustFog() which runs before syncRemixSky().
     // Both options are NoSave in rtx_options.h so these writes go to the
     // Derived layer and never pollute rtx.conf or user.conf.
+    //
+    // Speed range: 0.078 (calm) → 0.108 (storm). The earlier 0.110–0.155
+    // band felt too fast across the board — clouds were visibly racing
+    // even on clear days. Scaled the whole curve down ~30% (kept the
+    // calm/storm dynamic range proportional, just shifted slower) so
+    // the user-perceived "120-ish in normal weather" sits closer to ~85
+    // and storms top out at 108 instead of 155. Tunable here without a
+    // rebake; if it ever needs to be a runtime knob, expose two
+    // RTX_OPTIONs (NoSave) for base + slope and read them in.
     {
-        float cloudSpeed = 0.11f + DistantLand::windScaling * 0.05f;
-        if (cloudSpeed > 0.155f) cloudSpeed = 0.155f;
+        float cloudSpeed = 0.078f + DistantLand::windScaling * 0.030f;
+        if (cloudSpeed > 0.108f) cloudSpeed = 0.108f;
         snprintf(buf, sizeof(buf), "%.4f", cloudSpeed);
         api->SetConfigVariable("rtx.atmosphere.cloudWindSpeed", buf);
 
@@ -241,6 +520,193 @@ static void syncRemixSky() {
             snprintf(buf, sizeof(buf), "%.1f", windDir);
             api->SetConfigVariable("rtx.atmosphere.cloudWindDirection", buf);
         }
+    }
+
+    // ================================================================
+    // Meteor shower scheduler.
+    //
+    // Combines two activity sources:
+    //   1) Six canonical Morrowind meteor events scheduled by in-game date
+    //      (Wisp's Tongue, Vampire Star, Sun's Tears, Lunar Dance,
+    //       Tower's Spark, End-of-Year Burst). Each has a peak day, hour,
+    //       duration, radiant point, and per-shower peak rate multiplier.
+    //   2) Random unscheduled showers — deterministic per-day hash, rolls
+    //      ~1/45 chance per in-game day (~8/year), randomized radiant +
+    //      intensity. Caught surprise events on top of the canon list.
+    //
+    // Each frame we compute the activity envelope (triangular over day-of-
+    // year * gaussian over hour-of-night) for both sources and pick the
+    // higher one, pushing meteorShowerActivity / meteorRadiantElevation /
+    // meteorRadiantRotation. All three options are NoSave in Remix so the
+    // writes go to the Derived layer.
+    //
+    // Meteors render via Remix's atmosphere shooting-star path; activity=0
+    // means baseline rate only, activity=1 means full peak rate.
+    // ================================================================
+    {
+        // Morrowind calendar: 12 months, 365 days/year, Earth-like month lengths.
+        // First-of-month day-of-year offsets (0-indexed, Jan 1 = day 0).
+        static const int kMonthStart[12] = {
+            0,    // Morning Star (Jan)
+            31,   // Sun's Dawn   (Feb)
+            59,   // First Seed   (Mar)
+            90,   // Rain's Hand  (Apr)
+            120,  // Second Seed  (May)
+            151,  // Mid Year     (Jun)
+            181,  // Sun's Height (Jul)
+            212,  // Last Seed    (Aug)
+            243,  // Hearthfire   (Sep)
+            273,  // Frost Fall   (Oct)
+            304,  // Sun's Dusk   (Nov)
+            334   // Evening Star (Dec)
+        };
+
+        struct MeteorEvent {
+            int month;          // 0=Morning Star ... 11=Evening Star
+            int dayOfMonth;     // 1-based
+            float hourPeak;     // 24h
+            float hourSpread;   // gaussian sigma in hours
+            int durationDays;   // total days the event spans (centered on peak day)
+            float peakRate;     // 0..1 multiplier
+            float radiantElev;  // degrees
+            float radiantRot;   // degrees azimuth
+        };
+        static const MeteorEvent kEvents[] = {
+            { 1,  14, 0.0f,  2.5f, 5, 0.5f, 50.0f, 200.0f }, // Wisp's Tongue   - Sun's Dawn 14
+            { 5,  21, 2.0f,  2.0f, 3, 0.3f, 65.0f,  90.0f }, // Vampire Star    - Mid Year 21
+            { 7,  12, 4.0f,  2.5f, 7, 1.0f, 45.0f, 180.0f }, // Sun's Tears     - Last Seed 12
+            { 9,  18, 0.0f,  2.0f, 5, 0.4f, 70.0f, 270.0f }, // Lunar Dance     - Frost Fall 18
+            { 10,  7, 22.0f, 2.5f, 7, 0.6f, 55.0f,   0.0f }, // Tower's Spark   - Sun's Dusk 7
+            { 11, 31, 0.0f,  2.0f, 3, 1.0f, 60.0f, 150.0f }, // End-of-Year     - Evening Star 31 (clamped to 30 below)
+        };
+        constexpr int kEventCount = sizeof(kEvents) / sizeof(kEvents[0]);
+
+        int daysPassed = mwBridge->getDaysPassed();
+        int doy = daysPassed % 365;       // 0..364
+        if (doy < 0) doy += 365;
+        float hour = mwBridge->getGameHour();
+
+        auto envelope = [](float center, float spread, float x) -> float {
+            // Gaussian centered at 'center' with stddev 'spread'
+            float dx = x - center;
+            float g = expf(-(dx * dx) / (2.0f * spread * spread));
+            return g;
+        };
+
+        auto eventActivity = [&](const MeteorEvent& e) -> float {
+            int eventDoy = kMonthStart[e.month] + (e.dayOfMonth - 1);
+            if (eventDoy >= 365) eventDoy = 364;
+
+            // Triangular envelope over day-of-year, half-width = durationDays/2
+            float halfWidth = float(e.durationDays) / 2.0f;
+            int dDay = doy - eventDoy;
+            // Year-wrap shortest distance
+            if (dDay >  182) dDay -= 365;
+            if (dDay < -182) dDay += 365;
+            float dayEnv = 1.0f - fabsf(float(dDay)) / halfWidth;
+            if (dayEnv <= 0.0f) return 0.0f;
+
+            // Gaussian envelope over hour, but only at night (peak at hourPeak).
+            // Hour wrap for nights crossing midnight.
+            float dh = hour - e.hourPeak;
+            if (dh >  12.0f) dh -= 24.0f;
+            if (dh < -12.0f) dh += 24.0f;
+            float hourEnv = expf(-(dh * dh) / (2.0f * e.hourSpread * e.hourSpread));
+
+            return e.peakRate * dayEnv * hourEnv;
+        };
+
+        // Find the highest-activity scheduled event
+        float bestActivity = 0.0f;
+        float bestRadElev = 60.0f;
+        float bestRadRot  = 180.0f;
+        for (int i = 0; i < kEventCount; ++i) {
+            float a = eventActivity(kEvents[i]);
+            if (a > bestActivity) {
+                bestActivity = a;
+                bestRadElev = kEvents[i].radiantElev;
+                bestRadRot  = kEvents[i].radiantRot;
+            }
+        }
+
+        // Random unscheduled shower: deterministic per-day roll (cubed bias
+        // toward minor showers, occasional moderate, rare major). Same day
+        // always produces the same outcome, no frame jitter.
+        {
+            uint32_t seed = uint32_t(daysPassed) * 2654435761u;
+            seed ^= seed >> 16; seed *= 0x85ebca6bu;
+            seed ^= seed >> 13; seed *= 0xc2b2ae35u;
+            seed ^= seed >> 16;
+            // Probability ~ 1/45 per in-game day (~8/year)
+            uint32_t rollProb = seed % 45u;
+            if (rollProb == 0u) {
+                // Fire — pull more entropy bytes for the shower's attributes.
+                uint32_t s2 = seed * 1664525u + 1013904223u;
+                uint32_t s3 = s2 * 1664525u + 1013904223u;
+                uint32_t s4 = s3 * 1664525u + 1013904223u;
+                uint32_t s5 = s4 * 1664525u + 1013904223u;
+
+                // Intensity: cubed roll biased to minor (~0.15-0.3 typical).
+                float u   = float(s2 & 0xFFFFu) / 65535.0f;
+                float intensity = u * u * u;     // ~0.0..1.0, cubed bias
+                if (intensity < 0.05f) intensity = 0.05f;
+
+                // Peak hour: 20:00 .. 04:00 (most-active part of night)
+                float hOff = float(s3 & 0xFFFFu) / 65535.0f;
+                float peakHour = 20.0f + hOff * 8.0f;
+                if (peakHour >= 24.0f) peakHour -= 24.0f;
+
+                float hourSpread = 1.5f + (float(s4 & 0xFFFFu) / 65535.0f) * 1.0f;
+                float radElev    = 30.0f + (float(s5 & 0xFFFFu) / 65535.0f) * 50.0f;
+                float radRot     = (float(seed & 0xFFFFu) / 65535.0f) * 360.0f;
+
+                float dh = hour - peakHour;
+                if (dh >  12.0f) dh -= 24.0f;
+                if (dh < -12.0f) dh += 24.0f;
+                float hourEnv = expf(-(dh * dh) / (2.0f * hourSpread * hourSpread));
+                float randActivity = intensity * hourEnv;
+
+                if (randActivity > bestActivity) {
+                    bestActivity = randActivity;
+                    bestRadElev  = radElev;
+                    bestRadRot   = radRot;
+                }
+            }
+        }
+
+        // Push the picked activity + radiant. Always push so that off-night
+        // frames cleanly drive activity back to 0.
+        snprintf(buf, sizeof(buf), "%.4f", bestActivity);
+        api->SetConfigVariable("rtx.atmosphere.meteorShowerActivity", buf);
+        snprintf(buf, sizeof(buf), "%.2f", bestRadElev);
+        api->SetConfigVariable("rtx.atmosphere.meteorRadiantElevation", buf);
+        snprintf(buf, sizeof(buf), "%.2f", bestRadRot);
+        api->SetConfigVariable("rtx.atmosphere.meteorRadiantRotation", buf);
+    }
+
+    // ================================================================
+    // Lore-accurate constellation month gating (fork — 2026-05-24)
+    // ================================================================
+    //
+    // Drive rtx.atmosphere.constellationCurrentMonth from the in-game
+    // calendar so the shader can highlight the player's birthsign-month
+    // constellation. Morrowind's months are 28 days each; doy/28 + 1 gives
+    // the 1..12 month index. Push every frame (cheap, NoSave field, never
+    // pollutes user.conf). 0 = no highlight if the bridge can't resolve.
+    {
+        int daysPassed = mwBridge->getDaysPassed();
+        int doy = daysPassed % 365;
+        if (doy < 0) doy += 365;
+        // Morrowind's calendar: 12 months × 28 days = 336 days; the engine
+        // wraps daysPassed at 365 but in-fiction month rotation tracks the
+        // 12-month structure. Use the standard "month = doy/28 + 1, clamp
+        // to 12 on the spillover days" mapping.
+        int month = (doy / 28) + 1;
+        if (month < 1)  month = 1;
+        if (month > 12) month = 12;
+        char monthBuf[16];
+        snprintf(monthBuf, sizeof(monthBuf), "%d", month);
+        api->SetConfigVariable("rtx.atmosphere.constellationCurrentMonth", monthBuf);
     }
 }
 #endif
@@ -301,6 +767,15 @@ void DistantLand::renderStage0() {
                 // RTX Remix: Use fixed-function pipeline for distant land rendering.
                 // Remix can't extract proper textures from D3DX effect shaders.
                 if (mwBridge->IsExterior()) {
+                    // Architecture B (task 8.5): reconcile the per-cell composite residency for
+                    // this frame BEFORE the distant-land draw, so renderDistantLandFFP's
+                    // per-chunk Texture_Binder sees freshly-streamed composites and the
+                    // newly-evicted cells are gone. A no-op unless a New_Format composite pool
+                    // loaded (hasCompositeSet); Old_Format / stock stays on the atlas (Req 4.6).
+                    streamAndReconcileComposites();
+                    // Distant land terrain is sourced from the heightmap and always
+                    // renders here; this draw also couples culling (visLand) with the
+                    // draw and feeds the depth pass.
                     renderDistantLandFFP();
                 }
 
@@ -343,14 +818,28 @@ void DistantLand::renderStage0() {
             }
 
             // Update reflection
+#ifndef MGE_RTX
             if (mwBridge->CellHasWater()) {
                 renderWaterReflection(&mwView, &distProj);
             }
+#else
+            // Perf (RTX): skip the raster water-reflection pass entirely. texReflection
+            // is sampled ONLY by renderWaterPlane() (renderStageWater, #ifndef MGE_RTX);
+            // under RTX water is drawn by renderStageWaterFFP() which never reads it, and
+            // Remix ray-traces the reflections. So rendering reflected land + statics +
+            // sky into a 1024^2 RT every frame near water is pure dead work here.
+#endif
 
             // Update water simulation
+#ifndef MGE_RTX
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
                 simulateDynamicWaves();
             }
+#else
+            // Perf (RTX): skip the dynamic-wave simulation. Its outputs (texRain/texRipples)
+            // are sampled ONLY by renderWaterPlane() (renderStageWater, #ifndef MGE_RTX), which
+            // does not run under RTX, so the per-frame wave-step / ripple render passes are dead.
+#endif
 
             effect->End();
 
@@ -369,9 +858,16 @@ void DistantLand::renderStage0() {
         } else {
             // Clear water reflection to avoid seeing previous cell environment reflected
             // Must be done every frame to react to lighting changes
+#ifndef MGE_RTX
             clearReflection();
+#else
+            // Perf (RTX): texReflection is sampled only by renderWaterPlane (#ifndef MGE_RTX),
+            // so clearing it every frame is dead work under RTX. (Same reason the reflection
+            // render pass above is skipped.)
+#endif
 
             // Update water simulation
+#ifndef MGE_RTX
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
                 // Save state block manually since we can change FVF/decl
                 device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
@@ -384,6 +880,7 @@ void DistantLand::renderStage0() {
                 stateSaved->Apply();
                 stateSaved->Release();
             }
+#endif
         }
     }
 
@@ -502,6 +999,12 @@ void DistantLand::renderStageBlend() {
     effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
     // Render caustics
+#ifndef MGE_RTX
+    // Perf+visual (RTX): skip MGE's screen-space caustic overlay. PASS_RENDERCAUSTICS
+    // blends an animated caustic pattern (texWater + backbuffer) onto the frame every
+    // frame near water. Under RTX, Remix owns water lighting and this overlay both costs
+    // a fullscreen blend and shows as a moving shader pattern on the water. The water
+    // plane (renderStageWaterFFP) and Remix's own water are unaffected.
     if (mwBridge->IsExterior() && Configuration.DL.WaterCaustics > 0) {
         D3DXMATRIX m;
         IDirect3DTexture9* tex = PostShaders::borrowBuffer(0);
@@ -518,6 +1021,7 @@ void DistantLand::renderStageBlend() {
         PostShaders::applyBlend();
         effect->EndPass();
     }
+#endif
 
     // Blend MW/MGE
     if (isDistantCell() && (~Configuration.MGEFlags & NO_MW_MGE_BLEND)) {

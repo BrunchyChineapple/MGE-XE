@@ -6,8 +6,64 @@
 #include "progmesh/ProgMesh.h"
 #include "../3rdparty/tootle/src/TootleLib/include/tootlelib.h"
 
+// distantshader.h (in the d3d8.dll/renderer project) defines SIZEOFLANDVERT, the single stride
+// constant every land-vertex consumer steps the on-disk stream by. It is a self-contained header
+// (enums + two `static const int`, #pragma once, no further includes), so pulling it into this
+// MGEfuncs translation unit is cheap and lets task 6.3 tie that stride to the actual struct size in
+// a TU that already sees DXCompressedLandVertex (via progmesh/ProgMesh.h -> ../DXVertex.h).
+#include "../src/mge/distantshader.h"
+
 using namespace Niflib;
 using std::vector;
+
+// Cross-header layout guarantee (task 6.3; Req 8.1, 8.3, 8.4): the shared stride SIZEOFLANDVERT must
+// equal the real on-disk vertex size. DXVertex.h already asserts sizeof(DXCompressedLandVertex)==20
+// and the field offsets; this assert closes the loop so the stride that the IPC server skip-math,
+// the client vertex-buffer build, and the stream-source stride all rely on can never drift from the
+// struct the generator actually writes in LandMesh::Save below.
+static_assert(static_cast<size_t>(SIZEOFLANDVERT) == sizeof(DXCompressedLandVertex),
+              "SIZEOFLANDVERT (distantshader.h) must equal sizeof(DXCompressedLandVertex) (DXVertex.h)");
+
+// Maximum ROAM subdivision depth the tessellator supports. The Mega Detail tier uses depth 12
+// (leaf size 8192/2^(12/2) = 128 world units == the 65x65 source-grid spacing); every existing
+// tier uses depth 10. The entry point clamps the caller-supplied tree_depth to this ceiling so the
+// variance-node pool invariant cannot be violated. (Introduced by task 2.1; task 2.2 adds the
+// static_assert tying RoamVarianceNode::pool capacity to this value.)
+static const size_t kMaxRoamTreeDepth = 12;
+
+// Pre-sized capacity of the ROAM variance-node pool (RoamVarianceNode::pool, defined below). The
+// pool is allocated once at this size and is NEVER resized at runtime: RoamVarianceNode::Create()
+// hands out raw &pool[i] pointers that the variance tree stores as left_child/right_child, so a
+// reallocation would dangle every node pointer mid-build. The pool must therefore be pre-sized to
+// cover the worst case up front rather than growing on demand.
+//
+// Worst-case usage is one root's complete variance tree. RoamLandPatch::Tessellate builds the tree
+// for the first root, tessellates, calls RoamVarianceNode::ResetPool(), then repeats for the second
+// root -- so peak live usage is a single root, not both. CalculateVariance allocates two children
+// per non-leaf node down to `depth`, giving 2^(depth+1)-1 nodes for a full tree; Create() starts
+// handing out at index 1 (pre-increment), so it needs one extra slot, i.e. the capacity must reach
+// 2^(kMaxRoamTreeDepth+1) (8192 nodes at depth 12). The existing 32768 covers depth 12 with ~4x
+// margin and is left pre-sized as-is.
+static const size_t kVariancePoolSize = 32768;
+
+// Compile-time guarantee that the pre-sized pool holds one full root variance tree at the deepest
+// supported tier. If kMaxRoamTreeDepth is ever raised past what kVariancePoolSize covers, this
+// fails the build instead of letting Create() throw the Pool_Full_Error at bake time (Req 5.1,
+// 5.2). 2^(kMaxRoamTreeDepth+1) is a strict upper bound on one root's node count (2^(d+1)-1) and
+// also folds in the +1 headroom slot Create()'s pre-increment requires.
+static_assert(kVariancePoolSize >= (size_t(1) << (kMaxRoamTreeDepth + 1)),
+              "RoamVarianceNode::pool must hold one full root variance tree (2^(kMaxRoamTreeDepth+1) nodes)");
+
+// Encode one signed normal component [-1,1] to a UBYTE4N byte [0,255]. This mirrors the
+// distant-statics vertex normal encoding (NifConverter.cpp: 255 * (n*0.5+0.5)) so the runtime FFP
+// decode (b/255)*2-1 round-trips identically for land and statics. Rounds to nearest and clamps so
+// any tiny float overshoot from renormalization cannot wrap the byte.
+static inline unsigned char EncodeNormalByte(float c) {
+    float u = (c * 0.5f + 0.5f) * 255.0f;
+    if (u < 0.0f) { u = 0.0f; }
+    if (u > 255.0f) { u = 255.0f; }
+    return (unsigned char)(u + 0.5f);
+}
 
 struct LargeTriangle {
     unsigned int v1; /*!< The index of the first vertex. */
@@ -65,6 +121,11 @@ public:
     vector<Vector3> vertices;
     vector<LargeTriangle> triangles;
     vector<TexCoord> uvs;
+    // Per-vertex surface normals, parallel to `vertices`. Filled by GenerateMesh alongside the UV
+    // loop via HeightFieldSampler::SampleNormal (task 5.1). Save() encodes these into the on-disk
+    // DXCompressedLandVertex::Normal field; when this is empty (e.g. before task 5.1 populates it)
+    // Save falls back to a straight-up (0,0,1) normal so output is always well-defined.
+    vector<Vector3> normals;
     float radius;
     Vector3 center;
     Vector3 min;
@@ -149,6 +210,20 @@ public:
             compVerts[i].Position = vertices[i];
             compVerts[i].texCoord[0] = (short)(uvs[i].u * 32768.0f);
             compVerts[i].texCoord[1] = (short)(uvs[i].v * 32768.0f);
+
+            // Encode the per-vertex surface normal as UBYTE4N (xyz, w pad), the same encoding the
+            // distant-statics vertex uses, so the runtime FFP decode is identical for both paths.
+            // `normals` is filled by GenerateMesh via SampleNormal (task 5.1); if it has not been
+            // populated for this vertex yet, fall back to straight-up (0,0,1) so the field is never
+            // left undefined and the output is well-formed regardless of task ordering.
+            Vector3 n(0.0f, 0.0f, 1.0f);
+            if (i < normals.size()) {
+                n = normals[i];
+            }
+            compVerts[i].Normal[0] = EncodeNormalByte(n.x);
+            compVerts[i].Normal[1] = EncodeNormalByte(n.y);
+            compVerts[i].Normal[2] = EncodeNormalByte(n.z);
+            compVerts[i].Normal[3] = 0;   // pad
         }
 
         WriteFile(file, &*compVerts.begin(), sizeof(DXCompressedLandVertex) * verts, &unused, 0);
@@ -183,12 +258,18 @@ public:
 
     float minX, minY, maxX, maxY;
     float* data;
+    // Parallel per-sample surface-normal field, same grid as `data` (the height field) with three
+    // floats (x,y,z) per sample, indexed normal_data[(y*data_width + x)*3 + component]. Supplied by
+    // the TessellateLandscapeAtlased entry point (task 2.1 plumbing); SampleNormal consumes it
+    // (task 5.1). May be null only if a caller passes no normals, in which case SampleNormal must
+    // not be called -- the generator always passes a parallel field alongside height_data.
+    float* normal_data;
     size_t data_width, data_height;
     AtlasRegion* atlas_data;
     size_t atlas_count;
 
-    HeightFieldSampler(float* d, size_t dw, size_t dh, float* adata, size_t ac, float _minX, float _minY, float _maxX, float _maxY) :
-         minX(_minX), minY(_minY), maxX(_maxX), maxY(_maxY), data(d), data_width(dw), data_height(dh),
+    HeightFieldSampler(float* d, float* nd, size_t dw, size_t dh, float* adata, size_t ac, float _minX, float _minY, float _maxX, float _maxY) :
+         minX(_minX), minY(_minY), maxX(_maxX), maxY(_maxY), data(d), normal_data(nd), data_width(dw), data_height(dh),
         atlas_data(reinterpret_cast<AtlasRegion*>(adata)), atlas_count(ac) {}
     ~HeightFieldSampler() {}
 
@@ -230,6 +311,47 @@ public:
         return result;
     }
 
+    // Bilinearly sample the per-vertex surface normal at world (x, y), then renormalize. This uses
+    // EXACTLY the same low/high grid indices and bilinear weights as SampleHeight above (same
+    // (coord - min)/128 mapping, floor/ceil bracket, and interp weights), applied componentwise to
+    // the parallel normal_data field via the edge-clamped GetNormalValue. Because ceil(integer) ==
+    // integer with a zero weight, a vertex landing exactly on a source-grid sample returns that
+    // sample's normalized normal; a vertex between samples (ROAM emits edge midpoints) returns the
+    // normalized bilinear blend of the four surrounding samples, so the normal is defined
+    // everywhere (Req 7.4 -- no undefined normals between samples). A degenerate (near-zero-length)
+    // blend falls back to straight-up (0,0,1) rather than emitting a NaN (design Error Handling).
+    Vector3 SampleNormal(float x, float y) {
+        // Figure which normal samples to read (identical index math to SampleHeight).
+        int low_x, high_x, low_y, high_y;
+
+        float data_x = (x - minX) / 128.0f;
+        float data_y = (y - minY) / 128.0f;
+
+        low_x = (int)floor(data_x);
+        high_x = (int)ceil(data_x);
+        low_y = (int)floor(data_y);
+        high_y = (int)ceil(data_y);
+
+        // Bilinear interpolation weights (identical to SampleHeight).
+        float x_interp = data_x - (float)low_x;
+        float y_interp = data_y - (float)low_y;
+
+        // horizontal lerp of the bottom and top rows, then vertical lerp -- componentwise via the
+        // Vector3 scalar operators, mirroring SampleHeight's scalar expression.
+        Vector3 bottom_val = GetNormalValue(low_x, low_y) * (1.0f - x_interp) + GetNormalValue(high_x, low_y) * x_interp;
+        Vector3 top_val = GetNormalValue(low_x, high_y) * (1.0f - x_interp) + GetNormalValue(high_x, high_y) * x_interp;
+
+        // vertical
+        Vector3 n = top_val * (1.0f - y_interp) + bottom_val * y_interp;
+
+        // Renormalize the blended normal to unit length; fall back to up on a degenerate blend.
+        float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len > 1e-6f) {
+            return Vector3(n.x / len, n.y / len, n.z / len);
+        }
+        return Vector3(0.0f, 0.0f, 1.0f);
+    }
+
     float GetHeightValue(int x, int y) {
         if (x < 0) {
             x = 0;
@@ -245,6 +367,27 @@ public:
         }
 
         return data[y * data_width + x];
+    }
+
+    // Read the raw (possibly non-unit) source normal at integer grid index (x, y), clamping to the
+    // grid edge exactly like GetHeightValue does for the height field. The normal field is flat
+    // xyz-per-sample (parallel to `data`), so the sample at (x, y) lives at base (y*width + x)*3.
+    Vector3 GetNormalValue(int x, int y) {
+        if (x < 0) {
+            x = 0;
+        }
+        if (x > data_width - 1) {
+            x = data_width - 1;
+        }
+        if (y < 0) {
+            y = 0;
+        }
+        if (y > data_height - 1) {
+            y = data_height - 1;
+        }
+
+        size_t base = (size_t(y) * data_width + size_t(x)) * 3;
+        return Vector3(normal_data[base], normal_data[base + 1], normal_data[base + 2]);
     }
 };
 
@@ -365,7 +508,11 @@ public:
 };
 
 size_t RoamVarianceNode::last_used_index = 0;
-vector<RoamVarianceNode> RoamVarianceNode::pool(32768);
+// Pre-sized to kVariancePoolSize and never resized at runtime (see kVariancePoolSize above):
+// Create() returns raw &pool[i] pointers stored as left_child/right_child, so a realloc would
+// dangle them. The static_assert above guarantees this capacity covers one full root variance
+// tree at kMaxRoamTreeDepth, so Create()'s throw stays an unreachable guard in normal operation.
+vector<RoamVarianceNode> RoamVarianceNode::pool(kVariancePoolSize);
 
 class RoamTriangleNode;
 
@@ -768,24 +915,60 @@ public:
             return LandMesh();
         }
 
-        // Now that all the vertices have been found, figure out the UVs for them
+        // Now that all the vertices have been found, figure out the UVs for them. The per-vertex
+        // surface normal is sampled in the same loop so mesh.normals stays exactly parallel to
+        // mesh.vertices (normals.size() == vertices.size()); LandMesh::Save then writes a real
+        // per-vertex normal for every vertex instead of its (0,0,1) fallback (task 5.1; Req 7.2).
+        // This loop runs only for non-empty meshes -- the flat-at-world-bottom and Tootle-failure
+        // early returns above hand back an empty LandMesh before reaching here.
         for (size_t i = 0; i < mesh.vertices.size(); ++i) {
             mesh.uvs.push_back(sampler->SampleTexCoord(mesh.vertices[i].x, mesh.vertices[i].y));
+            mesh.normals.push_back(sampler->SampleNormal(mesh.vertices[i].x, mesh.vertices[i].y));
         }
 
         return mesh;
     }
 };
 
-extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, unsigned int data_width, unsigned int data_height, float* atlas_data, unsigned int atlas_count, float minX, float minY, float maxX, float maxY, float error_tolerance) {
+extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, float* normal_data, unsigned int data_width, unsigned int data_height, float* atlas_data, unsigned int atlas_count, float minX, float minY, float maxX, float maxY, float error_tolerance, unsigned int tree_depth) {
+
+    // normal_data is a parallel xyz-per-sample field on the same grid as height_data, fed straight
+    // into the HeightFieldSampler below so SampleNormal can sample it per emitted vertex (task 5.1).
+
+    // Clamp the caller-supplied ROAM tree depth to the maximum the variance pool is sized for.
+    // The GUI passes 10 for every existing tier (byte-identical to the previous hard-coded value)
+    // and 12 for the Mega Detail tier so a near-zero tolerance can reach the 65x65 source grid.
+    if (tree_depth > kMaxRoamTreeDepth) {
+        tree_depth = (unsigned int)kMaxRoamTreeDepth;
+    }
 
     // Create sampler
-    HeightFieldSampler sampler(height_data, data_width, data_height, atlas_data, atlas_count, minX, minY, maxX, maxY);
+    HeightFieldSampler sampler(height_data, normal_data, data_width, data_height, atlas_data, atlas_count, minX, minY, maxX, maxY);
 
-    // Create patches
-    const float patch_width = 32768.0f, patch_height = 32768.0f;
-    size_t patches_across = (size_t)ceil(float(data_width) / 256.0f);
-    size_t patches_down = (size_t)ceil(float(data_height) / 256.0f);
+    // Create patches. One patch == one Morrowind exterior cell (8192 units) so each emitted mesh
+    // maps to exactly one cell, which is what the per-cell composite Texture_Binder requires
+    // (Architecture B). Previously patches were 32768 (4x4 cells) which produced coarse meshes that
+    // could not be addressed per cell. The heightfield is sampled every 128 units, so a cell spans
+    // 8192/128 = 64 samples. The ROAM tree depth is now supplied per-tier via tree_depth (default
+    // 10 keeps the leaf-triangle world size identical to the old 32768/depth-14: 32768/2^7 ==
+    // 8192/2^5 == 256 units); the Mega tier passes 12.
+    //
+    // Patch count is derived from the CELL SPAN, not ceil(data_width / 64). Task 4.1 made the
+    // heightmap builder sample the grid INCLUSIVELY -- data_width = data_height = cells*64 + 1, so
+    // the shared seam sample at source index cells*64 (the column/row that adjacent cells agree on)
+    // is present in-bounds (Req 6.1, 6.2). Each patch spans 64 samples (8192 world units), and patch
+    // i covers samples [i*64 .. i*64+64] inclusive, sharing the seam sample with patch i+1. The cell
+    // count per edge is therefore (data_width - 1) / 64: with the inclusive width that is exactly
+    // `cells`, yielding one patch per cell and one mesh per cell (Req 10.4). Using ceil(data_width /
+    // 64) on the inclusive width would round (cells*64+1)/64 up to cells+1 and spawn a one-sample
+    // sliver patch past the seam, breaking the one-mesh-per-cell mapping the composite path relies
+    // on. Because the grid is inclusive, the rightmost/topmost patch's far edge (world index
+    // cells*64) now lands on real seam data instead of the clamped edge GetHeightValue/
+    // GetNormalValue would otherwise return.
+    const float patch_width = 8192.0f, patch_height = 8192.0f;
+    const size_t kSamplesPerPatch = 64;       // 8192 units / 128 units-per-sample (== one cell edge)
+    size_t patches_across = (size_t)(data_width - 1) / kSamplesPerPatch;
+    size_t patches_down = (size_t)(data_height - 1) / kSamplesPerPatch;
 
     vector<RoamLandPatch> patches;
 
@@ -833,7 +1016,7 @@ extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, 
 
     // Tessellate patches
     for (size_t i = 0; i < patches.size(); ++i) {
-        patches[i].Tessellate(error_tolerance, 14);
+        patches[i].Tessellate(error_tolerance, tree_depth);
     }
 
     // Generate Meshes

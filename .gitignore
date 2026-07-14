@@ -18,3 +18,5 @@ MGE-XE-DLfuncs.layout
 /CMakeCache.txt
 /CMakeFiles/
 MGEgui/.vs/
+/MGEfuncs/bin/
+/MGEfuncs/obj/

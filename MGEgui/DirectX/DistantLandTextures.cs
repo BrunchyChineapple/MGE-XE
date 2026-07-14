@@ -651,7 +651,7 @@ namespace MGEgui.DirectX {
             DXMain.device.VertexDeclaration = decl;
         }
 
-        public void Render(float pos_x, float pos_y, float scale_x, float scale_y) {
+        public void Render(float pos_x, float pos_y, float scale_x, float scale_y, bool applyVertexColor = true) {
             // Modelview matrix corrects D3D9 half-texel offset (*2 here, as NDC space is from -1 to +1)
             SlimDX.Matrix mat = SlimDX.Matrix.Identity;
             mat.M41 = pos_x - texelSize;
@@ -690,13 +690,22 @@ namespace MGEgui.DirectX {
                 DXMain.device.EndScene();
             }
 
-            DXMain.device.BeginScene();
-            effect.Begin(FX.None);
-            effect.BeginPass(2);
-            DXMain.device.DrawIndexedPrimitives(PrimitiveType.TriangleStrip, 0, 0, 4225, 0, 8444);
-            effect.EndPass();
-            effect.End();
-            DXMain.device.EndScene();
+            // Pass P2 multiplies the accumulated albedo by Morrowind's per-vertex baked terrain
+            // lighting (cell.Color). Correct for stock MGE (distant land is drawn flat and never
+            // relit), but for the RTX composite the path tracer relights the distant-land geometry,
+            // so baking lighting into the albedo double-lights it and flattens contrast ("washed
+            // out"). The composite bake passes applyVertexColor=false to emit pure, lighting-free
+            // albedo Remix can light itself; the province-atlas bake keeps the default (true) so its
+            // existing look is unchanged.
+            if (applyVertexColor) {
+                DXMain.device.BeginScene();
+                effect.Begin(FX.None);
+                effect.BeginPass(2);
+                DXMain.device.DrawIndexedPrimitives(PrimitiveType.TriangleStrip, 0, 0, 4225, 0, 8444);
+                effect.EndPass();
+                effect.End();
+                DXMain.device.EndScene();
+            }
         }
 
         public void RenderNormalMap(float pos_x, float pos_y, float scale_x, float scale_y) {

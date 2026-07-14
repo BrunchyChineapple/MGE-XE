@@ -12,6 +12,10 @@
 #endif // MGE_RTX
 #include "videobackground.h"
 
+#ifdef MGE_RTX
+#include "rt_anticull.h"
+#endif
+
 static int sceneCount;
 static bool rendertargetNormal, isHUDready;
 static bool isMainView, isStencilScene, isAmbientWhite;
@@ -105,17 +109,11 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         // Disable MW screenshot function to allow MGE to use the same key
         mwBridge->disableScreenshotFunc();
         // Mark water material to allow MGEProxyDevice to detect it
-#ifndef MGE_RTX
+        // Under MGE_RTX we mark for *detection only* (so we can capture the
+        // bound water texture for FFP distant-water reuse) — we still let
+        // the engine's vanilla water DIP pass through to D3D9 so Remix
+        // applies E-man's translucent water material to the near-water plane.
         mwBridge->markWaterNode(99999.0f);
-#else
-        // Under MGE_RTX we still mark the vanilla water node — not to skip
-        // the draw, but to detect it.  When the engine binds the marked
-        // material we capture the texture pointer so the distant-water FFP
-        // pass can re-use it (matching Remix material hashes between near
-        // and distant water → both inherit E-man's translucent replacement).
-        // The vanilla water DIPs themselves still pass through to D3D9.
-        mwBridge->markWaterNode(99999.0f);
-#endif // !MGE_RTX
     }
 
     if (mwBridge->IsLoaded()) {
@@ -208,6 +206,16 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     waterDrawn = false;
     isFrameComplete = false;
     isHUDComplete = false;
+
+#ifdef MGE_RTX
+    // Auto-select RT_AntiCull's reachability range by cell type, then advance its frame
+    // counter. CellHasWeather() is true for exterior + behaves-as-exterior cells, false for
+    // true interiors — exactly the split RT_AntiCull's two ranges target.
+    if (mwBridge->IsLoaded()) {
+        RTAntiCull::selectRangeForCell(mwBridge->CellHasWeather());
+    }
+    RTAntiCull::beginFrame();
+#endif
 
     return Direct3DDevice8::Present(a, b, c, d);
 }
@@ -326,11 +334,10 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             DistantLand::renderStageBlend();
 
 #ifdef MGE_RTX
-            // RTX: draw the distant-water radial plane as part of scene 0,
-            // not gated on whether vanilla water also drew.  Vanilla near
-            // water (drawn later, z-write on, 1 unit above) takes over on
-            // the overlap region.  Both surfaces share E-man's replacement
-            // because cachedWaterTex matches the vanilla material hash.
+            // RTX: render the FFP distant-water plane in scene 0, after the
+            // close-blend pass.  This binds the cached vanilla water texture
+            // so Remix routes both surfaces (near vanilla + distant FFP) to
+            // E-man's translucent water replacement via the same material hash.
             if (distantWater) {
                 DistantLand::renderStageWaterFFP();
             }
@@ -339,8 +346,10 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Everything else except UI
 #ifndef MGE_RTX
             DistantLand::renderStage2();
+#endif
 
             // Draw water if the Morrowind water plane doesn't appear in view
+#ifndef MGE_RTX
             if (distantWater && !waterDrawn && !isStencilScene) {
                 DistantLand::renderStageWater();
                 waterDrawn = true;
@@ -420,47 +429,48 @@ HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
         DistantLand::setSunLight(b);
 
 #ifdef MGE_RTX
-        // At night, redirect light 6 to act as moonlight.
-        // Instead of zeroing it (which removes all night GI), we point it
-        // from Secunda's orbit position with a dim blue-white color.
-        // This gives Remix a directional light source for moonlight shadows.
+        // Kill the redundant analytical light 6 wherever the path-traced
+        // atmosphere owns scene lighting. In atmosphere mode (skyMode == 1) the
+        // Atmos SUN and MOONS are injected as real Remix RtDistantLights driven
+        // by the atmosphere model (rtx_fork_atmosphere.cpp: g_atmoLights.sun +
+        // g_atmoLights.moons[], via LightManager::createExternallyTrackedLight)
+        // and illuminate every surface through the standard NEE/RTXDI path --
+        // so Bethesda's directional light 6 is a pure duplicate: a SECOND SUN by
+        // day and an extra (over-bright) THIRD MOON by night. It also costs a
+        // real distant-light NEE sample per bounce.
         //
-        // To revert to no moonlight: change the if-block below to zero
-        // Diffuse/Ambient/Specular as before (see git history).
+        // (remixplus-sync 2026-06-21: this used to cite the bespoke
+        // evalAtmosphereSunNEE / sampleAtmosphereMoonLight shader path; that path
+        // was removed when we adopted Kim's "sun/moon as real distant lights"
+        // model. The kill is still correct -- the injected distant lights now do
+        // what the NEE did, and the injected-moon radiance mirrors the old moon
+        // NEE formula (with the NEE->distant-light /pi conversion), so night
+        // brightness is preserved.)
+        //
+        // Fix: zero its radiance and submit that. createFromDirectional maps
+        // D3DLIGHT.Diffuse -> the Remix distant-light colour, and
+        // LightManager::addLight (rtx_light_manager.cpp:611) DROPS any light whose
+        // radiance is <= 0 in all channels ("light is off"). So a zeroed light 6
+        // is culled entirely: no contribution AND no sampling cost (the perf win).
+        // setSunLight() above still feeds MGE's own distant-land shading, so
+        // nothing is lost there.
+        //
+        // Gate on CellHasWeather(): exterior + behave-as-exterior interiors
+        // (Mournhold, grottos) run the atmosphere, so kill light 6 there. TRUE
+        // interiors gate the atmosphere off (syncRemixSky pushes sun -90 + moons
+        // disabled), so there light 6 is the legitimate interior fill and must
+        // pass through unchanged.
+        //
+        // (Supersedes the prior night-only moonlight redirect: now that the Atmos
+        // moons are confirmed to light surfaces directly, syncing a fake moon
+        // light is both redundant and a perf cost.)
         auto mwBridge = MWBridge::get();
-        if (mwBridge->IsLoaded() && mwBridge->CellHasWeather()) {
-            float hour = mwBridge->getGameHour();
-            if (hour < 6.0f || hour > 20.0f) {
-                D3DLIGHT8 moonLight = *b;
-
-                // Get Secunda's direction (brighter moon = primary moonlight source)
-                float mx, my, mz;
-                if (mwBridge->GetMoonDir(true, mx, my, mz)) {
-                    // GetMoonDir returns direction TO the moon (Z-up: x=east, y=north, z=up).
-                    // Light direction should point FROM the moon toward the ground.
-                    // D3D light direction = direction the light travels = -moonDir.
-                    moonLight.Direction.x = -mx;
-                    moonLight.Direction.y = -my;
-                    moonLight.Direction.z = -mz;
-                }
-                // else: keep Bethesda's original direction as fallback
-
-                // Moonlight color: dim blue-white, scaled by Secunda's phase.
-                // Phase 0.5 = full moon = brightest, phase 0/1 = new = darkest.
-                int daysPassed = mwBridge->getDaysPassed();
-                int phaseIndex = ((int)daysPassed % 16) / 2;  // 0..7
-                // Map phase index to brightness: 0(new)=0, 4(full)=1
-                float phaseBrightness = 1.0f - fabsf((float)phaseIndex - 4.0f) / 4.0f;
-                phaseBrightness = std::max(0.05f, phaseBrightness);  // minimum ambient even at new moon
-
-                // Dim blue-white moonlight
-                float intensity = 0.08f * phaseBrightness;
-                moonLight.Diffuse  = { intensity * 0.7f, intensity * 0.8f, intensity * 1.0f, 1.0f };
-                moonLight.Ambient  = { intensity * 0.3f, intensity * 0.35f, intensity * 0.4f, 1.0f };
-                moonLight.Specular = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-                return Direct3DDevice8::SetLight(a, &moonLight);
-            }
+        if (b && mwBridge->IsLoaded() && mwBridge->CellHasWeather()) {
+            D3DLIGHT8 killed = *b;
+            killed.Diffuse  = { 0.0f, 0.0f, 0.0f, 0.0f };
+            killed.Ambient  = { 0.0f, 0.0f, 0.0f, 0.0f };
+            killed.Specular = { 0.0f, 0.0f, 0.0f, 0.0f };
+            return Direct3DDevice8::SetLight(a, &killed);
         }
 #endif
     }
@@ -533,44 +543,40 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
 
         if (isWaterMaterial) {
-#ifdef MGE_RTX
-            // RTX: capture vanilla water's stage-0 texture on the FIRST
-            // water DIP of each frame.  Morrowind cycles through 32
-            // textures (water_00..water_31) at ~25 FPS to animate the
-            // surface, and E-man's mod has a separate replacement keyed
-            // off each frame's hash — but only the first DIP per frame
-            // binds the cycling colour texture.  Subsequent water DIPs
-            // bind normal maps and reflection effect textures that do
-            // not cycle; capturing those would freeze the distant plane
-            // on a non-animating texture.  waterDrawn (also used to gate
-            // the post-DIP fallback) doubles as our once-per-frame guard.
-            //
-            // After capture, fall through so the engine's own water draw
-            // still reaches D3D9 — Remix needs to see it to apply the
-            // replacement on the near-water surface.
-            if (!waterDrawn) {
-                IDirect3DBaseTexture9* base = nullptr;
-                ProxyInterface->GetTexture(0, &base);
-                if (base) {
-                    IDirect3DTexture9* asTex = nullptr;
-                    if (SUCCEEDED(base->QueryInterface(IID_IDirect3DTexture9, (void**)&asTex)) && asTex) {
-                        if (DistantLand::cachedWaterTex && DistantLand::cachedWaterTex != asTex) {
-                            DistantLand::cachedWaterTex->Release();
-                        }
-                        DistantLand::cachedWaterTex = asTex;  // owns one AddRef ref
-                    }
-                    base->Release();
-                }
-                waterDrawn = true;
-            }
-            // Fall through to Direct3DDevice8::DrawIndexedPrimitive below
-#else
+#ifndef MGE_RTX
             if (distantWater) {
                 if (!waterDrawn) {
                     DistantLand::renderStageWater();
                     waterDrawn = true;
                 }
                 return D3D_OK;
+            }
+#else
+            // RTX: on the first water DIP per frame, capture the bound stage-0
+            // texture so the FFP distant-water plane (drawn in EndScene scene 0
+            // of the next frame) can re-bind the same texture pointer and
+            // therefore land on the same Remix material hash as vanilla near
+            // water.  Morrowind cycles 32 water_NN textures (~25 FPS) but only
+            // the first DIP per frame binds the cycling colour texture; later
+            // water DIPs bind normal/reflection maps that don't cycle, so the
+            // !waterDrawn gate doubles as our once-per-frame guard.
+            //
+            // We then fall through to D3D9 so the engine's vanilla water draw
+            // actually issues — Remix needs the live draw to apply E-man's
+            // translucent replacement to the near-water surface.
+            if (!waterDrawn) {
+                IDirect3DBaseTexture9* baseTex = nullptr;
+                if (ProxyInterface->GetTexture(0, &baseTex) == D3D_OK && baseTex) {
+                    IDirect3DTexture9* asTex = nullptr;
+                    if (baseTex->QueryInterface(__uuidof(IDirect3DTexture9), (void**)&asTex) == S_OK && asTex) {
+                        if (DistantLand::cachedWaterTex && DistantLand::cachedWaterTex != asTex) {
+                            DistantLand::cachedWaterTex->Release();
+                        }
+                        DistantLand::cachedWaterTex = asTex;  // owns one AddRef ref
+                    }
+                    baseTex->Release();
+                }
+                waterDrawn = true;
             }
 #endif
         } else {
@@ -661,7 +667,12 @@ HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {
 
 HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8* b, UINT c) {
     if (a == 0) {
-        rs.vb = static_cast<Direct3DVertexBuffer8*>(b)->GetProxyInterface();
+        // Null-check: NiDX8Renderer::DrawPrimitive can call SetStreamSource(0, NULL, 0)
+        // from MWSE-driven renders that walk property-stripped scene-graph clones
+        // (e.g. Joy of Painting's OcclusionTester subject mask). Without the check,
+        // the static_cast deref crashed at NiDX8Renderer::DrawPrimitive+0x2A4.
+        // Mirrors the existing null-aware pattern in SetTexture above.
+        rs.vb = b ? static_cast<Direct3DVertexBuffer8*>(b)->GetProxyInterface() : nullptr;
         rs.vbOffset = 0;
         rs.vbStride = c;
     }
@@ -669,7 +680,9 @@ HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8*
 }
 
 HRESULT _stdcall MGEProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
-    rs.ib = static_cast<Direct3DIndexBuffer8*>(a)->GetProxyInterface();
+    // Null-check: same defensive guard as SetStreamSource above. Engine code
+    // paths that draw through property-stripped clones can issue SetIndices(NULL).
+    rs.ib = a ? static_cast<Direct3DIndexBuffer8*>(a)->GetProxyInterface() : nullptr;
     return Direct3DDevice8::SetIndices(a, b);
 }
 

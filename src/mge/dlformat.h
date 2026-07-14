@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ipc/bridge.h"
+#include "dlmath.h"
 #include <vector>
 
 enum StaticType {
@@ -17,17 +19,26 @@ struct LandMesh {
     BoundingBox box;
     DWORD verts;
     DWORD faces;
-    IDirect3DVertexBuffer9* vbuffer;
-    IDirect3DIndexBuffer9* ibuffer;
+    ptr32<IDirect3DVertexBuffer9> vbuffer;
+    ptr32<IDirect3DIndexBuffer9> ibuffer;
+    // NEW (additive; zero-initialized for Old_Format so the binder falls back).
+    // Mirrors the DistantSubset::tex pattern; appended at the end of the struct so
+    // prior field offsets are unchanged. LandMesh instances are value-initialized
+    // (vector::resize in distantinit.cpp initLandscape), which zeroes these fields,
+    // so an Old_Format load leaves compositeTex null and cellValid false -> fallback.
+    ptr32<IDirect3DTexture9>      compositeTex;  // resident per-cell composite, or null
+    int32_t                       cellX, cellY;  // cell identity for cache lookup
+    bool                          cellValid;     // false on Old_Format
 };
 
+#pragma pack(push, 4)
 struct DistantSubset {
     BoundingSphere sphere;
     D3DXVECTOR3 aabbMin, aabbMax;       // corners of the axis-aligned bounding box
-    IDirect3DTexture9* tex;
+    ptr32<IDirect3DTexture9> tex;
     bool hasAlpha, hasUVController;
-    IDirect3DVertexBuffer9* vbuffer;
-    IDirect3DIndexBuffer9* ibuffer;
+    ptr32<IDirect3DVertexBuffer9> vbuffer;
+    ptr32<IDirect3DIndexBuffer9> ibuffer;
     int verts;
     int faces;
 };
@@ -36,8 +47,10 @@ struct DistantStatic {
     unsigned char type;
     BoundingSphere sphere;
     D3DXVECTOR3 aabbMin, aabbMax;       // corners of the axis-aligned bounding box
-    std::vector<DistantSubset> subsets;
+    DWORD firstSubsetIndex;
+    DWORD numSubsets;
 };
+#pragma pack(pop)
 
 struct UsedDistantStatic {
     DWORD staticRef;

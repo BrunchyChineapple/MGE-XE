@@ -5,8 +5,8 @@
 #include <memory>
 #include <string>
 #include <vector>
-
-
+#include <thread>
+#include <atomic>
 
 enum EffectVariableID {
     EV_lastshader, EV_lastpass, EV_depthframe, EV_watertexture,
@@ -45,6 +45,8 @@ class PostShaders {
     static IDirect3DSurface9* surfReadqueue, *surfReadback;
     static D3DXVECTOR4 adaptPoint;
     static float rcpRes[2];
+    static std::thread shaderLoadThread;
+    static std::atomic<bool> isLoading; // Add this member declaration
 
 public:
     static bool init(IDirect3DDevice9* realDevice);
@@ -57,6 +59,8 @@ public:
     static void orderShaders();
     static bool initBuffers();
     static void release();
+    static bool initShaderChainThreaded();
+    static void waitForShaderLoading();
 
     static MGEShader* findShader(const char* shaderName);
     static const std::vector<std::unique_ptr<MGEShader>>& listShaders();
@@ -67,6 +71,13 @@ public:
     static bool setShaderEnable(const char* shaderName, bool enable);
 
     static void evalAdaptHDR(IDirect3DSurface9* source, int environmentFlags, float dt);
+    enum HDRReadbackState {
+        HDR_IDLE,
+        HDR_DOWNSAMPLING,
+        HDR_WAITING,
+        HDR_READY_TO_READ
+    };
+
     static void shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environmentFlags, float frameTime);
     static IDirect3DTexture9* borrowBuffer(int n);
     static void applyBlend();

@@ -5,8 +5,9 @@
 
 #include <algorithm>
 #include <sstream>
-
-
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 using std::string;
 using std::stringstream;
@@ -92,88 +93,91 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     // Pre-warm cache if any per-pixel mode is active
     if (Configuration.MGEFlags & USE_FFESHADER) {
         LOG::logline("-- Per-pixel shader precaching");
-        precache();
+        precacheAsync();
     }
 
     return true;
 }
 
-void FixedFunctionShader::precache() {
-    // Pre-warm cache with common materials
-    ShaderKey skCommon;
-    memset(&skCommon, 0, sizeof skCommon);
-    skCommon.uvSets = 1;
+void FixedFunctionShader::precacheAsync() {
+    // Move precaching to a separate thread - essential variants to prevent stuttering
+    std::thread precacheThread([]() {
+        LOG::logline("-- Starting async per-pixel shader precaching (essential variants)");
 
-    for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
-        skCommon.vertexColour = vertexCol;
-        skCommon.vertexMaterial = vertexCol + 1;
+        ShaderKey skCommon;
+        memset(&skCommon, 0, sizeof skCommon);
+        skCommon.uvSets = 1;
 
-        for (int heavyLighting = 0; heavyLighting <= 1; ++heavyLighting) {
-            skCommon.heavyLighting = heavyLighting;
+        int compiledVariants = 0;
 
-            // Additive blended texture without fog
-            skCommon.usesSkinning = 0;
-            skCommon.fogMode = 0;
-            skCommon.usesTexgen = 0;
+        for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
+            skCommon.vertexColour = vertexCol;
+            skCommon.vertexMaterial = vertexCol + 1;
 
-            skCommon.activeStages = 1;
-            skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-            memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
-            generateMWShader(skCommon);
+            for (int heavyLighting = 0; heavyLighting <= 1; ++heavyLighting) {
+                skCommon.heavyLighting = heavyLighting;
 
-            // Additive blended particle texturing
-            skCommon.usesSkinning = 0;
-            skCommon.fogMode = 2;
-            skCommon.usesTexgen = 0;
+                for (int skinning = 0; skinning <= 1; ++skinning) {
+                    skCommon.usesSkinning = skinning;
 
-            skCommon.activeStages = 1;
-            skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-            memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
-            generateMWShader(skCommon);
+                    // Standard diffuse texturing (most common)
+                    skCommon.activeStages = 1;
+                    skCommon.fogMode = 1;
+                    skCommon.usesTexgen = 0;
+                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
+                    generateMWShader(skCommon);
+                    compiledVariants++;
 
-            skCommon.activeStages = 2;
-            skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-            skCommon.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-            generateMWShader(skCommon);
+                    // Dual texture (common for details)
+                    skCommon.activeStages = 2;
+                    skCommon.fogMode = 1;
+                    skCommon.usesTexgen = 0;
+                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    skCommon.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
+                    generateMWShader(skCommon);
+                    compiledVariants++;
 
-            // Untextured
-            skCommon.usesSkinning = 0;
-            skCommon.fogMode = 1;
-            skCommon.usesTexgen = 0;
+                    // Particle effects (additive blend)
+                    skCommon.activeStages = 1;
+                    skCommon.fogMode = 2;
+                    skCommon.usesTexgen = 0;
+                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
+                    generateMWShader(skCommon);
+                    compiledVariants++;
 
-            skCommon.activeStages = 1;
-            skCommon.stage[0] = { D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-            memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
-            generateMWShader(skCommon);
+                    // Enchantment effects
+                    skCommon.activeStages = 2;
+                    skCommon.fogMode = 0;
+                    skCommon.usesTexgen = 1;
+                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 0, 1, 0, 3 };
+                    skCommon.stage[1] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    generateMWShader(skCommon);
+                    compiledVariants++;
+                }
 
-            for (int skinning = 0; skinning <= 1; ++skinning) {
-                skCommon.usesSkinning = skinning;
-
-                // Standard diffuse texturing
-                skCommon.activeStages = 1;
+                // Untextured surfaces
+                skCommon.usesSkinning = 0;
                 skCommon.fogMode = 1;
                 skCommon.usesTexgen = 0;
-                skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                skCommon.activeStages = 1;
+                skCommon.stage[0] = { D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
                 memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
                 generateMWShader(skCommon);
+                compiledVariants++;
 
-                skCommon.activeStages = 2;
-                skCommon.fogMode = 1;
-                skCommon.usesTexgen = 0;
-                skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                skCommon.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                generateMWShader(skCommon);
-
-                // Enchantment effect
-                skCommon.activeStages = 2;
-                skCommon.fogMode = 0;
-                skCommon.usesTexgen = 1;
-                skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 0, 1, 0, 3 };
-                skCommon.stage[1] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 1, 0, 0, 0 };
-                generateMWShader(skCommon);
+                // Progress logging
+                if (compiledVariants % 4 == 0) {
+                    LOG::logline("-- Precaching progress: %d shaders", compiledVariants);
+                }
             }
         }
-    }
+
+        LOG::logline("-- Async precaching completed: %d essential shaders compiled", compiledVariants);
+        });
+
+    precacheThread.detach();
 }
 
 void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {

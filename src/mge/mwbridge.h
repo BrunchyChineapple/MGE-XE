@@ -69,6 +69,7 @@ public:
 
     void GetSunDir(float& x, float& y, float& z);
     BYTE GetSunVis();
+    bool GetMoonDir(bool secunda, float& x, float& y, float& z);
     void setSunriseSunset(float rise_time, float rise_dur, float set_time, float set_dur);
 
     DWORD IntCurCellAddr();
@@ -124,6 +125,7 @@ public:
     void patchResolveDuringInit(void (__cdecl* newfunc)());
     void patchLoadTexture2D();
     void patchLightParticleMaterialModifier();
+    void patchWorldRenderingAccumulation();
 
     void* getGMSTPointer(DWORD id);
     DWORD getKeybindCode(DWORD action);

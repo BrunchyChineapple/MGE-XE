@@ -556,7 +556,7 @@ tabMesh = "Land Meshes"
 lMeshDesc = "Higher detail reduces mesh errors at the cost of more memory use."
 lMeshWorldDetail = "World mesh detail"
 lMeshAutoInfo = "World mesh detail is auto-calculated based on the size of the world resulting from the selected plugins list - this value may change from what you had set previously if you choose different set of plugins."
-cmbMeshWorldDetail = "Ultra High;Very High;High;Medium;Low"
+cmbMeshWorldDetail = "Mega Detail;Ultra High;Very High;High;Medium;Low"
 bMeshSkip = "Skip Mesh Creation"
 bMeshRun = "Create Land Meshes"
 

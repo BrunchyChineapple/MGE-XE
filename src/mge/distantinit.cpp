@@ -5,20 +5,30 @@
 #include "distantland.h"
 #include "distantshader.h"
 #include "dlformat.h"
+#include "compositetelemetry.h"   // CompositeTelemetry::write (task 11.2; Req 8.1/8.2/8.4)
 #include "postshaders.h"
 #include "morrowindbsa.h"
 #include "mwbridge.h"
 #include "mgeversion.h"
 #include "statusoverlay.h"
+#include "ipc/dlshare.h"
 #include <memory>
 #include <optional>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+#ifdef MGE_RTX
+#include "remix_api_test.h"      // RemixAPITest::getInterface (live Remix interface)
+#include "dlcull_config.h"       // dlRegisterDistantTexture — per-texture distant suppress
+#endif
 
 
 
 using std::string;
 using std::string_view;
 using std::vector;
-using std::unordered_map;
 
 bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
@@ -37,20 +47,54 @@ IDirect3DVertexDeclaration9* DistantLand::GrassDecl;
 
 VendorSpecificRendering DistantLand::vsr;
 
-unordered_map<std::string, DistantLand::WorldSpace> DistantLand::mapWorldSpaces;
-const DistantLand::WorldSpace* DistantLand::currentWorldSpace;
+IPC::Client DistantLand::ipcClient;
 std::vector<DistantLand::DynamicVisGroup> DistantLand::dynamicVisGroups;
 void* DistantLand::lastDistantVisCell;
-QuadTree DistantLand::LandQuadTree;
-VisibleSet DistantLand::visLand;
-VisibleSet DistantLand::visDistant;
-VisibleSet DistantLand::visGrass;
+bool DistantLand::isDistantLandLoaded = false;
+
+VisibleSet<StlVector> DistantLand::visLand;
+VisibleSet<StlVector> DistantLand::visDistant;
+VisibleSet<StlVector> DistantLand::visGrass;
+
+VisibleSet<IpcClientVector> DistantLand::visLandShared;
+VisibleSet<IpcClientVector> DistantLand::visDistantShared;
+VisibleSet<IpcClientVector> DistantLand::visGrassShared;
+VisibleSet<IpcClientVector> DistantLand::visExtraShared;
+IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
+
+IPC::VecId DistantLand::visLandSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::visDistantSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::visGrassSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::visExtraSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 
 vector<DistantLand::RecordedState> DistantLand::recordMW;
 vector<DistantLand::RecordedState> DistantLand::recordSky;
-vector< std::pair<const QuadTreeMesh*, int> > DistantLand::batchedGrass;
+vector< std::pair<const RenderMesh*, int> > DistantLand::batchedGrass;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
+// NEW (additive; Architecture B). Single IPC-client-owned resident composite cache shared by
+// the FFP and shader distant-land binders. Default-constructed empty/inert: until task 8.5
+// wires init()/admit()/evictNotVisible() on THIS instance, every lookup() misses and the
+// Texture_Binder falls back to texWorldColour (stock Single_Atlas_Path, Req 6.1/6.2).
+ResidentCompositeCache DistantLand::compositeCache;
+// NEW (additive; Architecture B client streaming, task 8.5). New_Format gate + the three
+// StreamVisibleComposites shared-vector channels and their client views. All default to the
+// inert Old_Format state (hasCompositeSet=false, InvalidVector ids), so until initLandscapeClient
+// activates them the reconcile path is a no-op and the binder takes the Single_Atlas_Path.
+bool DistantLand::hasCompositeSet = false;
+IPC::VecId DistantLand::compositeDeltaSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::compositeHeadersSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::compositeBytesSharedId = IPC::InvalidVector;
+IPC::VecView<CompositeCellId> DistantLand::compositeDeltaView;
+IPC::VecView<CompositeChunkMsg> DistantLand::compositeHeadersView;
+IPC::VecView<std::uint8_t> DistantLand::compositeBytesView;
+std::uint32_t DistantLand::compositeDefaultEdge = 0;
+// NEW (additive; Architecture B telemetry, task 11.2). Visible_Cell_Set change-detection state.
+// Default to "no prior signature" so the first New_Format frame always emits a telemetry record;
+// thereafter the sidecar is rewritten only when the visible set's signature changes (Req 8.1).
+bool DistantLand::compositeVisibleSigValid = false;
+std::uint64_t DistantLand::compositeVisibleSig = 0;
 IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texDistantBlend;
@@ -60,6 +104,12 @@ IDirect3DVolumeTexture9* DistantLand::texWater;
 IDirect3DVertexBuffer9* DistantLand::vbWater;
 IDirect3DIndexBuffer9* DistantLand::ibWater;
 IDirect3DVertexBuffer9* DistantLand::vbGrassInstances;
+
+#ifdef MGE_RTX
+IDirect3DVertexBuffer9* DistantLand::vbWaterFFP = nullptr;
+IDirect3DVertexDeclaration9* DistantLand::waterFFPDecl = nullptr;
+IDirect3DTexture9* DistantLand::cachedWaterTex = nullptr;
+#endif
 
 IDirect3DTexture9* DistantLand::texRain;
 IDirect3DTexture9* DistantLand::texRipples;
@@ -164,6 +214,7 @@ const D3DVERTEXELEMENT9 WaterElem[] = {
 const D3DVERTEXELEMENT9 LandElem[] = {
     {0, 0,  D3DDECLTYPE_FLOAT3,  D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
     {0, 12, D3DDECLTYPE_SHORT2N, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+    {0, 16, D3DDECLTYPE_UBYTE4N, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,   0},
     D3DDECL_END()
 };
 
@@ -202,6 +253,10 @@ bool DistantLand::init() {
     vsr.init(device);
     BSA::init();
 
+    if (Configuration.UseSharedMemory && !initIpc()) {
+        return false;
+    }
+
     if (!initShader()) {
         return false;
     }
@@ -230,7 +285,7 @@ bool DistantLand::init() {
         return false;
     }
 
-    if (!initDistantStatics()) {
+    if (!initDistantStaticsClient()) {
         return false;
     }
 
@@ -243,6 +298,65 @@ bool DistantLand::init() {
     LOG::logline("<< Completed Distant Land init");
     ready = true;
     isRenderCached = false;
+    return true;
+}
+
+bool DistantLand::initIpc() {
+    if (!IPC::initImports()) {
+        LOG::logline("!! Disabling shared memory because required memory mapping APIs are not available");
+        Configuration.UseSharedMemory = false;
+        // we'll return success so we can continue on the non-IPC path
+        return true;
+    }
+
+    if (!ipcClient.startServer("mgeHost64.exe")) {
+        return false;
+    }
+
+    // allocate shared vectors that will be reused for the duration of the program
+    auto maybeLandVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
+    if (!maybeLandVec.has_value()) {
+        return false;
+    }
+    auto& landVec = maybeLandVec.value();
+    visLandSharedId = landVec.id();
+    visLandShared.SetVector((IpcClientVector(landVec)));
+
+    auto maybeDistantVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
+    if (!maybeDistantVec.has_value()) {
+        return false;
+    }
+    auto& distantVec = maybeDistantVec.value();
+    visDistantSharedId = distantVec.id();
+    visDistantShared.SetVector((IpcClientVector(distantVec)));
+
+    // we force the maximum number of grass elements to always be resident in memory. this currently equates to 704 KiB of
+    // grass memory compared to the standard window size of 64 KiB, but it allows us to avoid a bunch of copying when
+    // rendering grass.
+    auto maybeGrassVec = ipcClient.allocVecBlocking<RenderMesh>(MaxGrassElements, MaxGrassElements, MaxGrassElements);
+    if (!maybeGrassVec.has_value()) {
+        return false;
+    }
+    auto& grassVec = maybeGrassVec.value();
+    visGrassSharedId = grassVec.id();
+    visGrassShared.SetVector((IpcClientVector(grassVec)));
+
+    auto maybeExtraVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
+    if (!maybeExtraVec.has_value()) {
+        return false;
+    }
+    auto& extraVec = maybeExtraVec.value();
+    visExtraSharedId = extraVec.id();
+    visExtraShared.SetVector((IpcClientVector(extraVec)));
+
+    auto maybeDynVisVec = ipcClient.allocVecBlocking<IPC::DynVisFlag>(1, 1000, 1);
+    if (!maybeDynVisVec.has_value()) {
+        return false;
+    }
+    auto& dynVisVec = maybeDynVisVec.value();
+    dynVisFlagsSharedId = dynVisVec.id();
+    dynVisFlagsShared = dynVisVec;
+
     return true;
 }
 
@@ -627,6 +741,47 @@ bool DistantLand::initWater() {
 
     ibWater->Unlock();
 
+#ifdef MGE_RTX
+    // Build a parallel UV-bearing VB for the FFP distant-water pass.
+    // Same vertex positions as vbWater (so we can re-use ibWater) but with
+    // an additional float2 UV0 derived from object-space XY at 1/256 scale.
+    // E-man's translucent water material relies on UV gradients to drive
+    // its time-animated flipbook; without per-vertex UVs the entire surface
+    // would sample one texel and look frozen.
+    struct WaterFFPElem { float x, y, z, u, v; };
+    static const D3DVERTEXELEMENT9 waterFFPDeclElems[] = {
+        { 0,  0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+        { 0, 12, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },
+        D3DDECL_END()
+    };
+    hr = device->CreateVertexDeclaration(waterFFPDeclElems, &waterFFPDecl);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create FFP water decl");
+        return false;
+    }
+    hr = device->CreateVertexBuffer(numWaterVerts * sizeof(WaterFFPElem), 0, 0, D3DPOOL_MANAGED, &vbWaterFFP, 0);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create FFP water verts");
+        return false;
+    }
+    {
+        D3DXVECTOR3* srcVerts;
+        WaterFFPElem* dstVerts;
+        vbWater->Lock(0, 0, (void**)&srcVerts, D3DLOCK_READONLY);
+        vbWaterFFP->Lock(0, 0, (void**)&dstVerts, 0);
+        const float kUvScale = 1.0f / 256.0f;
+        for (int i = 0; i < numWaterVerts; ++i) {
+            dstVerts[i].x = srcVerts[i].x;
+            dstVerts[i].y = srcVerts[i].y;
+            dstVerts[i].z = srcVerts[i].z;
+            dstVerts[i].u = srcVerts[i].x * kUvScale;
+            dstVerts[i].v = srcVerts[i].y * kUvScale;
+        }
+        vbWaterFFP->Unlock();
+        vbWater->Unlock();
+    }
+#endif
+
     if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
         // Setup water simulation
         if (!initDynamicWaves()) {
@@ -762,46 +917,11 @@ bool DistantLand::initShadow() {
     return true;
 }
 
-bool DistantLand::initDistantStatics() {
+bool DistantLand::initDistantStaticsClient() {
     if (FAILED(device->CreateVertexDeclaration(StaticElem, &StaticDecl))) {
         LOG::logline("!! Failed to to create static vertex declaration");
         return false;
     }
-
-    if (!loadDistantStatics()) {
-        return false;
-    }
-
-    currentWorldSpace = nullptr;
-    return true;
-}
-
-class membuf_reader {
-    char* ptr;
-
-public:
-    membuf_reader(char* buf) : ptr(buf) {}
-
-    template <typename T>
-    inline void read(T* dest, size_t size) {
-        memcpy((char*)dest, ptr, size);
-        ptr += size;
-    }
-
-    inline char* get() {
-        return ptr;
-    }
-
-    inline void advance(size_t size) {
-        ptr += size;
-    }
-};
-
-static size_t initDistantStaticsQT(DistantLand::WorldSpace& worldSpace, vector<DistantStatic>& distantStatics, vector<UsedDistantStatic>& uds);
-
-bool DistantLand::loadDistantStatics() {
-    DWORD unused;
-    HANDLE h;
 
     if (GetFileAttributes("Data Files\\distantland\\statics") == INVALID_FILE_ATTRIBUTES) {
         LOG::logline("!! Distant statics have not been generated");
@@ -809,33 +929,63 @@ bool DistantLand::loadDistantStatics() {
         return !(Configuration.MGEFlags & USE_DISTANT_LAND);
     }
 
-    h = CreateFile("Data Files\\distantland\\version", GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0);
-    if (h == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! Required distant statics files are missing, regeneration required - distantland/version");
-        LOG::flush();
-        return false;
-    }
-    BYTE version = 0;
-    ReadFile(h, &version, sizeof(version), &unused, 0);
-    if (version != MGE_DL_VERSION) {
-        LOG::logline("!! Distant statics data is from an old version and needs to be regenerated");
-        LOG::flush();
-        return false;
-    }
-    CloseHandle(h);
+    if (Configuration.UseSharedMemory) {
+        auto staticsId = IPC::InvalidVector;
+        auto subsetsId = IPC::InvalidVector;
+        {
+            auto maybeStatics = ipcClient.allocVecBlocking<DistantStatic>(1, 500000, 1);
+            if (!maybeStatics.has_value()) {
+                return false;
+            }
 
-    h = CreateFile("Data Files\\distantland\\statics\\usage.data", GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0);
-    if (h == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! Required distant statics files are missing, regeneration required - distantland/statics/usage.data");
-        LOG::flush();
-        return false;
+            auto maybeSubsets = ipcClient.allocVecBlocking<DistantSubset>(1, 500000, 1);
+            if (!maybeSubsets.has_value()) {
+                return false;
+            }
+
+            auto& statics = maybeStatics.value();
+            auto& subsets = maybeSubsets.value();
+            if (!loadDistantStaticsClient(statics, subsets)) {
+                return false;
+            }
+
+            staticsId = statics.id();
+            subsetsId = subsets.id();
+            if (!ipcClient.initDistantStatics(staticsId, subsetsId)) {
+                return false;
+            }
+
+            // our views are destroyed
+        }
+
+        // free on server
+        ipcClient.freeVecBlocking(staticsId);
+        ipcClient.freeVec(subsetsId);
+    } else {
+        vector<DistantStatic> distantStatics;
+        vector<DistantSubset> distantSubsets;
+        if (!loadDistantStaticsClient(distantStatics, distantSubsets)) {
+            return false;
+        }
     }
 
-    vector<DistantStatic> distantStatics;
+    DistantLandShare::currentWorldSpace = nullptr;
+    DistantLandShare::hasCurrentWorldSpace = false;
+    isDistantLandLoaded = true;
+    return true;
+}
+
+template<class T, class U>
+bool DistantLand::loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubsets) {
+    DWORD unused;
+
     size_t DistantStaticCount;
     ReadFile(h, &DistantStaticCount, 4, &unused, 0);
-    distantStatics.resize(DistantStaticCount);
+    distantStatics.reserve(DistantStaticCount);
 
+    // we don't actually know yet how many subsets there will be, but it'll probably be at least this many
+    distantSubsets.reserve(DistantStaticCount);
+    
     HANDLE h2 = CreateFile("Data Files\\distantland\\statics\\static_meshes", GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0);
     if (h2 == INVALID_HANDLE_VALUE) {
         LOG::logline("!! Required distant statics files are missing, regeneration required - distantland/statics/static_meshes");
@@ -859,18 +1009,20 @@ bool DistantLand::loadDistantStatics() {
     membuf_reader reader(file_buffer.get());
     CloseHandle(h2);
 
-    for (auto& i : distantStatics) {
-        int numSubsets;
-        reader.read(&numSubsets, 4);
+    for (DWORD distantStaticIndex = 0; distantStaticIndex < DistantStaticCount; distantStaticIndex++) {
+        DistantStatic i = {};
+        reader.read(&i.numSubsets, 4);
         reader.read(&i.sphere.radius, 4);
         reader.read(&i.sphere.center, 12);
         reader.read(&i.type, 1);
 
-        i.subsets.resize(numSubsets);
         i.aabbMin = D3DXVECTOR3(FLT_MAX, FLT_MAX, FLT_MAX);
         i.aabbMax = D3DXVECTOR3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
 
-        for (auto& subset : i.subsets) {
+        i.firstSubsetIndex = distantSubsets.size();
+        for (size_t subsetIndex = 0; subsetIndex < i.numSubsets; subsetIndex++) {
+            DistantSubset subset = {};
+
             // Get bounding sphere
             reader.read(&subset.sphere.radius, 4);
             reader.read(&subset.sphere.center, 12);
@@ -929,9 +1081,22 @@ bool DistantLand::loadDistantStatics() {
             }
             subset.tex = tex;
 
+#ifdef MGE_RTX
+            // Record this distant static's source texture path so the per-texture
+            // suppress list (MGE Distant Cull MCM) can skip its distant copies at draw
+            // time. Skip the shared error texture (its name would be meaningless/last-wins).
+            if (tex != errorTexture) {
+                dlRegisterDistantTexture(tex, texname);
+            }
+#endif
+
             // Keep resource pointers for deallocation
             meshCollectionStatics.push_back(MeshResources(vb, ib, tex));
+
+            distantSubsets.push_back(subset);
         }
+
+        distantStatics.push_back(i);
     }
     file_buffer.reset();
     errorTexture->Release();
@@ -946,6 +1111,11 @@ bool DistantLand::loadDistantStatics() {
     LOG::logline("-- Distant texture memory use: %d MB", texMemUsage);
     LOG::flush();
 
+    return true;
+}
+
+void DistantLand::loadVisGroupsClient(HANDLE h) {
+    DWORD unused;
 
     // Load dynamic vis groups
     size_t dynamicVisGroupCount;
@@ -982,213 +1152,289 @@ bool DistantLand::loadDistantStatics() {
 
         visData.reset();
     }
+}
 
-    // Load statics references
-    const size_t UsedDistantStaticRecordSize = 34;
-    const size_t UsedDistantStaticChunkCount = 250000;
-    size_t worldvis_memory_use = 0;
-    auto UsedDistantStaticData = std::make_unique<char[]>(UsedDistantStaticChunkCount * UsedDistantStaticRecordSize);
-
-    mapWorldSpaces.clear();
-    for (size_t nWorldSpace = 0; true; ++nWorldSpace) {
-        vector<UsedDistantStatic> worldSpaceStatics;
-        WorldSpace* currentWorldSpace;
-        size_t UsedDistantStaticCount;
-
-        ReadFile(h, &UsedDistantStaticCount, 4, &unused, 0);
-        if (nWorldSpace != 0 && UsedDistantStaticCount == 0) {
-            break;
-        }
-
-        if (nWorldSpace == 0) {
-            auto iterWS = mapWorldSpaces.insert(make_pair(string(), WorldSpace())).first;
-            currentWorldSpace = &iterWS->second;
-            if (UsedDistantStaticCount == 0) {
-                continue;
-            }
-        } else {
-            char cellname[64];
-            ReadFile(h, &cellname, 64, &unused, 0);
-            auto iterWS = mapWorldSpaces.insert(make_pair(string(cellname), WorldSpace())).first;
-            currentWorldSpace = &iterWS->second;
-        }
-
-        worldSpaceStatics.reserve(UsedDistantStaticCount);
-
-        while (UsedDistantStaticCount > 0) {
-            size_t staticsToRead = std::min(UsedDistantStaticChunkCount, UsedDistantStaticCount);
-            UsedDistantStaticCount -= staticsToRead;
-
-            ReadFile(h, UsedDistantStaticData.get(), staticsToRead * UsedDistantStaticRecordSize, &unused, 0);
-            membuf_reader udsReader(UsedDistantStaticData.get());
-
-            for (size_t i = 0; i < staticsToRead; ++i) {
-                UsedDistantStatic NewUsedStatic;
-                float yaw, pitch, roll, scale;
-
-                udsReader.read(&NewUsedStatic.staticRef, 4);
-                udsReader.read(&NewUsedStatic.visIndex, 2);
-                udsReader.read(&NewUsedStatic.pos, 12);
-                udsReader.read(&yaw, 4);
-                udsReader.read(&pitch, 4);
-                udsReader.read(&roll, 4);
-                udsReader.read(&scale, 4);
-                NewUsedStatic.scale = scale;
-
-                D3DXMATRIX transmat, rotmatx, rotmaty, rotmatz, scalemat;
-                D3DXMatrixTranslation(&transmat, NewUsedStatic.pos.x, NewUsedStatic.pos.y, NewUsedStatic.pos.z);
-                D3DXMatrixRotationX(&rotmatx, -yaw);
-                D3DXMatrixRotationY(&rotmaty, -pitch);
-                D3DXMatrixRotationZ(&rotmatz, -roll);
-                D3DXMatrixScaling(&scalemat, scale, scale, scale);
-
-                const DistantStatic* stat = &distantStatics[NewUsedStatic.staticRef];
-                NewUsedStatic.transform = scalemat * rotmatz * rotmaty * rotmatx * transmat;
-                NewUsedStatic.sphere = NewUsedStatic.GetBoundingSphere(stat->sphere);
-                NewUsedStatic.box = NewUsedStatic.GetBoundingBox(stat->aabbMin, stat->aabbMax);
-
-                worldSpaceStatics.push_back(NewUsedStatic);
-            }
-        }
-
-        worldvis_memory_use += initDistantStaticsQT(*currentWorldSpace, distantStatics, worldSpaceStatics);
+template<class T, class U>
+bool DistantLand::loadDistantStaticsClient(T& distantStatics, U& distantSubsets) {
+    auto h = DistantLandShare::beginReadStatics();
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
     }
 
+    if (!loadStaticMeshes(h, distantStatics, distantSubsets)) {
+        CloseHandle(h);
+        return false;
+    }
+    loadVisGroupsClient(h);
+    
+    if (Configuration.UseSharedMemory) {
+        CloseHandle(h);
+        return true; // server will handle the rest of the logic
+    }
+
+    DistantLandShare::readDistantStatics(h, distantStatics, distantSubsets, dynamicVisGroups);
     CloseHandle(h);
-
-    // Log approximate memory use
-    LOG::logline("-- Distant worldspaces memory use: %d MB", worldvis_memory_use / (1 << 20));
-
     return true;
 }
 
-static size_t initDistantStaticsQT(DistantLand::WorldSpace& worldSpace, vector<DistantStatic>& distantStatics, vector<UsedDistantStatic>& uds) {
-    // Initialize quadtrees
-    worldSpace.NearStatics = std::make_unique<QuadTree>();
-    worldSpace.FarStatics = std::make_unique<QuadTree>();
-    worldSpace.VeryFarStatics = std::make_unique<QuadTree>();
-    worldSpace.GrassStatics = std::make_unique<QuadTree>();
-    QuadTree* NQTR = worldSpace.NearStatics.get();
-    QuadTree* FQTR = worldSpace.FarStatics.get();
-    QuadTree* VFQTR = worldSpace.VeryFarStatics.get();
-    QuadTree* GQTR = worldSpace.GrassStatics.get();
-
-    // Calclulate optimal initial quadtree size
-    D3DXVECTOR2 aabbMax = D3DXVECTOR2(-FLT_MAX, -FLT_MAX);
-    D3DXVECTOR2 aabbMin = D3DXVECTOR2(FLT_MAX, FLT_MAX);
-
-    // Find xyz bounds
-    for (const auto& i : uds) {
-        float x = i.pos.x, y = i.pos.y, r = i.sphere.radius;
-
-        aabbMax.x = std::max(x + r, aabbMax.x);
-        aabbMax.y = std::max(y + r, aabbMax.y);
-        aabbMin.x = std::min(aabbMin.x, x - r);
-        aabbMin.y = std::min(aabbMin.y, y - r);
+bool DistantLand::initLandscapeClient() {
+    HANDLE file = CreateFile("Data Files\\distantland\\world", GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
     }
 
-    size_t total_instances = 0;
-    float box_size = std::max(aabbMax.x - aabbMin.x, aabbMax.y - aabbMin.y);
-    D3DXVECTOR2 box_center = 0.5 * (aabbMax + aabbMin);
-
-    NQTR->SetBox(box_size, box_center);
-    FQTR->SetBox(box_size, box_center);
-    VFQTR->SetBox(box_size, box_center);
-    GQTR->SetBox(box_size, box_center);
-
-    for (const auto& i : uds) {
-        DistantStatic* stat = &distantStatics[i.staticRef];
-        QuadTree* targetQTR;
-
-        // Use post-transform (include scale) radius
-        float radius = i.sphere.radius;
-
-        // Buildings are treated as larger objects, as they are typically
-        // smaller component meshes combined to make a single building
-        if (stat->type == STATIC_BUILDING) {
-            radius *= 2.0f;
-        }
-
-        // Select quadtree to place object in
-        switch (stat->type) {
-        case STATIC_AUTO:
-        case STATIC_TREE:
-        case STATIC_BUILDING:
-            if (radius <= Configuration.DL.FarStaticMinSize) {
-                targetQTR = NQTR;
-            } else if (radius <= Configuration.DL.VeryFarStaticMinSize) {
-                targetQTR = FQTR;
-            } else {
-                targetQTR = VFQTR;
-            }
-            break;
-
-        case STATIC_GRASS:
-            targetQTR = GQTR;
-            break;
-
-        case STATIC_NEAR:
-            targetQTR = NQTR;
-            break;
-
-        case STATIC_FAR:
-            targetQTR = FQTR;
-            break;
-
-        case STATIC_VERY_FAR:
-            targetQTR = VFQTR;
-            break;
-
-        default:
-            continue;
-        }
-
-        // Add sub-meshes to appropriate quadtree
-        for (auto& s : stat->subsets) {
-            BoundingSphere boundSphere;
-            BoundingBox boundBox;
-
-            if (stat->type == STATIC_BUILDING) {
-                // Use model bound so that all building parts have coherent visibility
-                boundSphere = i.sphere;
-                boundBox = i.box;
-            } else {
-                // Use individual mesh bounds
-                boundSphere = i.GetBoundingSphere(s.sphere);
-                boundBox = i.GetBoundingBox(s.aabbMin, s.aabbMax);
-            }
-
-            auto mesh = targetQTR->AddMesh(
-                boundSphere,
-                boundBox,
-                i.transform,
-                s.hasAlpha,
-                s.hasUVController,
-                s.tex,
-                s.verts,
-                s.vbuffer,
-                s.faces,
-                s.ibuffer
-            );
-            if (i.visIndex > 0) {
-                DistantLand::dynamicVisGroups[i.visIndex].references.push_back(mesh);
-            }
-        }
-
-        total_instances += stat->subsets.size();
+    DWORD file_size = GetFileSize(file, NULL);
+    DWORD mesh_count, unused;
+    ReadFile(file, &mesh_count, 4, &unused, 0);
+    if (mesh_count == 0) {
+        CloseHandle(file);
+        return true;
     }
 
-    NQTR->Optimize();
-    NQTR->CalcVolume();
-    FQTR->Optimize();
-    FQTR->CalcVolume();
-    VFQTR->Optimize();
-    VFQTR->CalcVolume();
-    GQTR->Optimize();
-    GQTR->CalcVolume();
+    auto id = IPC::InvalidVector;
+    {
+        auto& maybeBuffers = ipcClient.allocVecBlocking<IPC::LandscapeBuffers>(1, 200000, mesh_count);
+        if (!maybeBuffers.has_value()) {
+            return false;
+        }
 
-    // Return total memory use of leaves only, non-leaf nodes barely use much memory
-    return total_instances * sizeof(QuadTreeMesh);
+        auto& buffers = maybeBuffers.value();
+        id = buffers.id();
+
+        // the server will read data as we populate it
+        if (!ipcClient.initLandscape(id)) {
+            ipcClient.freeVecBlocking(id);
+            return false;
+        }
+
+        buffers.start_write();
+        for (DWORD i = 0; i < mesh_count; i++) {
+            // skip info that will be handled by the server
+            SetFilePointer(file, 40, NULL, FILE_CURRENT);
+
+            DWORD verts = 0, faces = 0;
+            IDirect3DVertexBuffer9* vb;
+            IDirect3DIndexBuffer9* ib;
+            void* lockdata;
+
+            ReadFile(file, &verts, 4, &unused, 0);
+            ReadFile(file, &faces, 4, &unused, 0);
+            bool large = (verts > 0xFFFF || faces > 0xFFFF);
+
+            device->CreateVertexBuffer(verts * SIZEOFLANDVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
+            vb->Lock(0, 0, &lockdata, 0);
+            ReadFile(file, lockdata, verts * SIZEOFLANDVERT, &unused, 0);
+            vb->Unlock();
+
+            device->CreateIndexBuffer(faces * (large ? 12 : 6), D3DUSAGE_WRITEONLY, large ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
+            ib->Lock(0, 0, &lockdata, 0);
+            ReadFile(file, lockdata, faces * (large ? 12 : 6), &unused, 0);
+            ib->Unlock();
+
+            buffers.push_back({ vb, ib });
+
+            meshCollectionLand.push_back(MeshResources(vb, ib, 0));
+        }
+        buffers.end_write();
+
+        // Architecture B (task 8.5): the server processed the landscape data in parallel and,
+        // as part of the same InitLandscape RPC, ran its Format_Loader and reported whether a
+        // New_Format composite pool was loaded. Read that verdict back NOW, before freeVec
+        // reuses the shared parameter union. hasCompositeSet=false (Old_Format / absent /
+        // malformed / inert) leaves every New_Format-only path off and the renderer stays on
+        // the bit-identical Single_Atlas_Path (Req 4.6, 6.2).
+        std::uint32_t cellCount = 0, defaultEdge = 0;
+        bool hasComposites = false;
+        if (ipcClient.awaitInitLandscape(hasComposites, cellCount, defaultEdge)) {
+            initCompositeStreaming(hasComposites, cellCount, defaultEdge);
+        }
+
+        // our views must be destroyed before we can free the vec
+    }
+
+    ipcClient.freeVec(id);
+    CloseHandle(file);
+    return true;
+}
+
+// Architecture B (task 8.5): activate IPC-client composite streaming once the server's
+// Format_Loader verdict is known. Guarded entirely behind New_Format so an Old_Format /
+// absent / malformed / inert load leaves the cache empty, allocates no channels, and keeps
+// the distant land bit-identical to stock (Req 4.6, 6.2).
+void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellCount, std::uint32_t defaultEdgeTexels) {
+    hasCompositeSet = false;
+    compositeDefaultEdge = 0;
+
+    if (!hasComposites || cellCount == 0) {
+        // Old_Format / inert: nothing to stream. The empty cache makes every lookup() miss so
+        // the Texture_Binder binds the atlas only (Req 4.6).
+        return;
+    }
+
+    // New_Format: bind the resident cache to the same D3D9 device that feeds Remix and set the
+    // default Texture_Memory_Budget (Req 7.2; 64 MB caps the Draw_Distance=2, 1024^2 worst case
+    // at or below 64 MB, Req 7.4). The configured per-cell resolution is the server-reported
+    // default; it estimates each cell's budget cost in the cache's admission rule.
+    compositeCache.init(device);
+    compositeCache.setBudgetMB(kCompositeBudgetMB);
+    compositeDefaultEdge = defaultEdgeTexels ? defaultEdgeTexels : 1024;
+
+    // Allocate the three StreamVisibleComposites shared channels, mirroring the visible-mesh
+    // vectors allocated in initIpc(). The delta channel carries the per-frame newVisible \
+    // resident cell list; the header channel one CompositeChunkMsg per streamed cell; the byte
+    // channel the concatenated DXT1 + mip blobs. Sizes are bounded by the visible ring at the
+    // configured draw distance plus headroom, but reserved (not committed) up front so the
+    // shared memory only grows as cells actually stream.
+    auto maybeDelta = ipcClient.allocVecBlocking<CompositeCellId>(256, 65536, 1);
+    auto maybeHeaders = ipcClient.allocVecBlocking<CompositeChunkMsg>(256, 65536, 1);
+    // The byte channel must hold a frame's worth of compressed cells: a generous ring of cells
+    // at the default edge (DXT1 + mips ~= edge^2 * 2/3 bytes each). Reserve a large maximum so a
+    // big visible set never overflows the channel; only touched pages are committed.
+    const std::uint32_t cellBytesEstimate =
+        std::max<std::uint32_t>(1u, ResidentCompositeCache::compositeBytes(compositeDefaultEdge));
+    auto maybeBytes = ipcClient.allocVecBlocking<std::uint8_t>(cellBytesEstimate, cellBytesEstimate * 128, cellBytesEstimate);
+
+    if (!maybeDelta.has_value() || !maybeHeaders.has_value() || !maybeBytes.has_value()) {
+        LOG::logline("!! Failed to allocate composite streaming channels; using single atlas");
+        // Free whichever channels did allocate, then stay on the atlas (Req 6.1).
+        if (maybeDelta.has_value())   { auto v = std::move(maybeDelta.value());   auto vid = v.id(); maybeDelta.reset();   ipcClient.freeVecBlocking(vid); }
+        if (maybeHeaders.has_value()) { auto v = std::move(maybeHeaders.value()); auto vid = v.id(); maybeHeaders.reset(); ipcClient.freeVecBlocking(vid); }
+        if (maybeBytes.has_value())   { auto v = std::move(maybeBytes.value());   auto vid = v.id(); maybeBytes.reset();   ipcClient.freeVecBlocking(vid); }
+        compositeCache.releaseAll();
+        compositeDefaultEdge = 0;
+        return;
+    }
+
+    compositeDeltaView = std::move(maybeDelta.value());
+    compositeHeadersView = std::move(maybeHeaders.value());
+    compositeBytesView = std::move(maybeBytes.value());
+    compositeDeltaSharedId = compositeDeltaView.id();
+    compositeHeadersSharedId = compositeHeadersView.id();
+    compositeBytesSharedId = compositeBytesView.id();
+
+    hasCompositeSet = true;
+    LOG::logline("-- Composite streaming active: %u cells, %u px default, %u MB budget",
+                 cellCount, compositeDefaultEdge, kCompositeBudgetMB);
+}
+
+// Architecture B (task 8.5): per-frame IPC-client composite residency reconcile. Mirrors the
+// authoritative model tests/composite_stream_model.py (reconcile + budget admission +
+// telemetry tally): derive the Visible_Cell_Set, stream newVisible \ resident, admit the
+// streamed blobs under the budget, evict cells that left the set (resident subset of visible),
+// and record the atlas-served count. A no-op for Old_Format / inert / non-IPC loads.
+void DistantLand::streamAndReconcileComposites() {
+    if (!hasCompositeSet || !Configuration.UseSharedMemory) {
+        return;  // Old_Format / inert: binder stays on the atlas (Req 4.6, 6.1).
+    }
+
+    // --- Derive the Visible_Cell_Set from the SAME cull parameters the renderer uses ---------
+    // The distant-land cull builds a viewsphere of (eyePos, Draw_Distance * kCellSize) and a
+    // frustum (renderDistantLandFFP / renderDistantLand). The client's RenderMesh cull output
+    // carries no per-chunk cell identity, so we reuse the cull's viewsphere directly: every
+    // exterior cell whose square overlaps the eye-centred Draw_Distance ring is required
+    // resident this frame. This is the same ring the server streams against; we do NOT run a
+    // second quadtree traversal.
+    const float drawDistCells = std::max(1.0f, Configuration.DL.DrawDist);
+    const int ring = static_cast<int>(std::ceil(drawDistCells));
+    const int eyeCellX = static_cast<int>(std::floor(eyePos.x / kCellSize));
+    const int eyeCellY = static_cast<int>(std::floor(eyePos.y / kCellSize));
+
+    VisibleCellSet visible;
+    visible.reserve(static_cast<std::size_t>((2 * ring + 1) * (2 * ring + 1)));
+    for (int dy = -ring; dy <= ring; ++dy) {
+        for (int dx = -ring; dx <= ring; ++dx) {
+            visible.insert(CellId{ eyeCellX + dx, eyeCellY + dy });
+        }
+    }
+    const std::uint32_t visibleCount = static_cast<std::uint32_t>(visible.size());
+
+    // --- Compute the delta = newVisible \ alreadyResident (Req 4.2) --------------------------
+    // Only cells that are visible AND not already resident need streaming; cells already
+    // resident and still visible are kept without re-streaming (matches the model).
+    compositeDeltaView.clear();
+    for (const CellId& cell : visible) {
+        if (compositeCache.lookup(cell) == nullptr) {
+            CompositeCellId wire;
+            wire.cellX = cell.x;
+            wire.cellY = cell.y;
+            if (!compositeDeltaView.push_back(wire)) {
+                break;  // delta channel full; the rest fall back to the atlas this frame
+            }
+        }
+    }
+
+    // --- Issue StreamVisibleComposites and wait for the server to fill the OUT channels ------
+    if (compositeDeltaView.size() > 0) {
+        if (ipcClient.streamVisibleComposites(compositeDeltaSharedId, compositeHeadersSharedId, compositeBytesSharedId)) {
+            ipcClient.waitForCompletion();
+
+            // --- Admit each streamed cell, consuming byteLength bytes per header in lockstep --
+            // The server wrote one CompositeChunkMsg header per resolved cell to the header
+            // channel and that cell's compressed DXT1 + mip blob to the byte channel in matching
+            // order (ipc/server.cpp streamVisibleComposites). Walk the headers, slicing the byte
+            // channel by byteLength, and admit each into the cache. admit() enforces the budget
+            // and returns false on over-budget / upload failure -> the binder falls back to the
+            // atlas for that cell (Req 4.3, 7.2, 7.3, 7.5, 6.4).
+            const std::uint32_t headerCount = compositeHeadersView.size();
+            const std::uint32_t totalBytes = compositeBytesView.size();
+            std::uint32_t byteCursor = 0;
+            std::vector<std::uint8_t> blob;
+            for (std::uint32_t h = 0; h < headerCount; ++h) {
+                const CompositeChunkMsg msg = compositeHeadersView[h];
+
+                // Guard against a desynced/short byte channel before reading the slice.
+                if (msg.byteLength == 0 ||
+                    static_cast<std::uint64_t>(byteCursor) + msg.byteLength > totalBytes) {
+                    break;
+                }
+
+                // Copy this cell's contiguous blob out of the windowed byte channel into a
+                // flat buffer for admit() (the channel is not guaranteed contiguous across
+                // window boundaries, so element-wise read is the safe idiom).
+                blob.resize(msg.byteLength);
+                for (std::uint32_t b = 0; b < msg.byteLength; ++b) {
+                    blob[b] = compositeBytesView[byteCursor + b];
+                }
+                byteCursor += msg.byteLength;
+
+                compositeCache.admit(msg, blob.data());
+            }
+        }
+    }
+
+    // --- Evict cells that left the Visible_Cell_Set (Req 4.4, 4.5) ---------------------------
+    // After this the resident set is a subset of the visible set; evicted cells' bytes stay
+    // resident only in the 64-bit server pool.
+    compositeCache.evictNotVisible(visible);
+
+    // --- Telemetry tally: cells served by the Single_Atlas_Path this frame (Req 8.4) --------
+    // Every visible cell is either resident (composite) or atlas-served, matching the model's
+    // atlas_served_count = visibleCount - residentCount.
+    const std::uint32_t residentNow = compositeCache.residentCount();
+    compositeCache.setAtlasServedThisFrame(visibleCount > residentNow ? visibleCount - residentNow : 0);
+
+    // --- Composite_Telemetry emit on Visible_Cell_Set change (task 11.2; Req 8.1/8.2/8.4) ----
+    // The requirement is to report resident count / resident MB / atlas-served "WHEN the
+    // Visible_Cell_Set changes" — not every frame. Build an order-independent signature of this
+    // frame's visible cells (fold each cell's CellIdHash with XOR + an additive rotate so the
+    // result is independent of unordered_set iteration order) and emit only when it differs from
+    // the previous frame's signature. The counts/bytes/atlas-served tally are sourced straight
+    // from compositeCache (write(cache) pulls residentCount()/residentBytes()/
+    // atlasServedThisFrame()), reflecting the freshly-reconciled frame state above. This emit is
+    // reached only on New_Format frames: the function early-returns for Old_Format / inert /
+    // non-IPC loads, so Old_Format writes no sidecar and stays bit-identical to stock.
+    std::uint64_t sig = 0x9E3779B97F4A7C15ull ^ static_cast<std::uint64_t>(visibleCount);
+    const CellIdHash cellHasher;
+    for (const CellId& cell : visible) {
+        const std::uint64_t h = static_cast<std::uint64_t>(cellHasher(cell));
+        sig ^= h;                                  // order-independent (XOR is commutative)
+        sig += (h << 1) | (h >> 63);               // mix in a rotate so distinct sets separate
+    }
+    if (!compositeVisibleSigValid || sig != compositeVisibleSig) {
+        compositeVisibleSig = sig;
+        compositeVisibleSigValid = true;
+        CompositeTelemetry::write(compositeCache);
+    }
 }
 
 bool DistantLand::initLandscape() {
@@ -1228,6 +1474,10 @@ bool DistantLand::initLandscape() {
     }
 
     LOG::logline("-- Landscape textures loaded");
+
+    if (Configuration.UseSharedMemory) {
+        return initLandscapeClient();
+    }
 
     HANDLE file = CreateFile("Data Files\\distantland\\world", GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0);
     if (file == INVALID_HANDLE_VALUE) {
@@ -1283,17 +1533,17 @@ bool DistantLand::initLandscape() {
             qtmax.y = std::max(qtmax.y, i.sphere.center.y + i.sphere.radius);
         }
 
-        LandQuadTree.SetBox(std::max(qtmax.x - qtmin.x, qtmax.y - qtmin.y), 0.5 * (qtmax + qtmin));
+        DistantLandShare::LandQuadTree.SetBox(std::max(qtmax.x - qtmin.x, qtmax.y - qtmin.y), 0.5 * (qtmax + qtmin));
 
         // Add meshes to the quadtree
         for (auto& i : meshesLand) {
             meshCollectionLand.push_back(MeshResources(i.vbuffer, i.ibuffer, 0));
-            LandQuadTree.AddMesh(i.sphere, i.box, world, false, false, texWorldColour, i.verts, i.vbuffer, i.faces, i.ibuffer);
+            DistantLandShare::LandQuadTree.AddMesh(i.sphere, i.box, world, false, false, texWorldColour, i.verts, i.vbuffer, i.faces, i.ibuffer);
         }
     }
 
     CloseHandle(file);
-    LandQuadTree.CalcVolume();
+    DistantLandShare::LandQuadTree.CalcVolume();
 
     // Log approximate memory use
     LOG::logline("-- Distant landscape memory use: %d MB", file_size / (1 << 20));
@@ -1326,17 +1576,13 @@ void DistantLand::release() {
 
     LOG::logline("-- Renderer unloading");
 
-#ifdef MGE_RTX
-    releaseFFPBuffers();
-#endif
-
     recordMW.clear();
     recordSky.clear();
 
     PostShaders::release();
     FixedFunctionShader::release();
 
-    mapWorldSpaces.clear();
+    DistantLandShare::mapWorldSpaces.clear();
 
     for (auto& iM : meshCollectionStatics) {
         iM.vb->Release();
@@ -1345,13 +1591,29 @@ void DistantLand::release() {
     }
     meshCollectionStatics.clear();
 
-    LandQuadTree.Clear();
+    DistantLandShare::LandQuadTree.Clear();
     for (auto& iM : meshCollectionLand) {
         iM.vb->Release();
         iM.ib->Release();
         // A shared texture is used for land, and is released below
     }
     meshCollectionLand.clear();
+
+    // Architecture B (task 8.5): release every resident composite's D3D9 default-pool texture
+    // on renderer teardown (they must be freed before the device is, exactly as texWorldColour
+    // below is). A no-op when composite streaming never activated. The StreamVisibleComposites
+    // shared-vector channels are intentionally NOT freed here: they mirror the persistent
+    // visible-mesh vectors (visLandShared etc.), which likewise survive release() and are
+    // re-bound on the next init(). hasCompositeSet is cleared so a subsequent Old_Format
+    // re-init can't run the streamer against stale channels; the cache stays empty until the
+    // next initCompositeStreaming re-activates it.
+    compositeCache.releaseAll();
+    hasCompositeSet = false;
+    compositeDefaultEdge = 0;
+    // Reset the telemetry change-detection signature so a subsequent re-init forces a fresh
+    // emit on its first New_Format frame (task 11.2).
+    compositeVisibleSigValid = false;
+    compositeVisibleSig = 0;
 
     if (texWorldColour) {
         texWorldColour->Release();
@@ -1409,6 +1671,22 @@ void DistantLand::release() {
     ibWater = nullptr;
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
+
+#ifdef MGE_RTX
+    if (vbWaterFFP) {
+        vbWaterFFP->Release();
+        vbWaterFFP = nullptr;
+    }
+    if (waterFFPDecl) {
+        waterFFPDecl->Release();
+        waterFFPDecl = nullptr;
+    }
+    if (cachedWaterTex) {
+        cachedWaterTex->Release();
+        cachedWaterTex = nullptr;
+    }
+#endif
+
     vbFullFrame->Release();
     vbFullFrame = nullptr;
     vbClipCube->Release();
