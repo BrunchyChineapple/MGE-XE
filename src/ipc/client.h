@@ -223,6 +223,19 @@ namespace IPC {
 		*/
 		bool streamVisibleComposites(VecId delta, VecId outHeaders, VecId outBytes);
 
+        /**
+         * @brief Populate a complete terrain/non-grass-static retained-world catalog.
+         *
+         * All output vectors are caller-allocated. The call blocks until the host has
+         * written a fully validated snapshot; false means no active worldspace/catalog.
+         */
+        bool getRetainedWorldCatalogBlocking(
+            VecId header,
+            VecId cells,
+            VecId meshes,
+            VecId placements,
+            VecId blob);
+
 		/**
 		* @brief Update the current worldspace by informing the server of the player's current cell.
 		* @param cellname The name of the player's current cell.

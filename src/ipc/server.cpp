@@ -105,6 +105,9 @@ namespace IPC {
 			case Command::StreamVisibleComposites:
 				streamVisibleComposites();
 				break;
+            case Command::GetRetainedWorldCatalog:
+                getRetainedWorldCatalog();
+                break;
 			default:
 				LOG::logline("Received unknown command value %u", m_ipcParameters->command);
 				break;
@@ -258,4 +261,14 @@ namespace IPC {
 		CompositeStreamerServer streamer(DistantLandShare::compositePool);
 		streamer.streamNewlyVisible(delta, outHeaders, &outBytes);
 	}
+
+    void Server::getRetainedWorldCatalog() {
+        auto& params = m_ipcParameters->params.retainedCatalogParams;
+        params.available = DistantLandShare::writeRetainedCatalog(
+            getVec<RetainedCatalog::Header>(params.header),
+            getVec<RetainedCatalog::Cell>(params.cells),
+            getVec<RetainedCatalog::Mesh>(params.meshes),
+            getVec<RetainedCatalog::Placement>(params.placements),
+            getVec<std::uint8_t>(params.blob));
+    }
 }

@@ -8,6 +8,7 @@
 #include "mge/dlstreamer.h"
 #include "mge/quadtree.h"
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -56,6 +57,13 @@ public:
     // Single_Atlas_Path (Requirements 4.1, 4.6, 6.3). Pure data, so the same member
     // compiles in the 32-bit client TU (where it simply stays inactive).
     static CompositePool compositePool;
+
+    static std::vector<RetainedCatalog::Mesh> retainedStaticMeshes;
+    static std::vector<RetainedCatalog::Mesh> retainedTerrainMeshes;
+    static std::vector<std::uint8_t> retainedStaticBlob;
+    static std::vector<std::uint8_t> retainedTerrainBlob;
+    static std::vector<std::uint64_t> retainedStaticPrototypeIds;
+    static std::uint64_t retainedCatalogGeneration;
 
     static bool initDistantStaticsServer(IPC::Vec<DistantStatic>& distantStatics, IPC::Vec<DistantSubset>& distantSubsets);
     static void loadVisGroupsServer(HANDLE h);
@@ -117,6 +125,9 @@ public:
                     udsReader.read(&roll, 4);
                     udsReader.read(&scale, 4);
                     NewUsedStatic.scale = scale;
+                    NewUsedStatic.retainedIdentitySeed =
+                        (static_cast<std::uint64_t>(nWorldSpace + 1) << 32) |
+                        static_cast<std::uint64_t>(worldSpaceStatics.size() + 1);
 
                     D3DXMATRIX transmat, rotmatx, rotmaty, rotmatz, scalemat;
                     D3DXMatrixTranslation(&transmat, NewUsedStatic.pos.x, NewUsedStatic.pos.y, NewUsedStatic.pos.z);
@@ -255,6 +266,19 @@ public:
                     s.faces,
                     (ptr32<IDirect3DIndexBuffer9>)s.ibuffer
                 );
+                if (mesh && targetQTR != GQTR &&
+                    subsetIndex < retainedStaticPrototypeIds.size()) {
+                    mesh->retainedPrototypeIdentity = retainedStaticPrototypeIds[subsetIndex];
+                    std::uint64_t placementIdentity = 1469598103934665603ull;
+                    placementIdentity ^= i.retainedIdentitySeed;
+                    placementIdentity *= 1099511628211ull;
+                    placementIdentity ^= mesh->retainedPrototypeIdentity;
+                    placementIdentity *= 1099511628211ull;
+                    mesh->retainedPlacementIdentity = placementIdentity ? placementIdentity : 1;
+                    mesh->cellX = static_cast<std::int32_t>(std::floor(i.transform._41 / 8192.0f));
+                    mesh->cellY = static_cast<std::int32_t>(std::floor(i.transform._42 / 8192.0f));
+                    mesh->cellValid = true;
+                }
                 if (i.visIndex > 0) {
                     dynamicVisGroups[i.visIndex].push_back(mesh);
                 }
@@ -277,6 +301,13 @@ public:
     }
 
     static bool initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& landscapeBuffers, ptr32<IDirect3DTexture9> texWorldColour);
+    static bool loadRetainedStaticCatalog(std::uint32_t staticCount);
+    static bool writeRetainedCatalog(
+        IPC::Vec<RetainedCatalog::Header>& header,
+        IPC::Vec<RetainedCatalog::Cell>& cells,
+        IPC::Vec<RetainedCatalog::Mesh>& meshes,
+        IPC::Vec<RetainedCatalog::Placement>& placements,
+        IPC::Vec<std::uint8_t>& blob);
     // Format_Loader: attempt to load Data Files\distantland\composite.{index,data} into
     // the static compositePool. Returns true and populates the pool only for a fully
     // validated New_Format set; for Old/absent/malformed input it clears the pool to the

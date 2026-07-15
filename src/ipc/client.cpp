@@ -253,6 +253,30 @@ namespace IPC {
 		return beginRpc(Command::StreamVisibleComposites);
 	}
 
+    bool Client::getRetainedWorldCatalogBlocking(
+        VecId header,
+        VecId cells,
+        VecId meshes,
+        VecId placements,
+        VecId blob) {
+        WAIT_FOR_PREVIOUS_COMMAND;
+
+        auto& params = m_ipcParameters->params.retainedCatalogParams;
+        params.header = header;
+        params.cells = cells;
+        params.meshes = meshes;
+        params.placements = placements;
+        params.blob = blob;
+        params.available = false;
+
+        if (!beginRpc(Command::GetRetainedWorldCatalog) ||
+            waitForCompletion() != WakeReason::Complete) {
+            return false;
+        }
+
+        return params.available;
+    }
+
 	bool Client::setWorldSpaceBlocking(const std::string& cellname) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 

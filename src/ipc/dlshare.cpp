@@ -7,7 +7,12 @@
 #include "mge/quadtree.h"
 #include "support/log.h"
 
-#include <cmath>  // std::floor for per-cell identity from mesh centre
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <unordered_set>
 
 using std::string;
 using std::unordered_map;
@@ -19,6 +24,12 @@ bool DistantLandShare::hasCurrentWorldSpace = false;
 QuadTree DistantLandShare::LandQuadTree;
 vector<vector<QuadTreeMesh*>> DistantLandShare::dynamicVisGroupsServer;
 CompositePool DistantLandShare::compositePool;
+vector<RetainedCatalog::Mesh> DistantLandShare::retainedStaticMeshes;
+vector<RetainedCatalog::Mesh> DistantLandShare::retainedTerrainMeshes;
+vector<std::uint8_t> DistantLandShare::retainedStaticBlob;
+vector<std::uint8_t> DistantLandShare::retainedTerrainBlob;
+vector<std::uint64_t> DistantLandShare::retainedStaticPrototypeIds;
+std::uint64_t DistantLandShare::retainedCatalogGeneration = 0;
 
 void DistantLandShare::loadVisGroupsServer(HANDLE h) {
     DWORD unused;
@@ -82,6 +93,19 @@ bool DistantLandShare::initDistantStaticsServer(IPC::Vec<DistantStatic>& distant
         return false;
     }
 
+    DWORD staticCount = 0;
+    DWORD unused = 0;
+    if (!ReadFile(h, &staticCount, sizeof(staticCount), &unused, nullptr) ||
+        unused != sizeof(staticCount)) {
+        CloseHandle(h);
+        return false;
+    }
+    SetFilePointer(h, 0, nullptr, FILE_BEGIN);
+
+    if (!loadRetainedStaticCatalog(staticCount)) {
+        LOG::logline("-- Retained static catalog unavailable; legacy distant statics remain active");
+    }
+
     loadVisGroupsServer(h);
     readDistantStatics(h, distantStatics, distantSubsets, dynamicVisGroupsServer);
 
@@ -131,6 +155,237 @@ namespace {
         CloseHandle(h);
         return true;
     }
+
+    class ByteCursor {
+        const std::uint8_t* m_data;
+        std::size_t m_size;
+        std::size_t m_offset = 0;
+
+    public:
+        explicit ByteCursor(const std::vector<std::uint8_t>& bytes)
+            : m_data(bytes.data()), m_size(bytes.size()) { }
+
+        bool read(void* destination, std::size_t bytes) {
+            if (bytes > m_size - m_offset) {
+                return false;
+            }
+            std::memcpy(destination, m_data + m_offset, bytes);
+            m_offset += bytes;
+            return true;
+        }
+
+        const std::uint8_t* take(std::size_t bytes) {
+            if (bytes > m_size - m_offset) {
+                return nullptr;
+            }
+            const auto* result = m_data + m_offset;
+            m_offset += bytes;
+            return result;
+        }
+
+        bool atEnd() const { return m_offset == m_size; }
+    };
+
+    std::uint64_t hashBytes(
+        const void* data,
+        std::size_t bytes,
+        std::uint64_t hash = 1469598103934665603ull) {
+        const auto* p = static_cast<const std::uint8_t*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            hash ^= p[i];
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
+    bool checkedBytes(std::uint32_t count, std::uint32_t stride, std::uint32_t& out) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(count) * stride;
+        if (bytes > std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+        out = static_cast<std::uint32_t>(bytes);
+        return true;
+    }
+
+    bool appendBytes(
+        std::vector<std::uint8_t>& destination,
+        const std::uint8_t* source,
+        std::uint32_t bytes,
+        std::uint32_t& offset) {
+        if ((!source && bytes != 0) ||
+            destination.size() + static_cast<std::uint64_t>(bytes) >
+                std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+        offset = static_cast<std::uint32_t>(destination.size());
+        if (bytes != 0) {
+            destination.insert(destination.end(), source, source + bytes);
+        }
+        return true;
+    }
+
+    bool publishRetainedCatalog(
+        const RetainedCatalog::Header& header,
+        const std::vector<RetainedCatalog::Cell>& cells,
+        const std::vector<RetainedCatalog::Mesh>& meshes,
+        const std::vector<RetainedCatalog::Placement>& placements,
+        const std::vector<std::uint8_t>& blob,
+        IPC::Vec<RetainedCatalog::Header>& outHeader,
+        IPC::Vec<RetainedCatalog::Cell>& outCells,
+        IPC::Vec<RetainedCatalog::Mesh>& outMeshes,
+        IPC::Vec<RetainedCatalog::Placement>& outPlacements,
+        IPC::Vec<std::uint8_t>& outBlob) {
+        const auto fail = [&]() {
+            outHeader.truncate(0);
+            outCells.truncate(0);
+            outMeshes.truncate(0);
+            outPlacements.truncate(0);
+            outBlob.truncate(0);
+            return false;
+        };
+
+        if (!outHeader.reserve(1) ||
+            !outCells.reserve(header.cellCount) ||
+            !outMeshes.reserve(header.meshCount) ||
+            !outPlacements.reserve(header.placementCount) ||
+            !outBlob.reserve(header.blobBytes) ||
+            !outHeader.push_back(header)) {
+            return fail();
+        }
+        for (const auto& cell : cells) {
+            if (!outCells.push_back(cell)) return fail();
+        }
+        for (const auto& mesh : meshes) {
+            if (!outMeshes.push_back(mesh)) return fail();
+        }
+        for (const auto& placement : placements) {
+            if (!outPlacements.push_back(placement)) return fail();
+        }
+        for (const auto byte : blob) {
+            if (!outBlob.push_back(byte)) return fail();
+        }
+        return true;
+    }
+}
+
+bool DistantLandShare::loadRetainedStaticCatalog(std::uint32_t staticCount) {
+    retainedStaticMeshes.clear();
+    retainedStaticBlob.clear();
+    retainedStaticPrototypeIds.clear();
+
+    std::vector<std::uint8_t> source;
+    if (!readWholeFile("Data Files\\distantland\\statics\\static_meshes", source)) {
+        return false;
+    }
+
+    ByteCursor cursor(source);
+    std::unordered_map<std::uint64_t, std::uint64_t> identities;
+
+    for (std::uint32_t staticIndex = 0; staticIndex < staticCount; ++staticIndex) {
+        std::uint32_t subsetCount = 0;
+        BoundingSphere staticSphere = {};
+        std::uint8_t staticType = 0;
+        if (!cursor.read(&subsetCount, sizeof(subsetCount)) ||
+            !cursor.read(&staticSphere.radius, sizeof(staticSphere.radius)) ||
+            !cursor.read(&staticSphere.center, sizeof(staticSphere.center)) ||
+            !cursor.read(&staticType, sizeof(staticType))) {
+            return false;
+        }
+
+        for (std::uint32_t subsetIndex = 0; subsetIndex < subsetCount; ++subsetIndex) {
+            BoundingSphere sphere = {};
+            D3DXVECTOR3 aabbMin = {};
+            D3DXVECTOR3 aabbMax = {};
+            std::uint32_t vertexCount = 0;
+            std::uint32_t faceCount = 0;
+            if (!cursor.read(&sphere.radius, sizeof(sphere.radius)) ||
+                !cursor.read(&sphere.center, sizeof(sphere.center)) ||
+                !cursor.read(&aabbMin, sizeof(aabbMin)) ||
+                !cursor.read(&aabbMax, sizeof(aabbMax)) ||
+                !cursor.read(&vertexCount, sizeof(vertexCount)) ||
+                !cursor.read(&faceCount, sizeof(faceCount))) {
+                return false;
+            }
+
+            std::uint32_t vertexBytes = 0;
+            std::uint32_t indexBytes = 0;
+            if (!checkedBytes(vertexCount, SIZEOFSTATICVERT, vertexBytes) ||
+                !checkedBytes(faceCount, 6, indexBytes)) {
+                return false;
+            }
+            const auto* vertices = cursor.take(vertexBytes);
+            const auto* indices = cursor.take(indexBytes);
+            std::uint8_t textureFlags[2] = {};
+            std::uint16_t pathBytes = 0;
+            if ((!vertices && vertexBytes) || (!indices && indexBytes) ||
+                !cursor.read(textureFlags, sizeof(textureFlags)) ||
+                !cursor.read(&pathBytes, sizeof(pathBytes))) {
+                return false;
+            }
+            const auto* texturePath = cursor.take(pathBytes);
+            if (!texturePath && pathBytes) {
+                return false;
+            }
+
+            std::uint64_t identity = hashBytes(&staticType, sizeof(staticType));
+            identity = hashBytes(&sphere, sizeof(sphere), identity);
+            identity = hashBytes(&aabbMin, sizeof(aabbMin), identity);
+            identity = hashBytes(&aabbMax, sizeof(aabbMax), identity);
+            identity = hashBytes(vertices, vertexBytes, identity);
+            identity = hashBytes(indices, indexBytes, identity);
+            identity = hashBytes(textureFlags, sizeof(textureFlags), identity);
+            identity = hashBytes(texturePath, pathBytes, identity);
+
+            std::uint64_t witness = hashBytes(&staticType, sizeof(staticType), 1099511628211ull);
+            witness = hashBytes(&sphere, sizeof(sphere), witness);
+            witness = hashBytes(&aabbMin, sizeof(aabbMin), witness);
+            witness = hashBytes(&aabbMax, sizeof(aabbMax), witness);
+            witness = hashBytes(vertices, vertexBytes, witness);
+            witness = hashBytes(indices, indexBytes, witness);
+            witness = hashBytes(textureFlags, sizeof(textureFlags), witness);
+            witness = hashBytes(texturePath, pathBytes, witness);
+            if (identity == 0) {
+                return false;
+            }
+
+            retainedStaticPrototypeIds.push_back(identity);
+            const auto [known, inserted] = identities.emplace(identity, witness);
+            if (!inserted) {
+                if (known->second != witness) {
+                    return false;
+                }
+                continue;
+            }
+
+            RetainedCatalog::Mesh mesh = {};
+            mesh.identity = identity;
+            mesh.materialIdentity = hashBytes(texturePath, pathBytes);
+            mesh.category = RetainedCatalog::Category::Static;
+            mesh.flags = (textureFlags[0] ? RetainedCatalog::MeshFlagHasAlpha : 0) |
+                         (textureFlags[1] ? RetainedCatalog::MeshFlagAnimatedUv : 0);
+            mesh.vertexCount = vertexCount;
+            mesh.vertexStride = SIZEOFSTATICVERT;
+            mesh.vertexBytes = vertexBytes;
+            mesh.indexCount = faceCount * 3;
+            mesh.indexStride = 2;
+            mesh.indexBytes = indexBytes;
+            mesh.materialBytes = pathBytes;
+            if (!appendBytes(retainedStaticBlob, vertices, vertexBytes, mesh.vertexOffset) ||
+                !appendBytes(retainedStaticBlob, indices, indexBytes, mesh.indexOffset) ||
+                !appendBytes(retainedStaticBlob, texturePath, pathBytes, mesh.materialOffset)) {
+                return false;
+            }
+
+            retainedStaticMeshes.push_back(mesh);
+        }
+    }
+
+    if (!cursor.atEnd()) {
+        return false;
+    }
+
+    ++retainedCatalogGeneration;
+    return true;
 }
 
 bool DistantLandShare::loadCompositeSet() {
@@ -249,6 +504,9 @@ bool DistantLandShare::loadCompositeSet() {
 }
 
 bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& landscapeBuffers, ptr32<IDirect3DTexture9> texWorldColour) {
+    retainedTerrainMeshes.clear();
+    retainedTerrainBlob.clear();
+
     HANDLE file = CreateFile("Data Files\\distantland\\world", GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
     if (file == INVALID_HANDLE_VALUE) {
         LOG::winerror("Server failed to open landscape data");
@@ -268,6 +526,7 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
         D3DXVECTOR2 qtmin(FLT_MAX, FLT_MAX), qtmax(-FLT_MAX, -FLT_MAX);
         D3DXMATRIX world;
         D3DXMatrixIdentity(&world);
+        std::unordered_set<std::uint64_t> terrainIdentities;
 
         // Load meshes and calculate max size of quadtree
         for (auto& i : meshesLand) {
@@ -283,10 +542,56 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
             ReadFile(file, &i.faces, 4, &unused, 0);
 
             bool large = (i.verts > 0xFFFF || i.faces > 0xFFFF);
+            std::uint32_t vertexBytes = 0;
+            std::uint32_t indexBytes = 0;
+            if (!checkedBytes(i.verts, SIZEOFLANDVERT, vertexBytes) ||
+                !checkedBytes(i.faces, large ? 12u : 6u, indexBytes)) {
+                landscapeBuffers.end_read();
+                CloseHandle(file);
+                return false;
+            }
 
-            // skip info the client handles
-            auto bufferSize = i.verts * SIZEOFLANDVERT + i.faces * (large ? 12 : 6);
-            SetFilePointer(file, bufferSize, NULL, FILE_CURRENT);
+            std::vector<std::uint8_t> vertices(vertexBytes);
+            std::vector<std::uint8_t> indices(indexBytes);
+            DWORD bytesRead = 0;
+            if ((vertexBytes && (!ReadFile(file, vertices.data(), vertexBytes, &bytesRead, nullptr) || bytesRead != vertexBytes)) ||
+                (indexBytes && (!ReadFile(file, indices.data(), indexBytes, &bytesRead, nullptr) || bytesRead != indexBytes))) {
+                landscapeBuffers.end_read();
+                CloseHandle(file);
+                return false;
+            }
+
+            const std::int32_t cellX = static_cast<std::int32_t>(std::floor(i.sphere.center.x / 8192.0f));
+            const std::int32_t cellY = static_cast<std::int32_t>(std::floor(i.sphere.center.y / 8192.0f));
+            std::uint64_t identity = hashBytes(&cellX, sizeof(cellX));
+            identity = hashBytes(&cellY, sizeof(cellY), identity);
+            identity = hashBytes(vertices.data(), vertices.size(), identity);
+            identity = hashBytes(indices.data(), indices.size(), identity);
+            if (identity == 0 || !terrainIdentities.insert(identity).second) {
+                landscapeBuffers.end_read();
+                CloseHandle(file);
+                return false;
+            }
+
+            RetainedCatalog::Mesh catalogMesh = {};
+            catalogMesh.identity = identity;
+            catalogMesh.category = RetainedCatalog::Category::Terrain;
+            catalogMesh.flags = large ? RetainedCatalog::MeshFlagIndex32 : RetainedCatalog::MeshFlagNone;
+            catalogMesh.vertexBytes = vertexBytes;
+            catalogMesh.vertexCount = i.verts;
+            catalogMesh.vertexStride = SIZEOFLANDVERT;
+            catalogMesh.indexBytes = indexBytes;
+            catalogMesh.indexCount = i.faces * 3;
+            catalogMesh.indexStride = large ? 4 : 2;
+            catalogMesh.cellX = cellX;
+            catalogMesh.cellY = cellY;
+            if (!appendBytes(retainedTerrainBlob, vertices.data(), vertexBytes, catalogMesh.vertexOffset) ||
+                !appendBytes(retainedTerrainBlob, indices.data(), indexBytes, catalogMesh.indexOffset)) {
+                landscapeBuffers.end_read();
+                CloseHandle(file);
+                return false;
+            }
+            retainedTerrainMeshes.push_back(catalogMesh);
 
             auto& buffers = *it;
             if (it.at_end()) {
@@ -312,6 +617,7 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
         // centre and stamp it onto the QuadTreeMesh. The per-cell composite Texture_Binder reads
         // cellX/cellY/cellValid off the streamed RenderMesh to look the cell up in the resident cache;
         // floor(center / 8192) is the same cell mapping the streamer and generator use.
+        std::size_t terrainIndex = 0;
         for (auto& i : meshesLand) {
             QuadTreeMesh* qm = LandQuadTree.AddMesh(i.sphere, i.box, world, false, false, texWorldColour, i.verts, i.vbuffer, i.faces, i.ibuffer);
             if (qm) {
@@ -319,7 +625,12 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
                 qm->cellY = (int32_t)std::floor(i.sphere.center.y / 8192.0f);
                 qm->cellValid = true;
                 qm->compositeTex = 0;  // resolved per frame via the cache; never a baked handle here (ptr32, so 0 not nullptr)
+                if (terrainIndex < retainedTerrainMeshes.size()) {
+                    qm->retainedPrototypeIdentity = retainedTerrainMeshes[terrainIndex].identity;
+                    qm->retainedPlacementIdentity = retainedTerrainMeshes[terrainIndex].identity;
+                }
             }
+            ++terrainIndex;
         }
     }
 
@@ -341,17 +652,44 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
     // distant-land load itself succeeds regardless of the composite outcome.
     loadCompositeSet();
 
+    if (compositePool.active) {
+        for (auto& mesh : retainedTerrainMeshes) {
+            const auto record = compositePool.byCell.find(CellId{ mesh.cellX, mesh.cellY });
+            if (record == compositePool.byCell.end()) {
+                continue;
+            }
+            const auto& composite = record->second;
+            const auto* bytes = compositePool.blob.data() + composite.poolOffset;
+            mesh.materialIdentity = hashBytes(bytes, composite.byteLength);
+            mesh.materialBytes = composite.byteLength;
+            mesh.flags |= RetainedCatalog::MeshFlagCompositeDxt1;
+            if (!appendBytes(retainedTerrainBlob, bytes, composite.byteLength, mesh.materialOffset)) {
+                retainedTerrainMeshes.clear();
+                retainedTerrainBlob.clear();
+                return false;
+            }
+        }
+    }
+
+    ++retainedCatalogGeneration;
     return true;
 }
 
 bool DistantLandShare::setCurrentWorldSpace(const char* name) {
     auto it = mapWorldSpaces.find(name);
     if (it != mapWorldSpaces.end()) {
-        currentWorldSpace = &it->second;
+        const auto* nextWorldSpace = &it->second;
+        if (currentWorldSpace != nextWorldSpace) {
+            ++retainedCatalogGeneration;
+        }
+        currentWorldSpace = nextWorldSpace;
         hasCurrentWorldSpace = true;
         return true;
     }
 
+    if (currentWorldSpace != nullptr || hasCurrentWorldSpace) {
+        ++retainedCatalogGeneration;
+    }
     currentWorldSpace = nullptr;
     hasCurrentWorldSpace = false;
     return false;
@@ -444,4 +782,176 @@ void DistantLandShare::sortVisibleSet(IPC::Vec<RenderMesh>& vec, VisibleSetSort 
     case VisibleSetSort::None:
         break;
     }
+}
+
+bool DistantLandShare::writeRetainedCatalog(
+    IPC::Vec<RetainedCatalog::Header>& outHeader,
+    IPC::Vec<RetainedCatalog::Cell>& outCells,
+    IPC::Vec<RetainedCatalog::Mesh>& outMeshes,
+    IPC::Vec<RetainedCatalog::Placement>& outPlacements,
+    IPC::Vec<std::uint8_t>& outBlob) {
+    outHeader.truncate(0);
+    outCells.truncate(0);
+    outMeshes.truncate(0);
+    outPlacements.truncate(0);
+    outBlob.truncate(0);
+
+    if (!hasCurrentWorldSpace || !currentWorldSpace || retainedTerrainMeshes.empty()) {
+        return false;
+    }
+
+    struct CellBuild {
+        std::vector<RetainedCatalog::Mesh> terrain;
+        std::vector<RetainedCatalog::Placement> placements;
+    };
+    std::map<std::pair<std::int32_t, std::int32_t>, CellBuild> byCell;
+
+    for (const auto& mesh : retainedTerrainMeshes) {
+        byCell[{ mesh.cellX, mesh.cellY }].terrain.push_back(mesh);
+    }
+
+    std::unordered_map<std::uint64_t, const RetainedCatalog::Mesh*> prototypes;
+    for (const auto& mesh : retainedStaticMeshes) {
+        prototypes.emplace(mesh.identity, &mesh);
+    }
+    std::unordered_map<std::uint64_t, std::uint64_t> placementWitnesses;
+    std::unordered_set<std::uint64_t> referencedPrototypes;
+
+    auto collectStatics = [&](const std::unique_ptr<QuadTree>& tree) {
+        if (!tree) {
+            return true;
+        }
+        bool valid = true;
+        tree->ForEachMesh([&](const QuadTreeMesh& mesh) {
+            if (!valid) {
+                return;
+            }
+            if (!mesh.cellValid || mesh.retainedPrototypeIdentity == 0 ||
+                mesh.retainedPlacementIdentity == 0 ||
+                prototypes.find(mesh.retainedPrototypeIdentity) == prototypes.end()) {
+                valid = false;
+                return;
+            }
+
+            RetainedCatalog::Placement placement = {};
+            placement.identity = mesh.retainedPlacementIdentity;
+            placement.prototypeIdentity = mesh.retainedPrototypeIdentity;
+            std::memcpy(placement.transform, &mesh.transform, sizeof(placement.transform));
+            placement.cellX = mesh.cellX;
+            placement.cellY = mesh.cellY;
+            placement.flags = mesh.enabled ? 1u : 0u;
+
+            std::uint64_t witness = hashBytes(
+                &placement.prototypeIdentity,
+                sizeof(placement.prototypeIdentity),
+                1099511628211ull);
+            witness = hashBytes(placement.transform, sizeof(placement.transform), witness);
+            witness = hashBytes(&placement.cellX, sizeof(placement.cellX), witness);
+            witness = hashBytes(&placement.cellY, sizeof(placement.cellY), witness);
+            const auto [known, inserted] = placementWitnesses.emplace(placement.identity, witness);
+            if (!inserted) {
+                if (known->second != witness) {
+                    valid = false;
+                }
+                return;
+            }
+
+            referencedPrototypes.insert(placement.prototypeIdentity);
+            byCell[{ placement.cellX, placement.cellY }].placements.push_back(placement);
+        });
+        return valid;
+    };
+
+    // Complete-tree traversal is intentional: frustum visibility never owns retained lifetime.
+    if (!collectStatics(currentWorldSpace->NearStatics) ||
+        !collectStatics(currentWorldSpace->FarStatics) ||
+        !collectStatics(currentWorldSpace->VeryFarStatics)) {
+        return false;
+    }
+
+    std::vector<RetainedCatalog::Cell> cells;
+    std::vector<RetainedCatalog::Mesh> meshes;
+    std::vector<RetainedCatalog::Placement> placements;
+    cells.reserve(byCell.size());
+
+    for (auto& [coordinates, build] : byCell) {
+        std::sort(build.terrain.begin(), build.terrain.end(), [](const auto& a, const auto& b) {
+            return a.identity < b.identity;
+        });
+        std::sort(build.placements.begin(), build.placements.end(), [](const auto& a, const auto& b) {
+            return a.identity < b.identity;
+        });
+
+        RetainedCatalog::Cell cell = {};
+        cell.cellX = coordinates.first;
+        cell.cellY = coordinates.second;
+        cell.terrainMeshFirst = static_cast<std::uint32_t>(meshes.size());
+        cell.terrainMeshCount = static_cast<std::uint32_t>(build.terrain.size());
+        meshes.insert(meshes.end(), build.terrain.begin(), build.terrain.end());
+        cell.staticPlacementFirst = static_cast<std::uint32_t>(placements.size());
+        cell.staticPlacementCount = static_cast<std::uint32_t>(build.placements.size());
+        placements.insert(placements.end(), build.placements.begin(), build.placements.end());
+        cells.push_back(cell);
+    }
+
+    std::vector<std::uint64_t> sortedPrototypeIds(
+        referencedPrototypes.begin(), referencedPrototypes.end());
+    std::sort(sortedPrototypeIds.begin(), sortedPrototypeIds.end());
+
+    const std::uint64_t staticBlobBase64 = retainedTerrainBlob.size();
+    const std::uint64_t combinedBlobBytes = staticBlobBase64 + retainedStaticBlob.size();
+    if (combinedBlobBytes > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    const auto staticBlobBase = static_cast<std::uint32_t>(staticBlobBase64);
+
+    for (const auto identity : sortedPrototypeIds) {
+        auto mesh = *prototypes.at(identity);
+        const auto adjust = [staticBlobBase](std::uint32_t offset) -> std::uint32_t {
+            return offset + staticBlobBase;
+        };
+        mesh.vertexOffset = adjust(mesh.vertexOffset);
+        mesh.indexOffset = adjust(mesh.indexOffset);
+        mesh.materialOffset = adjust(mesh.materialOffset);
+        meshes.push_back(mesh);
+    }
+
+    if (cells.size() > std::numeric_limits<std::uint32_t>::max() ||
+        meshes.size() > std::numeric_limits<std::uint32_t>::max() ||
+        placements.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> blob;
+    blob.reserve(static_cast<std::size_t>(combinedBlobBytes));
+    blob.insert(blob.end(), retainedTerrainBlob.begin(), retainedTerrainBlob.end());
+    blob.insert(blob.end(), retainedStaticBlob.begin(), retainedStaticBlob.end());
+
+    std::uint64_t contentHash = hashBytes(cells.data(), cells.size() * sizeof(cells[0]));
+    contentHash = hashBytes(meshes.data(), meshes.size() * sizeof(meshes[0]), contentHash);
+    contentHash = hashBytes(placements.data(), placements.size() * sizeof(placements[0]), contentHash);
+    contentHash = hashBytes(blob.data(), blob.size(), contentHash);
+
+    RetainedCatalog::Header header = {};
+    header.magic = RetainedCatalog::Magic;
+    header.version = RetainedCatalog::Version;
+    header.headerBytes = sizeof(header);
+    header.generation = retainedCatalogGeneration;
+    header.contentHash = contentHash;
+    header.cellCount = static_cast<std::uint32_t>(cells.size());
+    header.meshCount = static_cast<std::uint32_t>(meshes.size());
+    header.placementCount = static_cast<std::uint32_t>(placements.size());
+    header.blobBytes = static_cast<std::uint32_t>(blob.size());
+
+    return publishRetainedCatalog(
+        header,
+        cells,
+        meshes,
+        placements,
+        blob,
+        outHeader,
+        outCells,
+        outMeshes,
+        outPlacements,
+        outBlob);
 }

@@ -50,6 +50,7 @@ namespace IPC {
 		// into CompositeStreamerServer::streamNewlyVisible, filling the header + byte output
 		// channels for the Composite_Streamer (inert for an Old_Format pool).
 		void streamVisibleComposites();
+        void getRetainedWorldCatalog();
 	public:
 		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent);
 		~Server();

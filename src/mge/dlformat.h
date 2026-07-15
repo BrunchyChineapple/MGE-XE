@@ -57,6 +57,7 @@ struct UsedDistantStatic {
     uint16_t visIndex;
     D3DXVECTOR3 pos;
     float scale;
+    std::uint64_t retainedIdentitySeed = 0;
     D3DXMATRIX transform;
     BoundingSphere sphere;      // post-transform
     BoundingBox box;            // post-transform

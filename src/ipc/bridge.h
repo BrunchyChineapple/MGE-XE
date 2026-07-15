@@ -2,6 +2,7 @@
 
 #include "proxydx/d3d9header.h"
 #include "mge/dlmath.h"
+#include "ipc/retainedcatalog.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -139,6 +140,9 @@ namespace IPC {
         // Server fills an IPC::Vec<CompositeChunkMsg> for the delta of cells newly
         // entering the Visible_Cell_Set this frame (Composite_Streamer).
         StreamVisibleComposites,
+        // Complete terrain/non-grass-static snapshot for explicit retained ownership.
+        // Appended to preserve every existing command value.
+        GetRetainedWorldCatalog,
     };
 
     struct AllocVecParameters {
@@ -217,6 +221,15 @@ namespace IPC {
         OUT VecId outBytes;     // Vec<uint8_t>: concatenated DXT1 blobs, byteLength each
     };
 
+    struct RetainedCatalogParameters {
+        OUT VecId header;       // Vec<RetainedCatalog::Header>, exactly one on success
+        OUT VecId cells;        // Vec<RetainedCatalog::Cell>
+        OUT VecId meshes;       // Vec<RetainedCatalog::Mesh>
+        OUT VecId placements;   // Vec<RetainedCatalog::Placement>
+        OUT VecId blob;         // Vec<uint8_t>, offsets in Mesh are relative to this vec
+        OUT bool available;
+    };
+
 	struct Parameters {
         Command command;
         union {
@@ -228,7 +241,12 @@ namespace IPC {
             SetWorldSpaceParameters worldSpaceParams;
             GetMeshesParameters meshParams;
             StreamCompositesParameters streamCompositesParams;
+            RetainedCatalogParameters retainedCatalogParams;
         } params;
 	};
+
+    static_assert(sizeof(RetainedCatalogParameters) == 24);
+    static_assert(offsetof(RetainedCatalogParameters, available) == 20);
+    static_assert(offsetof(Parameters, params) == 4);
 }
 #pragma pack(pop)

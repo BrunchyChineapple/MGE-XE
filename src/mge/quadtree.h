@@ -5,6 +5,7 @@
 #include "ipc/bridge.h"
 
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 
@@ -12,6 +13,10 @@
 struct QuadTreeMesh: public RenderMesh {
     BoundingSphere sphere;
     BoundingBox box;
+    // Host-only retained-world metadata. These fields are never copied into the
+    // cross-process RenderMesh base and contain no process-local pointers.
+    std::uint64_t retainedPrototypeIdentity = 0;
+    std::uint64_t retainedPlacementIdentity = 0;
 
     QuadTreeMesh(
         const BoundingSphere& b_sphere,
@@ -223,6 +228,18 @@ struct QuadTreeNode {
     QuadTreeNode(QuadTree* owner);
     ~QuadTreeNode();
 
+    template<class F>
+    void ForEachMesh(F&& visitor) const {
+        for (const auto* child : children) {
+            if (child) {
+                child->ForEachMesh(visitor);
+            }
+        }
+        for (const auto* mesh : meshes) {
+            visitor(*mesh);
+        }
+    }
+
     template<class T>
     void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set, bool inside = false) {
         // Check if this node is fully outside the frustum.
@@ -365,6 +382,12 @@ public:
 
     bool Optimize();
     void Clear();
+    template<class F>
+    void ForEachMesh(F&& visitor) const {
+        if (m_root_node) {
+            m_root_node->ForEachMesh(std::forward<F>(visitor));
+        }
+    }
     template<class T>
     void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set) {
         m_root_node->GetVisibleMeshes(frustum, viewsphere, visible_set);
