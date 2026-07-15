@@ -301,6 +301,7 @@ public:
     }
 
     static bool initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& landscapeBuffers, ptr32<IDirect3DTexture9> texWorldColour);
+    static void bumpRetainedCatalogGeneration() noexcept;
     static bool loadRetainedStaticCatalog(std::uint32_t staticCount);
     static bool writeRetainedCatalog(
         IPC::Vec<RetainedCatalog::Header>& header,

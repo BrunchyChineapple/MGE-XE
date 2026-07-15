@@ -32,6 +32,7 @@ public:
 
         DataSource source;
         bool enabled;
+        bool retainedEnabled = true;
         const void *gameObject;
         std::string id;
         std::vector<Range> ranges;
@@ -255,7 +256,11 @@ public:
     static bool selectDistantCell();
     static bool isDistantCell();
     static void resolveDynamicVisGroups();
-    static void scanDynamicVisGroups();
+    static void resetDynamicVisState();
+    static bool scanDynamicVisGroups(
+        bool retainedOnly,
+        const void* transitionToken,
+        bool& batchComplete);
 
     static void setView(const D3DMATRIX* m);
     static void setProjection(D3DMATRIX* proj);

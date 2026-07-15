@@ -8,6 +8,7 @@
 #include "support/log.h"
 
 #include <cassert>
+#include <utility>
 
 namespace IPC {
 	template<typename T>
@@ -117,6 +118,40 @@ namespace IPC {
 
 		init();
 
+		return *this;
+	}
+
+	template<typename T>
+	VecView<T>& VecView<T>::operator=(VecView<T>&& other) noexcept {
+		if (this == &other) {
+			return *this;
+		}
+
+		if (m_buffer != nullptr) {
+			UnmapViewOfFile(m_buffer);
+			VirtualFree(m_buffer, 0, MEM_RELEASE);
+		}
+		if (m_shared != nullptr) {
+			auto remainingUsers = InterlockedDecrement(&m_shared->users32);
+			if (remainingUsers == 0) {
+				UnmapViewOfFile(m_shared);
+			}
+		}
+
+		m_headerBytes = std::exchange(other.m_headerBytes, 0);
+		m_windowSize = std::exchange(other.m_windowSize, 0);
+		m_windowBytes = std::exchange(other.m_windowBytes, 0);
+		m_maxSize = std::exchange(other.m_maxSize, 0);
+		m_reservedBytes = std::exchange(other.m_reservedBytes, 0);
+		m_shared = std::exchange(other.m_shared, nullptr);
+		m_id = std::exchange(other.m_id, InvalidVector);
+		m_writing = std::exchange(other.m_writing, false);
+		m_buffer = std::exchange(other.m_buffer, nullptr);
+		m_currentWindow = std::exchange(other.m_currentWindow, 0);
+		m_currentWindowIndex = std::exchange(other.m_currentWindowIndex, 0);
+		m_nextWindowIndex = std::exchange(other.m_nextWindowIndex, 0);
+		m_index = std::exchange(other.m_index, 0);
+		m_subIndex = std::exchange(other.m_subIndex, 0);
 		return *this;
 	}
 

@@ -21,6 +21,7 @@
 
 #ifdef MGE_RTX
 #include "remix_api_test.h"      // RemixAPITest::getInterface (live Remix interface)
+#include "retained_world.h"
 #include "dlcull_config.h"       // dlRegisterDistantTexture — per-texture distant suppress
 #endif
 
@@ -289,6 +290,12 @@ bool DistantLand::init() {
         return false;
     }
 
+#ifdef MGE_RTX
+    if (Configuration.UseSharedMemory) {
+        RetainedWorld::initialize(ipcClient, device);
+    }
+#endif
+
     if (!initGrass()) {
         return false;
     }
@@ -312,6 +319,11 @@ bool DistantLand::initIpc() {
     if (!ipcClient.startServer("mgeHost64.exe")) {
         return false;
     }
+
+    // The prior host is now confirmed stopped and the client has started a
+    // fresh IPC session. Detach its vectors and pending metadata before any
+    // replacement vector can inherit an old completion.
+    resetDynamicVisState();
 
     // allocate shared vectors that will be reused for the duration of the program
     auto maybeLandVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
@@ -1296,10 +1308,19 @@ void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellC
 
     if (!maybeDelta.has_value() || !maybeHeaders.has_value() || !maybeBytes.has_value()) {
         LOG::logline("!! Failed to allocate composite streaming channels; using single atlas");
-        // Free whichever channels did allocate, then stay on the atlas (Req 6.1).
-        if (maybeDelta.has_value())   { auto v = std::move(maybeDelta.value());   auto vid = v.id(); maybeDelta.reset();   ipcClient.freeVecBlocking(vid); }
-        if (maybeHeaders.has_value()) { auto v = std::move(maybeHeaders.value()); auto vid = v.id(); maybeHeaders.reset(); ipcClient.freeVecBlocking(vid); }
-        if (maybeBytes.has_value())   { auto v = std::move(maybeBytes.value());   auto vid = v.id(); maybeBytes.reset();   ipcClient.freeVecBlocking(vid); }
+        auto freeAllocatedView = [](auto& view) {
+            if (!view.has_value()) {
+                return;
+            }
+            const auto id = view->id();
+            view.reset();
+            if (!ipcClient.freeVecBlocking(id)) {
+                LOG::logline("!! Failed to free partially allocated composite vector %u", id);
+            }
+        };
+        freeAllocatedView(maybeBytes);
+        freeAllocatedView(maybeHeaders);
+        freeAllocatedView(maybeDelta);
         compositeCache.releaseAll();
         compositeDefaultEdge = 0;
         return;
@@ -1346,27 +1367,47 @@ void DistantLand::streamAndReconcileComposites() {
             visible.insert(CellId{ eyeCellX + dx, eyeCellY + dy });
         }
     }
+    // Hysteresis can keep the retained anchor just outside the raw eye-centred ring.
+    // Retained targets are required inputs even when the legacy cull would omit them.
+    compositeCache.includeTransitionTargets(visible);
     const std::uint32_t visibleCount = static_cast<std::uint32_t>(visible.size());
 
-    // --- Compute the delta = newVisible \ alreadyResident (Req 4.2) --------------------------
-    // Only cells that are visible AND not already resident need streaming; cells already
-    // resident and still visible are kept without re-streaming (matches the model).
+    // Free stale unpinned entries before admission. A retained material may keep one
+    // off-screen cell pinned; the cache grants one bounded incoming-cell allowance until
+    // that deferred eviction completes after the retained pair commits.
+    compositeCache.evictNotVisible(visible);
+
+    // Retained targets are requested first so only target composites can consume the
+    // one-cell transition allowance. Remaining visible cells use the steady budget.
     compositeDeltaView.clear();
-    for (const CellId& cell : visible) {
-        if (compositeCache.lookup(cell) == nullptr) {
+    const auto appendMissing = [&](bool transitionTargets) {
+        for (const CellId& cell : visible) {
+            if (compositeCache.isTransitionTarget(cell) != transitionTargets ||
+                compositeCache.lookup(cell) != nullptr) {
+                continue;
+            }
             CompositeCellId wire;
             wire.cellX = cell.x;
             wire.cellY = cell.y;
             if (!compositeDeltaView.push_back(wire)) {
-                break;  // delta channel full; the rest fall back to the atlas this frame
+                return false;
             }
         }
+        return true;
+    };
+    if (appendMissing(true)) {
+        appendMissing(false);
     }
 
     // --- Issue StreamVisibleComposites and wait for the server to fill the OUT channels ------
+    compositeHeadersView.clear();
+    compositeBytesView.clear();
     if (compositeDeltaView.size() > 0) {
-        if (ipcClient.streamVisibleComposites(compositeDeltaSharedId, compositeHeadersSharedId, compositeBytesSharedId)) {
-            ipcClient.waitForCompletion();
+        if (ipcClient.streamVisibleComposites(
+                compositeDeltaSharedId,
+                compositeHeadersSharedId,
+                compositeBytesSharedId) &&
+            ipcClient.waitForCompletion() == IPC::WakeReason::Complete) {
 
             // --- Admit each streamed cell, consuming byteLength bytes per header in lockstep --
             // The server wrote one CompositeChunkMsg header per resolved cell to the header
@@ -1402,16 +1443,12 @@ void DistantLand::streamAndReconcileComposites() {
         }
     }
 
-    // --- Evict cells that left the Visible_Cell_Set (Req 4.4, 4.5) ---------------------------
-    // After this the resident set is a subset of the visible set; evicted cells' bytes stay
-    // resident only in the 64-bit server pool.
-    compositeCache.evictNotVisible(visible);
-
     // --- Telemetry tally: cells served by the Single_Atlas_Path this frame (Req 8.4) --------
-    // Every visible cell is either resident (composite) or atlas-served, matching the model's
-    // atlas_served_count = visibleCount - residentCount.
-    const std::uint32_t residentNow = compositeCache.residentCount();
-    compositeCache.setAtlasServedThisFrame(visibleCount > residentNow ? visibleCount - residentNow : 0);
+    // Pinned off-screen entries remain in total residency accounting but do not serve this
+    // frame's visible set.
+    const std::uint32_t visibleResident = compositeCache.visibleResidentCount(visible);
+    compositeCache.setAtlasServedThisFrame(
+        visibleCount > visibleResident ? visibleCount - visibleResident : 0);
 
     // --- Composite_Telemetry emit on Visible_Cell_Set change (task 11.2; Req 8.1/8.2/8.4) ----
     // The requirement is to report resident count / resident MB / atlas-served "WHEN the
@@ -1570,6 +1607,12 @@ bool DistantLand::initGrass() {
 }
 
 void DistantLand::release() {
+#ifdef MGE_RTX
+    if (!RetainedWorld::shutdown()) {
+        LOG::logline("RetainedWorld: renderer release deferred until retained teardown succeeds");
+        return;
+    }
+#endif
     if (!ready) {
         return;
     }

@@ -10,6 +10,7 @@
 
 #ifdef MGE_RTX
 #include "remix_api_test.h"
+#include "retained_world.h"
 #define REMIX_ALLOW_X86
 #include "remix_c.h"
 #include "sky_config.h"   // skyConfig() — live MCM/env master toggles (distant fog, constellations, meteors)
@@ -22,6 +23,13 @@
 
 using std::string;
 using std::unordered_map;
+
+// The shared update vector remains host-owned until an acknowledged RPC completion.
+// These flags prevent a later frame from truncating or replacing an in-flight batch.
+static bool s_dynVisUpdatePending = false;
+static bool s_dynVisPendingBatchComplete = true;
+static bool s_dynVisPendingRetainedOnly = false;
+static const void* s_dynVisPendingTransitionToken = nullptr;
 
 #ifdef MGE_RTX
 // File-scope state for syncRemixSky's self-healing watchdog and the
@@ -726,6 +734,14 @@ void DistantLand::renderStage0() {
 
     // Set variables derived from current game state and camera configuration
     setView(&mwView);
+#ifdef MGE_RTX
+    RetainedWorld::setupCamera(
+        eyePos,
+        mwView,
+        mwProj,
+        kDistantNearPlane,
+        Configuration.DL.DrawDist * kCellSize);
+#endif
     adjustFog();
 #ifdef MGE_RTX
     syncRemixSky();
@@ -772,7 +788,9 @@ void DistantLand::renderStage0() {
                     // per-chunk Texture_Binder sees freshly-streamed composites and the
                     // newly-evicted cells are gone. A no-op unless a New_Format composite pool
                     // loaded (hasCompositeSet); Old_Format / stock stays on the atlas (Req 4.6).
+                    RetainedWorld::prepareCompositeTransition(eyePos, mwView, compositeCache);
                     streamAndReconcileComposites();
+                    RetainedWorld::reconcile(eyePos, mwView, compositeCache);
                     // Distant land terrain is sourced from the heightmap and always
                     // renders here; this draw also couples culling (visLand) with the
                     // draw and feeds the depth pass.
@@ -1449,11 +1467,40 @@ bool DistantLand::selectDistantCell() {
     auto mwBridge = MWBridge::get();
 
     if (Configuration.MGEFlags & USE_DISTANT_LAND) {
-        // Scan dynamic vis on cell change
-        void* playerCell = mwBridge->getPlayerCell();
-        if (playerCell != lastDistantVisCell) {
-            scanDynamicVisGroups();
-            lastDistantVisCell = playerCell;
+        // Preserve legacy generic/grass visibility cadence on cell transitions.
+        // Retained non-grass members are polled separately every frame below.
+        const auto playerCell = mwBridge->getPlayerCell();
+        const bool cellChanged = lastDistantVisCell != playerCell;
+        bool retainedCatalogChanged = false;
+        bool scanComplete = true;
+        if (cellChanged) {
+            retainedCatalogChanged = scanDynamicVisGroups(
+                false, playerCell, scanComplete);
+            if (scanComplete) {
+                lastDistantVisCell = playerCell;
+            }
+        }
+#ifdef MGE_RTX
+        // The generic scan already includes retained members. Avoid reusing its
+        // in-flight IPC vector until the server has consumed it.
+        if (!cellChanged) {
+            retainedCatalogChanged = scanDynamicVisGroups(
+                true, nullptr, scanComplete);
+        }
+        if (retainedCatalogChanged) {
+            RetainedWorld::requestCatalogRefresh();
+        }
+#else
+        (void)retainedCatalogChanged;
+#endif
+        // A completion for another mode/cell may have been drained above.
+        // Do not activate this cell until its own generic visibility batch is
+        // acknowledged, or one frame can render with stale generic/grass state.
+        if (cellChanged && !scanComplete) {
+            return DistantLandShare::hasCurrentWorldSpace;
+        }
+        if (s_dynVisUpdatePending) {
+            return DistantLandShare::hasCurrentWorldSpace;
         }
 
         // Get worldspace key
@@ -1467,6 +1514,13 @@ bool DistantLand::selectDistantCell() {
 
         if (Configuration.UseSharedMemory) {
             DistantLandShare::hasCurrentWorldSpace = ipcClient.setWorldSpaceBlocking(cellname);
+#ifdef MGE_RTX
+            RetainedWorld::selectWorldspace(
+                ipcClient,
+                cellname,
+                DistantLandShare::hasCurrentWorldSpace,
+                mwBridge->IsExterior());
+#endif
             if (DistantLandShare::hasCurrentWorldSpace) {
                 return true;
             }
@@ -1480,6 +1534,11 @@ bool DistantLand::selectDistantCell() {
         }
     }
 
+#ifdef MGE_RTX
+    if (Configuration.UseSharedMemory) {
+        RetainedWorld::selectWorldspace(ipcClient, string(), false, false);
+    }
+#endif
     DistantLandShare::currentWorldSpace = nullptr;
     DistantLandShare::hasCurrentWorldSpace = false;
     return false;
@@ -1526,19 +1585,84 @@ void DistantLand::resolveDynamicVisGroups() {
     lastDistantVisCell = nullptr;
 }
 
+// resetDynamicVisState - Detach state belonging to a terminated IPC host
+void DistantLand::resetDynamicVisState() {
+    s_dynVisUpdatePending = false;
+    s_dynVisPendingBatchComplete = true;
+    s_dynVisPendingRetainedOnly = false;
+    s_dynVisPendingTransitionToken = nullptr;
+    lastDistantVisCell = nullptr;
+
+    // startServer has synchronously stopped the previous host before this is
+    // called, so releasing its view cannot race a host read.
+    dynVisFlagsShared = IPC::VecView<IPC::DynVisFlag>();
+    dynVisFlagsSharedId = IPC::InvalidVector;
+}
+
 // scanDynamicVisGroups - Scan through game data for visibility changes
-void DistantLand::scanDynamicVisGroups() {
+bool DistantLand::scanDynamicVisGroups(
+    bool retainedOnly,
+    const void* transitionToken,
+    bool& batchComplete) {
+    batchComplete = true;
+
+    const auto finishSharedUpdate = [&]() {
+        bool accepted = false;
+        const auto result = ipcClient.awaitDynVis(accepted);
+        if (result != IPC::WakeReason::Complete) {
+            if (result == IPC::WakeReason::ServerLost) {
+                s_dynVisUpdatePending = false;
+                s_dynVisPendingTransitionToken = nullptr;
+                dynVisFlagsShared.clear();
+            }
+            batchComplete = false;
+            return false;
+        }
+
+        const bool requestMatchesPending =
+            s_dynVisPendingRetainedOnly == retainedOnly &&
+            (retainedOnly || s_dynVisPendingTransitionToken == transitionToken);
+        s_dynVisUpdatePending = false;
+        bool changed = false;
+        if (accepted) {
+            for (std::uint32_t i = 0; i < dynVisFlagsShared.size(); ++i) {
+                const auto update = dynVisFlagsShared[i];
+                if (update.groupIndex >= dynamicVisGroups.size()) {
+                    continue;
+                }
+                auto& group = dynamicVisGroups[update.groupIndex];
+                if (update.retainedOnly) {
+                    group.retainedEnabled = update.enable;
+                } else {
+                    group.enabled = update.enable;
+                    group.retainedEnabled = update.enable;
+                }
+                changed = true;
+            }
+        }
+
+        batchComplete = accepted && s_dynVisPendingBatchComplete && requestMatchesPending;
+        s_dynVisPendingTransitionToken = nullptr;
+        dynVisFlagsShared.clear();
+        return accepted && changed;
+    };
+
+    if (Configuration.UseSharedMemory && s_dynVisUpdatePending) {
+        return finishSharedUpdate();
+    }
+
     auto mwBridge = MWBridge::get();
     if (Configuration.UseSharedMemory) {
         dynVisFlagsShared.clear();
     }
+    bool localRetainedChanged = false;
+    bool allChangesQueued = true;
 
     std::uint16_t i = 0;
     for (auto& vis : dynamicVisGroups) {
         int value;
-        auto groupIndex = i++;
+        const auto groupIndex = i++;
 
-        // Ignore unresolved objects
         if (!vis.gameObject) {
             continue;
         }
@@ -1556,7 +1680,6 @@ void DistantLand::scanDynamicVisGroups() {
             break;
         }
 
-        // Enable if value is inside any range
         bool enable = false;
         for (const auto& r : vis.ranges) {
             if (r.begin <= value && value < r.end) {
@@ -1565,22 +1688,54 @@ void DistantLand::scanDynamicVisGroups() {
             }
         }
 
-        // If enable state has changed, propagate to distant land mesh instances
-        if (enable ^ vis.enabled) {
-            vis.enabled = enable;
-            if (Configuration.UseSharedMemory) {
-                dynVisFlagsShared.push_back({ groupIndex, enable });
-            } else {
-                for (auto& m : vis.references) {
-                    m->enabled = enable;
-                }
+        const bool cachedEnable = retainedOnly ? vis.retainedEnabled : vis.enabled;
+        if (enable == cachedEnable) {
+            continue;
+        }
+        if (Configuration.UseSharedMemory) {
+            if (!dynVisFlagsShared.push_back({ groupIndex, enable, retainedOnly })) {
+                allChangesQueued = false;
             }
+            continue;
+        }
+
+        bool changedRetainedMesh = false;
+        for (auto* mesh : vis.references) {
+            if (mesh == nullptr ||
+                (retainedOnly && mesh->retainedPlacementIdentity == 0) ||
+                mesh->enabled == enable) {
+                continue;
+            }
+            mesh->enabled = enable;
+            changedRetainedMesh = changedRetainedMesh ||
+                mesh->retainedPlacementIdentity != 0;
+        }
+        localRetainedChanged = localRetainedChanged || changedRetainedMesh;
+        if (retainedOnly) {
+            vis.retainedEnabled = enable;
+        } else {
+            vis.enabled = enable;
+            vis.retainedEnabled = enable;
         }
     }
 
-    if (Configuration.UseSharedMemory && !dynVisFlagsShared.empty()) {
-        ipcClient.updateDynVis(dynVisFlagsSharedId);
+    if (!Configuration.UseSharedMemory) {
+        return localRetainedChanged;
     }
+    if (dynVisFlagsShared.empty()) {
+        batchComplete = allChangesQueued;
+        return false;
+    }
+    if (!ipcClient.updateDynVis(dynVisFlagsSharedId)) {
+        batchComplete = false;
+        return false;
+    }
+
+    s_dynVisUpdatePending = true;
+    s_dynVisPendingBatchComplete = allChangesQueued;
+    s_dynVisPendingRetainedOnly = retainedOnly;
+    s_dynVisPendingTransitionToken = retainedOnly ? nullptr : transitionToken;
+    return finishSharedUpdate();
 }
 
 // setView - Called once per frame to setup view dependent data

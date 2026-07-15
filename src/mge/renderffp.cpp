@@ -23,6 +23,7 @@
 #endif
 #include "remix_api_test.h"   // RemixAPITest::getInterface()
 #include "remix_c.h"          // remixapi_* structs / entrypoints
+#include "retained_world.h"
 #include "world_batch.h"      // worldBatchTier1Enabled() — runtime in-game toggle (MGE Batching MCM)
 #include "haze_config.h"      // hazeConfig() — live MCM/env tuning for the aerial-perspective haze
 #include "dlcull_config.h"    // dlCullConfig() — live MCM/env tuning for the distant-static near-cull
@@ -513,32 +514,6 @@ void DistantLand::renderDistantStaticsFFP() {
         }
     }
 
-    // Give external (API-submitted) geometry a camera with the EXTENDED distant far
-    // plane. Confirmed root cause of the "submits rc=0 but invisible" bug: external
-    // DrawInstance geometry is projected with getCamera(Main)'s projection, which is
-    // Morrowind's vanilla SHORT far plane, so distant batched statics clip out. The
-    // FFP distant draw only renders because it uses the extended distProj. SetupCamera
-    // -> processExternalCamera overrides the World/Main camera matrices used by our
-    // external draws. Basis from the view matrix columns (D3D LH lookAt), fov/aspect
-    // from the projection, far = the distant draw distance.
-    if (batchRemix && batchRemix->SetupCamera) {
-        remixapi_CameraInfoParameterizedEXT pc = {};
-        pc.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
-        pc.position.x = eyePos.x; pc.position.y = eyePos.y; pc.position.z = eyePos.z;
-        pc.right.x   = mwView._11; pc.right.y   = mwView._21; pc.right.z   = mwView._31;
-        pc.up.x      = mwView._12; pc.up.y      = mwView._22; pc.up.z      = mwView._32;
-        pc.forward.x = mwView._13; pc.forward.y = mwView._23; pc.forward.z = mwView._33;
-        pc.fovYInDegrees = atanf(1.0f / mwProj._22) * 2.0f * 57.2957795131f;
-        pc.aspect    = mwProj._22 / mwProj._11;
-        pc.nearPlane = kDistantNearPlane;
-        pc.farPlane  = Configuration.DL.DrawDist * kCellSize;
-        remixapi_CameraInfo ci = {};
-        ci.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
-        ci.pNext = &pc;
-        ci.type  = REMIXAPI_CAMERA_TYPE_WORLD;
-        batchRemix->SetupCamera(&ci);
-    }
-
     // One batch frame number per distant-statics pass; drives the warm-up gate.
     uint32_t batchFrame = batchRemix ? ++g_batchFrameCounter : 0u;
 
@@ -578,6 +553,10 @@ void DistantLand::renderDistantStaticsFFP() {
         IDirect3DVertexBuffer9* lastResolvedFFP = nullptr;
 
         for (const auto& mesh : localMeshes) {
+            if (mesh.cellValid &&
+                RetainedWorld::isCellCommitted(mesh.cellX, mesh.cellY)) {
+                continue;
+            }
 
             // Batched submission first. When it fully stands in for the FFP draw
             // (warmed up + valid mesh & texture-resolved material), suppress ALL the
@@ -818,6 +797,10 @@ void DistantLand::renderDistantLandFFP() {
         }
 
         for (const auto& mesh : localMeshes) {
+            if (mesh.cellValid &&
+                RetainedWorld::isCellCommitted(mesh.cellX, mesh.cellY)) {
+                continue;
+            }
 
             IDirect3DVertexBuffer9* ffpVB = getOrCreateLandFFPBuffer(device, mesh.vBuffer, mesh.verts, mesh.cellX, mesh.cellY);
             if (!ffpVB) continue;

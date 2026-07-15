@@ -2,6 +2,10 @@
 #include "mged3d8device.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <thread>
 #include "mgeversion.h"
 #include "configuration.h"
 #include "distantland.h"
@@ -14,6 +18,15 @@
 
 #ifdef MGE_RTX
 #include "rt_anticull.h"
+#include "retained_world.h"
+
+static std::atomic<bool> retainedReleasePending{ false };
+
+void waitForRetainedDeviceRelease() {
+    while (retainedReleasePending.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 #endif
 
 static int sceneCount;
@@ -44,6 +57,13 @@ static float calcFPS();
 
 
 MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, Direct3D8* d3d, bool EnableZBufferDiscarding) : Direct3DDevice8(d3d, real, EnableZBufferDiscarding) {
+#ifdef MGE_RTX
+    // A deferred final release owns the old device until retained destruction succeeds.
+    // Do not initialize a replacement against the same global retained manager meanwhile.
+    while (retainedReleasePending.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#endif
     // Initialize state here, as the device is released and recreated on fullscreen Alt-Tab
     sceneCount = -1;
     rendertargetNormal = true;
@@ -91,6 +111,27 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, Direct3D8* d3d, bool Enab
     D3DVIEWPORT9 vp;
     ProxyInterface->GetViewport(&vp);
     MWBridge::get()->patchSplashScreen(vp.Width, vp.Height);
+}
+
+HRESULT _stdcall MGEProxyDevice::Reset(D3DPRESENT_PARAMETERS8* presentationParameters) {
+    if (presentationParameters == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+#ifdef MGE_RTX
+    if (!RetainedWorld::beforeDeviceReset()) {
+        return D3DERR_DEVICELOST;
+    }
+    DistantLand::compositeCache.releaseAll();
+    DistantLand::compositeCache.init(nullptr);
+#endif
+    const HRESULT result = Direct3DDevice8::Reset(presentationParameters);
+#ifdef MGE_RTX
+    if (SUCCEEDED(result)) {
+        DistantLand::compositeCache.init(ProxyInterface);
+    }
+    RetainedWorld::afterDeviceReset(ProxyInterface, SUCCEEDED(result));
+#endif
+    return result;
 }
 
 // Present - End of MW frame
@@ -591,6 +632,57 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
 // Release
 ULONG _stdcall MGEProxyDevice::Release() {
+#ifdef MGE_RTX
+    bool clearRetainedReleaseGate = false;
+    ULONG currentReferences = ProxyInterface->AddRef();
+    currentReferences = ProxyInterface->Release();
+    const ULONG trackedReferences = static_cast<ULONG>(
+        VertexShaderAndDeclarationCount + PixelShaderHandles.size() + StateBlockTokens.size());
+    if (trackedReferences <= currentReferences &&
+        currentReferences - trackedReferences == 1 &&
+        !RetainedWorld::shutdown()) {
+        // Publish the gate before creating the retry worker so replacement
+        // CreateDevice calls cannot enter through a construction race.
+        retainedReleasePending.store(true, std::memory_order_release);
+        try {
+            auto retryReady = std::make_shared<std::atomic<bool>>(false);
+            std::thread retryThread([this, retryReady]() {
+                while (!retryReady->load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                do {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                } while (!RetainedWorld::shutdown());
+
+                // The worker owns the sole logical device reference, so it can safely
+                // release renderer resources before consuming that reference.
+                DistantLand::release();
+                StatusOverlay::release();
+                const ULONG remaining = this->Direct3DDevice8::Release();
+                retainedReleasePending.store(false, std::memory_order_release);
+                if (remaining != 0) {
+                    LOG::logline(
+                        "RetainedWorld: deferred device release completed with %u internal references",
+                        static_cast<unsigned>(remaining));
+                }
+            });
+
+            ProxyInterface->AddRef();
+            Direct3DDevice8::Release();
+            retryThread.detach();
+            retryReady->store(true, std::memory_order_release);
+            LOG::logline("RetainedWorld: final device ownership transferred to teardown retry worker");
+            return 1;
+        } catch (...) {
+            LOG::logline("RetainedWorld: retry worker unavailable; completing teardown synchronously");
+            do {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } while (!RetainedWorld::shutdown());
+            clearRetainedReleaseGate = true;
+        }
+    }
+#endif
+
     ULONG r = Direct3DDevice8::Release();
 
     if (r == 0) {
@@ -601,6 +693,11 @@ ULONG _stdcall MGEProxyDevice::Release() {
         StatusOverlay::release();
     }
 
+#ifdef MGE_RTX
+    if (clearRetainedReleaseGate) {
+        retainedReleasePending.store(false, std::memory_order_release);
+    }
+#endif
     return r;
 }
 

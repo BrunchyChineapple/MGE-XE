@@ -48,9 +48,13 @@ public:
     // Capture the D3D9 device that feeds Remix (DistantLand::device). Uploads target it.
     void init(IDirect3DDevice9* device);
 
-    // Configure the Texture_Memory_Budget (Req 7.2). Does not retroactively evict; eviction is
-    // visibility-driven (evictNotVisible). budgetBytes = mb * 1 MiB.
+    // Configure the steady resident budget and the bounded one-cell allowance used while
+    // a retained target pair is transitioning.
     void setBudgetMB(std::uint32_t mb);
+    void setTransitionTargets(const VisibleCellSet& cells);
+    void includeTransitionTargets(VisibleCellSet& cells) const;
+    bool isTransitionTarget(CellId cell) const;
+    void trimToBudget();
 
     // Upload one newly-streamed cell's DXT1 + mip chain to the device, enforcing the byte
     // budget. Returns true if the cell is resident after the call (admitted now, or already
@@ -60,27 +64,28 @@ public:
     // followed msg in the shared-memory window.
     bool admit(const CompositeChunkMsg& msg, const std::uint8_t* dxt1Bytes);
 
-    // Resolve a cell to its resident composite texture, or null if it is not resident (which
-    // includes cells that were rejected for exceeding the budget, since those are never made
-    // resident). A null return tells the Texture_Binder to use the atlas (Req 5.2, 7.3).
+    // Resolve a cell to its resident composite texture, or null if it is not resident.
     IDirect3DTexture9* lookup(CellId cell) const;
 
-    // Release the D3D textures of every resident cell absent from the new Visible_Cell_Set
-    // (Req 4.5). Their compressed bytes stay resident only in the 64-bit server pool. After
-    // this call the resident set is a subset of the visible set.
+    // Retained materials lease cache ownership instead of taking an unaccounted COM reference.
+    // A pinned entry remains resident and budgeted even after leaving the visible set.
+    IDirect3DTexture9* pin(CellId cell);
+    void unpin(CellId cell);
+
+    // Release unpinned textures absent from the Visible_Cell_Set. Pinned entries are marked for
+    // deferred eviction and remain in resident byte/count telemetry until the final unpin.
     void evictNotVisible(const VisibleCellSet& visible);
 
-    // Release every resident texture (device reset / shutdown).
+    // Release every unpinned texture and defer pinned entries (device reset / shutdown).
     void releaseAll();
 
     // Telemetry accessors (Composite_Telemetry; design Property 13).
     std::uint32_t residentCount() const;   // Req 8.1
+    std::uint32_t visibleResidentCount(const VisibleCellSet& visible) const;
     std::uint32_t residentBytes() const;   // Req 8.2 source
     std::uint32_t atlasServedThisFrame() const;  // Req 8.4
 
     // Set the per-frame Single_Atlas_Path-served tally (visible cells not resident this frame).
-    // The client reconcile loop (task 8.5) sets this as visibleCount - residentCount(), matching
-    // composite_stream_model's atlas_served_count.
     void setAtlasServedThisFrame(std::uint32_t count);
 
     // Budget helpers (also exercised by the budget tests). Public + static so the worst-case
@@ -95,6 +100,8 @@ private:
         IDirect3DTexture9* tex;     // uploaded DXT1 + mips (default pool), owned reference
         std::uint32_t bytes;        // GPU footprint estimate = compositeBytes(edgeTexels)
         std::uint32_t lastSeenFrame;// reserved for future LRU; eviction here is visibility-driven
+        std::uint32_t pins;         // retained-material leases
+        bool evictionPending;       // left visibility while pinned
     };
 
     // Upload the precompressed DXT1 + mip chain into a default-pool texture via a system-memory
@@ -107,5 +114,6 @@ private:
     std::uint32_t budgetBytes_;
     std::uint32_t residentBytes_;
     std::uint32_t atlasServedThisFrame_;
+    VisibleCellSet transitionTargets_;
     std::unordered_map<CellId, ResidentComposite, CellIdHash> resident_;
 };

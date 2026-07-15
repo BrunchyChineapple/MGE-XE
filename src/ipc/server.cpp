@@ -3,7 +3,6 @@
 #include "mge/dlstreamer.h"
 #include "support/log.h"
 
-#include <cassert>
 #include <vector>
 
 namespace IPC {
@@ -116,16 +115,19 @@ namespace IPC {
 	}
 
 	template<typename T>
-	Vec<T>& Server::getVec(VecId id) {
+	Vec<T>* Server::getVec(VecId id) noexcept {
+		if (id == InvalidVector || id >= m_vecs.size()) {
+			return nullptr;
+		}
+
 		auto pVec = m_vecs[id];
-		// when the client requests to allocate a shared vector, there's no way we can communicate a template
-		// argument to the server, so all vectors are stored with a dummy type of char. the actual contained
-		// type doesn't affect the layout of the vector (as all it holds is a pointer to the elements), so
-		// we can freely cast between types without breaking the class itself. we will do an assert to make
-		// sure the size of the type we're being told the vector contains matches the size of the type it
-		// was told it contained when it was created.
-		assert(sizeof(T) == pVec->m_elementBytes);
-		return *reinterpret_cast<Vec<T>*>(pVec);
+		// Shared vectors are stored as Vec<char> because the allocation RPC cannot carry a
+		// template argument. The Vec layout is type-independent, but the element size must
+		// still match before the vector can be safely reinterpreted.
+		if (pVec == nullptr || sizeof(T) != pVec->m_elementBytes) {
+			return nullptr;
+		}
+		return reinterpret_cast<Vec<T>*>(pVec);
 	}
 
 	bool Server::allocVec() {
@@ -164,7 +166,7 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.freeVecParams;
 		params.wasFreed = false;
 
-		if (params.id == InvalidVector) {
+		if (params.id == InvalidVector || params.id >= m_vecs.size()) {
 			return true;
 		}
 
@@ -184,24 +186,49 @@ namespace IPC {
 
 	void Server::updateDynVis() {
 		auto& params = m_ipcParameters->params.dynVisParams;
-		auto& vec = getVec<DynVisFlag>(params.id);
-		for (auto& update : vec) {
+		params.accepted = false;
+		auto vec = getVec<DynVisFlag>(params.id);
+		if (vec == nullptr) {
+			LOG::logline("Rejected UpdateDynVis RPC with invalid vector %u", params.id);
+			return;
+		}
+
+		bool retainedChanged = false;
+		for (auto& update : *vec) {
+			if (update.groupIndex >= DistantLandShare::dynamicVisGroupsServer.size()) {
+				continue;
+			}
 			for (auto mesh : DistantLandShare::dynamicVisGroupsServer[update.groupIndex]) {
+				if (mesh == nullptr ||
+					(update.retainedOnly && mesh->retainedPlacementIdentity == 0) ||
+					mesh->enabled == update.enable) {
+					continue;
+				}
 				mesh->enabled = update.enable;
+				retainedChanged = retainedChanged || mesh->retainedPlacementIdentity != 0;
 			}
 		}
+		if (retainedChanged) {
+			DistantLandShare::bumpRetainedCatalogGeneration();
+		}
+		params.accepted = true;
 	}
 
 	bool Server::initDistantStatics() {
 		auto& params = m_ipcParameters->params.distantStaticParams;
-		auto& distantStatics = getVec<DistantStatic>(params.distantStatics);
-		auto& distantSubsets = getVec<DistantSubset>(params.distantSubsets);
-		return DistantLandShare::initDistantStaticsServer(distantStatics, distantSubsets);
+		auto distantStatics = getVec<DistantStatic>(params.distantStatics);
+		auto distantSubsets = getVec<DistantSubset>(params.distantSubsets);
+		if (distantStatics == nullptr || distantSubsets == nullptr) {
+			return false;
+		}
+		return DistantLandShare::initDistantStaticsServer(*distantStatics, *distantSubsets);
 	}
 
 	bool Server::initLandscape() {
 		auto& params = m_ipcParameters->params.initLandscapeParams;
-		bool ok = DistantLandShare::initLandscapeServer(getVec<LandscapeBuffers>(params.buffers), params.texWorldColour);
+		auto buffers = getVec<LandscapeBuffers>(params.buffers);
+		bool ok = buffers != nullptr &&
+			DistantLandShare::initLandscapeServer(*buffers, params.texWorldColour);
 
 		// Surface the Format_Loader's composite-pool state back to the client (task 5.2
 		// additions). hasCompositeSet drives the client's Old_Format vs New_Format path:
@@ -210,9 +237,9 @@ namespace IPC {
 		// for any Old/absent/malformed load the pool is inactive, so hasCompositeSet is
 		// false (Requirements 4.1, 4.6, 6.3).
 		const auto& pool = DistantLandShare::compositePool;
-		params.hasCompositeSet = pool.active;
-		params.compositeCellCount = pool.active ? pool.cellCount : 0;
-		params.defaultEdgeTexels = pool.active ? pool.defaultEdgeTexels : 0;
+		params.hasCompositeSet = ok && pool.active;
+		params.compositeCellCount = params.hasCompositeSet ? pool.cellCount : 0;
+		params.defaultEdgeTexels = params.hasCompositeSet ? pool.defaultEdgeTexels : 0;
 
 		return ok;
 	}
@@ -224,20 +251,34 @@ namespace IPC {
 
 	void Server::getVisibleMeshesCoarse() {
 		auto& params = m_ipcParameters->params.meshParams;
-		auto& vec = getVec<RenderMesh>(params.visibleSet);
-		DistantLandShare::getVisibleMeshesCoarse(vec, params.viewFrustum, params.sort, params.setFlags);
+		auto vec = getVec<RenderMesh>(params.visibleSet);
+		if (vec == nullptr) {
+			LOG::logline("Rejected GetVisibleMeshesCoarse RPC with invalid output vector %u", params.visibleSet);
+			return;
+		}
+		vec->truncate(0);
+		DistantLandShare::getVisibleMeshesCoarse(*vec, params.viewFrustum, params.sort, params.setFlags);
 	}
 
 	void Server::getVisibleMeshes() {
 		auto& params = m_ipcParameters->params.meshParams;
-		auto& vec = getVec<RenderMesh>(params.visibleSet);
-		DistantLandShare::getVisibleMeshes(vec, params.viewFrustum, params.viewSphere, params.sort, params.setFlags);
+		auto vec = getVec<RenderMesh>(params.visibleSet);
+		if (vec == nullptr) {
+			LOG::logline("Rejected GetVisibleMeshes RPC with invalid output vector %u", params.visibleSet);
+			return;
+		}
+		vec->truncate(0);
+		DistantLandShare::getVisibleMeshes(*vec, params.viewFrustum, params.viewSphere, params.sort, params.setFlags);
 	}
 
 	void Server::sortVisibleSet() {
 		auto& params = m_ipcParameters->params.meshParams;
-		auto& vec = getVec<RenderMesh>(params.visibleSet);
-		DistantLandShare::sortVisibleSet(vec, params.sort);
+		auto vec = getVec<RenderMesh>(params.visibleSet);
+		if (vec == nullptr) {
+			LOG::logline("Rejected SortVisibleSet RPC with invalid vector %u", params.visibleSet);
+			return;
+		}
+		DistantLandShare::sortVisibleSet(*vec, params.sort);
 	}
 
 	void Server::streamVisibleComposites() {
@@ -248,27 +289,45 @@ namespace IPC {
 		// went active (Old_Format / absent / malformed), leaving both channels empty (Req 4.6).
 		auto& params = m_ipcParameters->params.streamCompositesParams;
 
-		auto& deltaVec = getVec<CompositeCellId>(params.delta);
-		auto& outHeaders = getVec<CompositeChunkMsg>(params.outHeaders);
-		auto& outBytes = getVec<std::uint8_t>(params.outBytes);
+		auto deltaVec = getVec<CompositeCellId>(params.delta);
+		auto outHeaders = getVec<CompositeChunkMsg>(params.outHeaders);
+		auto outBytes = getVec<std::uint8_t>(params.outBytes);
+		if (outHeaders != nullptr) {
+			outHeaders->truncate(0);
+		}
+		if (outBytes != nullptr) {
+			outBytes->truncate(0);
+		}
+		if (deltaVec == nullptr || outHeaders == nullptr || outBytes == nullptr) {
+			LOG::logline("Rejected StreamVisibleComposites RPC with invalid vector IDs");
+			return;
+		}
 
 		VisibleCellDelta delta;
-		delta.reserve(deltaVec.size());
-		for (const auto& c : deltaVec) {
+		delta.reserve(deltaVec->size());
+		for (const auto& c : *deltaVec) {
 			delta.push_back(CellId{ c.cellX, c.cellY });
 		}
 
 		CompositeStreamerServer streamer(DistantLandShare::compositePool);
-		streamer.streamNewlyVisible(delta, outHeaders, &outBytes);
+		streamer.streamNewlyVisible(delta, *outHeaders, outBytes);
 	}
 
     void Server::getRetainedWorldCatalog() {
         auto& params = m_ipcParameters->params.retainedCatalogParams;
+        params.available = false;
+
+        auto header = getVec<RetainedCatalog::Header>(params.header);
+        auto cells = getVec<RetainedCatalog::Cell>(params.cells);
+        auto meshes = getVec<RetainedCatalog::Mesh>(params.meshes);
+        auto placements = getVec<RetainedCatalog::Placement>(params.placements);
+        auto blob = getVec<std::uint8_t>(params.blob);
+        if (header == nullptr || cells == nullptr || meshes == nullptr ||
+            placements == nullptr || blob == nullptr) {
+            return;
+        }
+
         params.available = DistantLandShare::writeRetainedCatalog(
-            getVec<RetainedCatalog::Header>(params.header),
-            getVec<RetainedCatalog::Cell>(params.cells),
-            getVec<RetainedCatalog::Mesh>(params.meshes),
-            getVec<RetainedCatalog::Placement>(params.placements),
-            getVec<std::uint8_t>(params.blob));
+            *header, *cells, *meshes, *placements, *blob);
     }
 }

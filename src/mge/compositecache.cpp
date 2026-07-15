@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 // ResidentCompositeCache: the IPC client's bounded set of uploaded Per_Cell_Composite
@@ -68,8 +69,34 @@ void ResidentCompositeCache::init(IDirect3DDevice9* device) {
 }
 
 void ResidentCompositeCache::setBudgetMB(std::uint32_t mb) {
-    // budgetBytes = Texture_Memory_Budget * 1 MiB (design "Memory budget model", Req 7.2).
     budgetBytes_ = static_cast<std::uint32_t>(static_cast<std::uint64_t>(mb) * kBytesPerMB);
+}
+
+void ResidentCompositeCache::setTransitionTargets(const VisibleCellSet& cells) {
+    transitionTargets_ = cells;
+}
+
+void ResidentCompositeCache::includeTransitionTargets(VisibleCellSet& cells) const {
+    cells.insert(transitionTargets_.begin(), transitionTargets_.end());
+}
+
+bool ResidentCompositeCache::isTransitionTarget(CellId cell) const {
+    return transitionTargets_.find(cell) != transitionTargets_.end();
+}
+
+void ResidentCompositeCache::trimToBudget() {
+    for (auto it = resident_.begin();
+         it != resident_.end() && residentBytes_ > budgetBytes_;) {
+        if (it->second.pins != 0 || isTransitionTarget(it->first)) {
+            ++it;
+            continue;
+        }
+        if (it->second.tex != nullptr) {
+            it->second.tex->Release();
+        }
+        residentBytes_ -= it->second.bytes;
+        it = resident_.erase(it);
+    }
 }
 
 // compositeBytes - per-cell resident GPU footprint estimate: edgeTexels^2 / 2 * 1.333
@@ -192,31 +219,28 @@ bool ResidentCompositeCache::uploadDXT1(const CompositeChunkMsg& msg,
 bool ResidentCompositeCache::admit(const CompositeChunkMsg& msg, const std::uint8_t* dxt1Bytes) {
     const CellId cell{ msg.cellX, msg.cellY };
 
-    // Already resident: keep the existing texture, do not re-upload (idempotent success).
-    if (resident_.find(cell) != resident_.end()) {
+    auto existing = resident_.find(cell);
+    if (existing != resident_.end()) {
+        existing->second.evictionPending = false;
         return true;
     }
 
-    // Byte-budget admission rule (Req 7.3), non-strict, identical to composite_stream_model:
-    // admit iff residentBytes + cellBytes <= budgetBytes. A cell that would exceed the budget
-    // is NOT uploaded, so the Texture_Binder falls back to the atlas for it.
-    const std::uint32_t cellBytes = compositeBytes(msg.edgeTexels);
-    if (static_cast<std::uint64_t>(residentBytes_) + cellBytes > budgetBytes_) {
+    const std::uint32_t cellBytes = msg.byteLength;
+    const std::uint64_t admissionBudget = static_cast<std::uint64_t>(budgetBytes_) +
+        (isTransitionTarget(cell) ? cellBytes : 0u);
+    if (static_cast<std::uint64_t>(residentBytes_) + cellBytes > admissionBudget) {
         return false;
     }
 
-    // Within budget: upload. A CreateTexture / LockRect / UpdateTexture failure returns false
-    // (Req 6.4, 4.3) and leaves the cache unchanged so the binder uses the atlas.
     IDirect3DTexture9* tex = nullptr;
     if (!uploadDXT1(msg, dxt1Bytes, &tex)) {
         return false;
     }
 
-    ResidentComposite rc;
+    ResidentComposite rc = {};
     rc.cell = cell;
     rc.tex = tex;
     rc.bytes = cellBytes;
-    rc.lastSeenFrame = 0;
     resident_.emplace(cell, rc);
     residentBytes_ += cellBytes;
     return true;
@@ -224,40 +248,83 @@ bool ResidentCompositeCache::admit(const CompositeChunkMsg& msg, const std::uint
 
 IDirect3DTexture9* ResidentCompositeCache::lookup(CellId cell) const {
     const auto it = resident_.find(cell);
-    if (it == resident_.end()) {
-        return nullptr;  // not resident (incl. budget-rejected) -> binder uses the atlas
+    return it == resident_.end() ? nullptr : it->second.tex;
+}
+
+IDirect3DTexture9* ResidentCompositeCache::pin(CellId cell) {
+    auto it = resident_.find(cell);
+    if (it == resident_.end() || it->second.pins == std::numeric_limits<std::uint32_t>::max()) {
+        return nullptr;
     }
+    ++it->second.pins;
+    it->second.evictionPending = false;
     return it->second.tex;
 }
 
+void ResidentCompositeCache::unpin(CellId cell) {
+    auto it = resident_.find(cell);
+    if (it == resident_.end() || it->second.pins == 0) {
+        LOG::logline("!! ResidentCompositeCache: unmatched unpin for cell (%d,%d)", cell.x, cell.y);
+        return;
+    }
+
+    if (--it->second.pins != 0 || !it->second.evictionPending) {
+        return;
+    }
+    if (it->second.tex != nullptr) {
+        it->second.tex->Release();
+    }
+    residentBytes_ -= it->second.bytes;
+    resident_.erase(it);
+}
+
 void ResidentCompositeCache::evictNotVisible(const VisibleCellSet& visible) {
-    // Release every resident cell absent from the new Visible_Cell_Set (Req 4.5). After this the
-    // resident set is a subset of the visible set; evicted bytes stay only in the server pool.
     for (auto it = resident_.begin(); it != resident_.end();) {
-        if (visible.find(it->first) == visible.end()) {
-            if (it->second.tex != nullptr) {
-                it->second.tex->Release();
-            }
-            residentBytes_ -= it->second.bytes;
-            it = resident_.erase(it);
-        } else {
+        if (visible.find(it->first) != visible.end()) {
+            it->second.evictionPending = false;
             ++it;
+            continue;
         }
+        if (it->second.pins != 0) {
+            it->second.evictionPending = true;
+            ++it;
+            continue;
+        }
+        if (it->second.tex != nullptr) {
+            it->second.tex->Release();
+        }
+        residentBytes_ -= it->second.bytes;
+        it = resident_.erase(it);
     }
 }
 
 void ResidentCompositeCache::releaseAll() {
-    for (auto& kv : resident_) {
-        if (kv.second.tex != nullptr) {
-            kv.second.tex->Release();
+    for (auto it = resident_.begin(); it != resident_.end();) {
+        if (it->second.pins != 0) {
+            it->second.evictionPending = true;
+            ++it;
+            continue;
         }
+        if (it->second.tex != nullptr) {
+            it->second.tex->Release();
+        }
+        residentBytes_ -= it->second.bytes;
+        it = resident_.erase(it);
     }
-    resident_.clear();
-    residentBytes_ = 0;
 }
 
 std::uint32_t ResidentCompositeCache::residentCount() const {
     return static_cast<std::uint32_t>(resident_.size());
+}
+
+std::uint32_t ResidentCompositeCache::visibleResidentCount(const VisibleCellSet& visible) const {
+    std::uint32_t count = 0;
+    for (const auto& cell : visible) {
+        if (resident_.find(cell) != resident_.end()) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 std::uint32_t ResidentCompositeCache::residentBytes() const {

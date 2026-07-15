@@ -167,10 +167,13 @@ namespace IPC {
     struct DynVisFlag {
         std::uint16_t groupIndex;
         bool enable;
+        bool retainedOnly;
     };
+    static_assert(sizeof(DynVisFlag) == 4, "DynVisFlag IPC layout changed");
 
     struct DynVisParameters {
         IN VecId id;
+        OUT bool accepted;
     };
 
     struct DistantStaticParameters {

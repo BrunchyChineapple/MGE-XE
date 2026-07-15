@@ -31,6 +31,10 @@ vector<std::uint8_t> DistantLandShare::retainedTerrainBlob;
 vector<std::uint64_t> DistantLandShare::retainedStaticPrototypeIds;
 std::uint64_t DistantLandShare::retainedCatalogGeneration = 0;
 
+void DistantLandShare::bumpRetainedCatalogGeneration() noexcept {
+    ++retainedCatalogGeneration;
+}
+
 void DistantLandShare::loadVisGroupsServer(HANDLE h) {
     DWORD unused;
 
@@ -513,14 +517,55 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
         return false;
     }
 
-    DWORD file_size = GetFileSize(file, NULL);
-    DWORD mesh_count, unused;
-    ReadFile(file, &mesh_count, 4, &unused, 0);
+    bool readingBuffers = false;
+    const auto fail = [&]() {
+        if (readingBuffers) {
+            landscapeBuffers.end_read();
+            readingBuffers = false;
+        }
+        CloseHandle(file);
+        retainedTerrainMeshes.clear();
+        retainedTerrainBlob.clear();
+        return false;
+    };
 
-    vector<LandMesh> meshesLand;
-    meshesLand.resize(mesh_count);
+    LARGE_INTEGER fileSize = {};
+    if (!GetFileSizeEx(file, &fileSize) ||
+        fileSize.QuadPart < static_cast<LONGLONG>(sizeof(DWORD)) ||
+        fileSize.QuadPart > static_cast<LONGLONG>(std::numeric_limits<DWORD>::max())) {
+        return fail();
+    }
+    const DWORD file_size = static_cast<DWORD>(fileSize.QuadPart);
+    std::uint64_t bytesConsumed = 0;
+    const auto readExact = [&](void* destination, DWORD bytes) {
+        if (bytes > static_cast<std::uint64_t>(file_size) - bytesConsumed) {
+            return false;
+        }
+        DWORD bytesRead = 0;
+        if (bytes != 0 &&
+            (!ReadFile(file, destination, bytes, &bytesRead, nullptr) || bytesRead != bytes)) {
+            return false;
+        }
+        bytesConsumed += bytes;
+        return true;
+    };
 
+    DWORD mesh_count = 0;
+    if (!readExact(&mesh_count, sizeof(mesh_count))) {
+        return fail();
+    }
+
+    constexpr std::uint64_t meshMetadataBytes =
+        sizeof(float) + 3 * sizeof(D3DXVECTOR3) + 2 * sizeof(DWORD);
+    if (mesh_count > landscapeBuffers.max_size() ||
+        static_cast<std::uint64_t>(mesh_count) * meshMetadataBytes >
+            static_cast<std::uint64_t>(file_size) - bytesConsumed) {
+        return fail();
+    }
+
+    vector<LandMesh> meshesLand(mesh_count);
     landscapeBuffers.start_read();
+    readingBuffers = true;
     auto it = landscapeBuffers.begin();
     if (!meshesLand.empty()) {
         D3DXVECTOR2 qtmin(FLT_MAX, FLT_MAX), qtmax(-FLT_MAX, -FLT_MAX);
@@ -528,49 +573,68 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
         D3DXMatrixIdentity(&world);
         std::unordered_set<std::uint64_t> terrainIdentities;
 
+        const auto finiteVector = [](const D3DXVECTOR3& value) {
+            return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+        };
+
         // Load meshes and calculate max size of quadtree
         for (auto& i : meshesLand) {
-            ReadFile(file, &i.sphere.radius, 4, &unused, 0);
-            ReadFile(file, &i.sphere.center, 12, &unused, 0);
-
             D3DXVECTOR3 boxMin, boxMax;
-            ReadFile(file, &boxMin, 12, &unused, 0);
-            ReadFile(file, &boxMax, 12, &unused, 0);
+            if (!readExact(&i.sphere.radius, sizeof(i.sphere.radius)) ||
+                !readExact(&i.sphere.center, sizeof(i.sphere.center)) ||
+                !readExact(&boxMin, sizeof(boxMin)) ||
+                !readExact(&boxMax, sizeof(boxMax)) ||
+                !readExact(&i.verts, sizeof(i.verts)) ||
+                !readExact(&i.faces, sizeof(i.faces))) {
+                return fail();
+            }
+            if (!std::isfinite(i.sphere.radius) || i.sphere.radius < 0.0f ||
+                !finiteVector(i.sphere.center) || !finiteVector(boxMin) || !finiteVector(boxMax) ||
+                boxMin.x > boxMax.x || boxMin.y > boxMax.y || boxMin.z > boxMax.z ||
+                !std::isfinite(i.sphere.center.x - i.sphere.radius) ||
+                !std::isfinite(i.sphere.center.x + i.sphere.radius) ||
+                !std::isfinite(i.sphere.center.y - i.sphere.radius) ||
+                !std::isfinite(i.sphere.center.y + i.sphere.radius)) {
+                return fail();
+            }
             i.box.Set(boxMin, boxMax);
 
-            ReadFile(file, &i.verts, 4, &unused, 0);
-            ReadFile(file, &i.faces, 4, &unused, 0);
-
-            bool large = (i.verts > 0xFFFF || i.faces > 0xFFFF);
+            std::uint32_t indexCount = 0;
             std::uint32_t vertexBytes = 0;
             std::uint32_t indexBytes = 0;
-            if (!checkedBytes(i.verts, SIZEOFLANDVERT, vertexBytes) ||
-                !checkedBytes(i.faces, large ? 12u : 6u, indexBytes)) {
-                landscapeBuffers.end_read();
-                CloseHandle(file);
-                return false;
+            const bool large = (i.verts > 0xFFFF || i.faces > 0xFFFF);
+            if (!checkedBytes(i.faces, 3, indexCount) ||
+                !checkedBytes(i.verts, SIZEOFLANDVERT, vertexBytes) ||
+                !checkedBytes(indexCount, large ? 4u : 2u, indexBytes) ||
+                static_cast<std::uint64_t>(vertexBytes) + indexBytes >
+                    static_cast<std::uint64_t>(file_size) - bytesConsumed) {
+                return fail();
+            }
+
+            const double cellXd = std::floor(static_cast<double>(i.sphere.center.x) / 8192.0);
+            const double cellYd = std::floor(static_cast<double>(i.sphere.center.y) / 8192.0);
+            if (cellXd < std::numeric_limits<std::int32_t>::min() ||
+                cellXd > std::numeric_limits<std::int32_t>::max() ||
+                cellYd < std::numeric_limits<std::int32_t>::min() ||
+                cellYd > std::numeric_limits<std::int32_t>::max()) {
+                return fail();
             }
 
             std::vector<std::uint8_t> vertices(vertexBytes);
             std::vector<std::uint8_t> indices(indexBytes);
-            DWORD bytesRead = 0;
-            if ((vertexBytes && (!ReadFile(file, vertices.data(), vertexBytes, &bytesRead, nullptr) || bytesRead != vertexBytes)) ||
-                (indexBytes && (!ReadFile(file, indices.data(), indexBytes, &bytesRead, nullptr) || bytesRead != indexBytes))) {
-                landscapeBuffers.end_read();
-                CloseHandle(file);
-                return false;
+            if (!readExact(vertices.data(), vertexBytes) ||
+                !readExact(indices.data(), indexBytes)) {
+                return fail();
             }
 
-            const std::int32_t cellX = static_cast<std::int32_t>(std::floor(i.sphere.center.x / 8192.0f));
-            const std::int32_t cellY = static_cast<std::int32_t>(std::floor(i.sphere.center.y / 8192.0f));
+            const std::int32_t cellX = static_cast<std::int32_t>(cellXd);
+            const std::int32_t cellY = static_cast<std::int32_t>(cellYd);
             std::uint64_t identity = hashBytes(&cellX, sizeof(cellX));
             identity = hashBytes(&cellY, sizeof(cellY), identity);
             identity = hashBytes(vertices.data(), vertices.size(), identity);
             identity = hashBytes(indices.data(), indices.size(), identity);
             if (identity == 0 || !terrainIdentities.insert(identity).second) {
-                landscapeBuffers.end_read();
-                CloseHandle(file);
-                return false;
+                return fail();
             }
 
             RetainedCatalog::Mesh catalogMesh = {};
@@ -581,24 +645,21 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
             catalogMesh.vertexCount = i.verts;
             catalogMesh.vertexStride = SIZEOFLANDVERT;
             catalogMesh.indexBytes = indexBytes;
-            catalogMesh.indexCount = i.faces * 3;
+            catalogMesh.indexCount = indexCount;
             catalogMesh.indexStride = large ? 4 : 2;
             catalogMesh.cellX = cellX;
             catalogMesh.cellY = cellY;
             if (!appendBytes(retainedTerrainBlob, vertices.data(), vertexBytes, catalogMesh.vertexOffset) ||
                 !appendBytes(retainedTerrainBlob, indices.data(), indexBytes, catalogMesh.indexOffset)) {
-                landscapeBuffers.end_read();
-                CloseHandle(file);
-                return false;
+                return fail();
             }
             retainedTerrainMeshes.push_back(catalogMesh);
 
-            auto& buffers = *it;
             if (it.at_end()) {
                 LOG::logline("Client landscape buffers ended while the server still has more meshes (%u buffers found, expected %u)", landscapeBuffers.size(), mesh_count);
-                landscapeBuffers.end_read();
-                return false;
+                return fail();
             }
+            auto& buffers = *it;
             ++it;
 
             i.vbuffer = buffers.vb;
@@ -635,12 +696,12 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
     }
 
     landscapeBuffers.end_read();
-
+    readingBuffers = false;
     CloseHandle(file);
     LandQuadTree.CalcVolume();
 
     // Log approximate memory use
-    LOG::logline("-- Distant landscape memory use: %d MB", file_size / (1 << 20));
+    LOG::logline("-- Distant landscape memory use: %u MB", file_size / (1 << 20));
 
     // Architecture B Format_Loader (task 6.1): after the existing mesh table read, attempt
     // to load the additive per-cell composite set. loadCompositeSet() classifies the
@@ -815,7 +876,6 @@ bool DistantLandShare::writeRetainedCatalog(
         prototypes.emplace(mesh.identity, &mesh);
     }
     std::unordered_map<std::uint64_t, std::uint64_t> placementWitnesses;
-    std::unordered_set<std::uint64_t> referencedPrototypes;
 
     auto collectStatics = [&](const std::unique_ptr<QuadTree>& tree) {
         if (!tree) {
@@ -823,10 +883,14 @@ bool DistantLandShare::writeRetainedCatalog(
         }
         bool valid = true;
         tree->ForEachMesh([&](const QuadTreeMesh& mesh) {
-            if (!valid) {
+            if (!valid || !mesh.cellValid) {
                 return;
             }
-            if (!mesh.cellValid || mesh.retainedPrototypeIdentity == 0 ||
+            const auto cell = byCell.find({ mesh.cellX, mesh.cellY });
+            if (cell == byCell.end()) {
+                return;
+            }
+            if (mesh.retainedPrototypeIdentity == 0 ||
                 mesh.retainedPlacementIdentity == 0 ||
                 prototypes.find(mesh.retainedPrototypeIdentity) == prototypes.end()) {
                 valid = false;
@@ -856,8 +920,7 @@ bool DistantLandShare::writeRetainedCatalog(
                 return;
             }
 
-            referencedPrototypes.insert(placement.prototypeIdentity);
-            byCell[{ placement.cellX, placement.cellY }].placements.push_back(placement);
+            cell->second.placements.push_back(placement);
         });
         return valid;
     };
@@ -894,25 +957,36 @@ bool DistantLandShare::writeRetainedCatalog(
         cells.push_back(cell);
     }
 
+    std::unordered_set<std::uint64_t> referencedPrototypes;
+    for (const auto& placement : placements) {
+        referencedPrototypes.insert(placement.prototypeIdentity);
+    }
     std::vector<std::uint64_t> sortedPrototypeIds(
         referencedPrototypes.begin(), referencedPrototypes.end());
     std::sort(sortedPrototypeIds.begin(), sortedPrototypeIds.end());
 
-    const std::uint64_t staticBlobBase64 = retainedTerrainBlob.size();
-    const std::uint64_t combinedBlobBytes = staticBlobBase64 + retainedStaticBlob.size();
-    if (combinedBlobBytes > std::numeric_limits<std::uint32_t>::max()) {
-        return false;
-    }
-    const auto staticBlobBase = static_cast<std::uint32_t>(staticBlobBase64);
+    std::vector<std::uint8_t> blob = retainedTerrainBlob;
+    const auto copyStaticSpan = [&](std::uint32_t sourceOffset,
+                                    std::uint32_t bytes,
+                                    std::uint32_t& destinationOffset) {
+        if (sourceOffset > retainedStaticBlob.size() ||
+            bytes > retainedStaticBlob.size() - sourceOffset) {
+            return false;
+        }
+        const auto* source = bytes == 0
+            ? nullptr
+            : retainedStaticBlob.data() + sourceOffset;
+        return appendBytes(blob, source, bytes, destinationOffset);
+    };
 
     for (const auto identity : sortedPrototypeIds) {
-        auto mesh = *prototypes.at(identity);
-        const auto adjust = [staticBlobBase](std::uint32_t offset) -> std::uint32_t {
-            return offset + staticBlobBase;
-        };
-        mesh.vertexOffset = adjust(mesh.vertexOffset);
-        mesh.indexOffset = adjust(mesh.indexOffset);
-        mesh.materialOffset = adjust(mesh.materialOffset);
+        const auto& sourceMesh = *prototypes.at(identity);
+        auto mesh = sourceMesh;
+        if (!copyStaticSpan(sourceMesh.vertexOffset, sourceMesh.vertexBytes, mesh.vertexOffset) ||
+            !copyStaticSpan(sourceMesh.indexOffset, sourceMesh.indexBytes, mesh.indexOffset) ||
+            !copyStaticSpan(sourceMesh.materialOffset, sourceMesh.materialBytes, mesh.materialOffset)) {
+            return false;
+        }
         meshes.push_back(mesh);
     }
 
@@ -921,11 +995,6 @@ bool DistantLandShare::writeRetainedCatalog(
         placements.size() > std::numeric_limits<std::uint32_t>::max()) {
         return false;
     }
-
-    std::vector<std::uint8_t> blob;
-    blob.reserve(static_cast<std::size_t>(combinedBlobBytes));
-    blob.insert(blob.end(), retainedTerrainBlob.begin(), retainedTerrainBlob.end());
-    blob.insert(blob.end(), retainedStaticBlob.begin(), retainedStaticBlob.end());
 
     std::uint64_t contentHash = hashBytes(cells.data(), cells.size() * sizeof(cells[0]));
     contentHash = hashBytes(meshes.data(), meshes.size() * sizeof(meshes[0]), contentHash);

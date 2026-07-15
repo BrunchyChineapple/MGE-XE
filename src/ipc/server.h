@@ -35,7 +35,7 @@ namespace IPC {
 		Parameters* m_ipcParameters;
 
 		template<typename T>
-		Vec<T>& getVec(VecId id);
+		Vec<T>* getVec(VecId id) noexcept;
 
 		bool allocVec();
 		bool freeVec();

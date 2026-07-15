@@ -97,6 +97,7 @@ namespace IPC {
 		VecView(const VecView<T>&);
 		VecView(VecView<T>&&) noexcept;
 		VecView<T>& operator=(const VecView<T>&);
+		VecView<T>& operator=(VecView<T>&&) noexcept;
 
 		// iterator methods
 		reference operator*() const;

@@ -52,9 +52,18 @@ namespace IPC {
 		};
 		Parameters* m_ipcParameters;
 		bool m_isRpcPending;
+		bool m_freeVecResultPending;
+		bool m_freeVecResultReady;
+		bool m_freeVecResultWasFreed;
+		VecId m_freeVecResultId;
+		bool m_dynVisResultPending;
+		bool m_dynVisResultReady;
+		bool m_dynVisResultAccepted;
+		std::vector<VecId> m_deferredVecFrees;
 
 		bool beginRpc(Command command);
 		WakeReason tryWaitForCompletion(DWORD ms = MaxWait);
+		void retainFailedVecAllocation(VecId id);
 
 	public:
 		Client();
@@ -96,24 +105,28 @@ namespace IPC {
 				LOG::logline("Vec allocation rejected by server");
 				return std::nullopt;
 			}
+			const auto allocatedId = params.id;
 
 			assert(sizeof(T) == params.elementSize);
 
 			// map header
 			auto header32 = static_cast<VecBase::VecShare*>(MapViewOfFile(params.sharedMem32, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VecBase::VecShare)));
 			if (header32 == nullptr) {
-				LOG::winerror("Failed to map header for vec %u", params.id);
-				freeVecBlocking(params.id);
+				LOG::winerror("Failed to map header for vec %u", allocatedId);
+				retainFailedVecAllocation(allocatedId);
 				return std::nullopt;
 			}
 
 			// recalculate elements per window
 			auto windowElements = params.windowBytes / sizeof(T);
-			VecView<T> view(params.id, header32, static_cast<std::size_t>(windowElements), static_cast<std::size_t>(params.windowBytes),
+			VecView<T> view(allocatedId, header32, static_cast<std::size_t>(windowElements), static_cast<std::size_t>(params.windowBytes),
 				static_cast<std::size_t>((params.reservedBytes / params.windowBytes) * windowElements), static_cast<std::size_t>(params.reservedBytes), static_cast<std::size_t>(params.headerBytes));
 			if (!view.init()) {
-				UnmapViewOfFile(header32);
-				freeVecBlocking(params.id);
+				// Drop the client view (and users32 reference) before asking the
+				// server to free the allocation. The client retains the ID if the
+				// free cannot complete while the host is still alive.
+				view = VecView<T>();
+				retainFailedVecAllocation(allocatedId);
 				return std::nullopt;
 			}
 
@@ -165,11 +178,25 @@ namespace IPC {
 		bool freeVecBlocking(VecId id);
 
 		/**
+		* @brief Retry vector frees retained after local allocation-view failures.
+		* @return True when all deferred vectors were freed, or their server is
+		*         proven gone and therefore no longer owns them.
+		*/
+		bool releaseDeferredVecs();
+
+		/**
 		* @brief Asynchronously update mesh dynamic visibility flags.
 		* @param flags ID of a shared vector which the client has filled with flags to be updated.
 		* @return Whether the RPC was issued successfully.
 		*/
 		bool updateDynVis(VecId flags);
+
+		/**
+		* @brief Await host acknowledgment of a previously-issued dynamic visibility update.
+		* @param accepted Set only when the host consumed a valid update vector.
+		* @return Completion, timeout, or host-loss reason for preserving retry ownership.
+		*/
+		WakeReason awaitDynVis(bool& accepted);
 
 		/**
 		* @brief Inform the server of distant static D3D resources.

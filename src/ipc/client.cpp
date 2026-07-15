@@ -20,7 +20,14 @@ namespace IPC {
 		m_rpcStartEvent(INVALID_HANDLE_VALUE),
 		m_rpcCompleteEvent(INVALID_HANDLE_VALUE),
 		m_ipcParameters(nullptr),
-		m_isRpcPending(false)
+		m_isRpcPending(false),
+		m_freeVecResultPending(false),
+		m_freeVecResultReady(false),
+		m_freeVecResultWasFreed(false),
+		m_freeVecResultId(InvalidVector),
+		m_dynVisResultPending(false),
+		m_dynVisResultReady(false),
+		m_dynVisResultAccepted(false)
 	{}
 
 	Client::~Client() {
@@ -61,14 +68,41 @@ namespace IPC {
 		char strHandles[256] = { 0, };
 
 		if (isServerActive()) {
-			TerminateProcess(m_process, 0);
-			CloseHandle(m_process);
-			m_process = INVALID_HANDLE_VALUE;
+			if (!TerminateProcess(m_process, 0)) {
+				LOG::winerror("Failed to terminate previous 64-bit host process");
+				return false;
+			}
+			const auto waitResult = WaitForSingleObject(m_process, MaxWait);
+			if (waitResult != WAIT_OBJECT_0) {
+				if (waitResult == WAIT_FAILED) {
+					LOG::winerror("Failed waiting for previous 64-bit host process to terminate");
+				} else {
+					LOG::logline("Timed out waiting for previous 64-bit host process to terminate");
+				}
+				return false;
+			}
 		}
+		CleanupHandle(m_process);
 
+		if (m_ipcParameters != nullptr) {
+			UnmapViewOfFile(m_ipcParameters);
+			m_ipcParameters = nullptr;
+		}
 		CleanupHandle(m_sharedMem);
 		CleanupHandle(m_rpcStartEvent);
 		CleanupHandle(m_rpcCompleteEvent);
+
+		// A replaced process is proven unable to consume the old RPC/vector.
+		// Reset cached completion state before the new IPC session is created.
+		m_isRpcPending = false;
+		m_freeVecResultPending = false;
+		m_freeVecResultReady = false;
+		m_freeVecResultWasFreed = false;
+		m_freeVecResultId = InvalidVector;
+		m_dynVisResultPending = false;
+		m_dynVisResultReady = false;
+		m_dynVisResultAccepted = false;
+		m_deferredVecFrees.clear();
 
 		// make the mapping handle inheritable
 		SECURITY_ATTRIBUTES attrsAllowInherit = {
@@ -163,6 +197,9 @@ namespace IPC {
 
 	bool Client::allocVec(std::size_t elementSize, std::size_t windowSizeInElements, std::size_t maxSizeInElements, std::size_t initialCapacity) {
 		WAIT_FOR_PREVIOUS_COMMAND;
+		if (!releaseDeferredVecs() || m_freeVecResultPending || !isServerActive()) {
+			return false;
+		}
 
 		auto& params = m_ipcParameters->params.allocVecParams;
 		params.elementSize = elementSize;
@@ -173,21 +210,58 @@ namespace IPC {
 	}
 
 	bool Client::freeVec(VecId id) {
+		// A timed-out blocking FreeVec remains owned by its original caller. A
+		// retry for that ID reuses the pending/cached result; a different free
+		// must wait so an allocated slot can never be mistaken for the old ID.
+		if (m_freeVecResultPending) {
+			return m_freeVecResultId == id;
+		}
+
 		WAIT_FOR_PREVIOUS_COMMAND;
 
-		m_ipcParameters->params.freeVecParams.id = id;
+		auto& params = m_ipcParameters->params.freeVecParams;
+		params.id = id;
+		params.wasFreed = false;
 		return beginRpc(Command::FreeVec);
 	}
 
 	bool Client::awaitFreeVec() {
-		assert(m_ipcParameters->command == Command::FreeVec);
+		if (!m_freeVecResultPending) {
+			if (!m_isRpcPending || m_ipcParameters->command != Command::FreeVec) {
+				LOG::logline("No vector free RPC result is pending");
+				return false;
+			}
+			m_freeVecResultPending = true;
+			m_freeVecResultReady = false;
+			m_freeVecResultWasFreed = false;
+			m_freeVecResultId = m_ipcParameters->params.freeVecParams.id;
+		}
 
-		if (waitForCompletion() != WakeReason::Complete) {
-			LOG::logline("Vec free RPC failed");
+		if (!m_freeVecResultReady) {
+			const auto result = waitForCompletion();
+			if (result != WakeReason::Complete) {
+				if (result == WakeReason::ServerLost) {
+					m_freeVecResultPending = false;
+					m_freeVecResultReady = false;
+					m_freeVecResultWasFreed = false;
+					m_freeVecResultId = InvalidVector;
+				}
+				LOG::logline("Vec free RPC failed");
+				return false;
+			}
+		}
+
+		if (!m_freeVecResultReady) {
+			LOG::logline("Vec free RPC completed without a matching result");
 			return false;
 		}
 
-		return m_ipcParameters->params.freeVecParams.wasFreed;
+		const bool wasFreed = m_freeVecResultWasFreed;
+		m_freeVecResultPending = false;
+		m_freeVecResultReady = false;
+		m_freeVecResultWasFreed = false;
+		m_freeVecResultId = InvalidVector;
+		return wasFreed;
 	}
 
 	bool Client::freeVecBlocking(VecId id) {
@@ -198,11 +272,93 @@ namespace IPC {
 		return awaitFreeVec();
 	}
 
+	void Client::retainFailedVecAllocation(VecId id) {
+		if (id == InvalidVector) {
+			return;
+		}
+		m_deferredVecFrees.push_back(id);
+		if (!releaseDeferredVecs()) {
+			LOG::logline("Retained failed local mapping for vec %u for cleanup retry", id);
+		}
+	}
+
+	bool Client::releaseDeferredVecs() {
+		auto discardAfterHostLoss = [this]() {
+			if (!m_deferredVecFrees.empty()) {
+				LOG::logline(
+					"Discarding %u deferred vector IDs after IPC host loss",
+					static_cast<unsigned>(m_deferredVecFrees.size()));
+			}
+			m_deferredVecFrees.clear();
+			m_freeVecResultPending = false;
+			m_freeVecResultReady = false;
+			m_freeVecResultWasFreed = false;
+			m_freeVecResultId = InvalidVector;
+			m_isRpcPending = false;
+			return true;
+		};
+
+		if (!isServerActive()) {
+			return discardAfterHostLoss();
+		}
+
+		while (!m_deferredVecFrees.empty()) {
+			const auto id = m_deferredVecFrees.back();
+			if (freeVecBlocking(id)) {
+				m_deferredVecFrees.pop_back();
+				continue;
+			}
+			if (!isServerActive()) {
+				return discardAfterHostLoss();
+			}
+			return false;
+		}
+		return true;
+	}
+
 	bool Client::updateDynVis(VecId id) {
+		if (m_dynVisResultPending) {
+			return false;
+		}
 		WAIT_FOR_PREVIOUS_COMMAND;
 
-		m_ipcParameters->params.dynVisParams.id = id;
-		return beginRpc(Command::UpdateDynVis);
+		auto& params = m_ipcParameters->params.dynVisParams;
+		params.id = id;
+		params.accepted = false;
+		if (!beginRpc(Command::UpdateDynVis)) {
+			return false;
+		}
+		m_dynVisResultPending = true;
+		m_dynVisResultReady = false;
+		m_dynVisResultAccepted = false;
+		return true;
+	}
+
+	WakeReason Client::awaitDynVis(bool& accepted) {
+		accepted = false;
+		if (m_dynVisResultReady) {
+			accepted = m_dynVisResultAccepted;
+			m_dynVisResultPending = false;
+			m_dynVisResultReady = false;
+			return WakeReason::Complete;
+		}
+		if (!m_dynVisResultPending) {
+			return WakeReason::Error;
+		}
+
+		const auto result = waitForCompletion();
+		if (result == WakeReason::Complete) {
+			if (!m_dynVisResultReady) {
+				return WakeReason::Error;
+			}
+			accepted = m_dynVisResultAccepted;
+			m_dynVisResultPending = false;
+			m_dynVisResultReady = false;
+		} else if (result == WakeReason::ServerLost) {
+			m_dynVisResultPending = false;
+			m_dynVisResultReady = false;
+		}
+		return result;
 	}
 
 	bool Client::initDistantStatics(VecId distantStatics, VecId distantSubsets) {
@@ -343,8 +499,26 @@ namespace IPC {
 			auto handleIndex = result - WAIT_OBJECT_0;
 			switch (handleIndex) {
 			case 0:
+				m_isRpcPending = false;
+				m_freeVecResultPending = false;
+				m_freeVecResultReady = false;
+				m_freeVecResultWasFreed = false;
+				m_freeVecResultId = InvalidVector;
 				return WakeReason::ServerLost;
 			case 1:
+				if (m_isRpcPending &&
+					m_ipcParameters->command == Command::FreeVec &&
+					m_freeVecResultPending &&
+					m_freeVecResultId == m_ipcParameters->params.freeVecParams.id) {
+					m_freeVecResultWasFreed = m_ipcParameters->params.freeVecParams.wasFreed;
+					m_freeVecResultReady = true;
+				}
+				if (m_isRpcPending &&
+					m_ipcParameters->command == Command::UpdateDynVis &&
+					m_dynVisResultPending) {
+					m_dynVisResultAccepted = m_ipcParameters->params.dynVisParams.accepted;
+					m_dynVisResultReady = true;
+				}
 				m_isRpcPending = false;
 				return WakeReason::Complete;
 			default:
