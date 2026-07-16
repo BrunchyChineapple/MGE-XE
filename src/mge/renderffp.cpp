@@ -606,7 +606,7 @@ void DistantLand::renderDistantStaticsFFP() {
 }
 
 // Render distant land terrain using fixed-function pipeline
-void DistantLand::renderDistantLandFFP() {
+void DistantLand::renderDistantLandFFP(bool refreshVisibility) {
     if (!MWBridge::get()->IsExterior()) return;
 
     D3DXMATRIX distProj = mwProj;
@@ -618,9 +618,13 @@ void DistantLand::renderDistantLandFFP() {
     ViewFrustum frustum(&viewproj);
 
     if (Configuration.UseSharedMemory) {
-        visLandShared.RemoveAll();
-        ipcClient.getVisibleMeshes(visLandSharedId, frustum, viewsphere, VIS_LAND);
-        ipcClient.waitForCompletion();
+        if (refreshVisibility) {
+            visLandShared.RemoveAll();
+            if (ipcClient.getVisibleMeshes(
+                    visLandSharedId, frustum, viewsphere, VIS_LAND)) {
+                ipcClient.waitForCompletion();
+            }
+        }
     } else {
         visLand.RemoveAll();
         DistantLandShare::LandQuadTree.GetVisibleMeshes(frustum, viewsphere, visLand);

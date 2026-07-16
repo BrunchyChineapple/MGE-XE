@@ -20,6 +20,7 @@ namespace IPC {
 		m_rpcStartEvent(INVALID_HANDLE_VALUE),
 		m_rpcCompleteEvent(INVALID_HANDLE_VALUE),
 		m_ipcParameters(nullptr),
+		m_sessionGeneration(0),
 		m_isRpcPending(false),
 		m_freeVecResultPending(false),
 		m_freeVecResultReady(false),
@@ -27,7 +28,9 @@ namespace IPC {
 		m_freeVecResultId(InvalidVector),
 		m_dynVisResultPending(false),
 		m_dynVisResultReady(false),
-		m_dynVisResultAccepted(false)
+		m_dynVisResultAccepted(false),
+        m_compositeStreamResultReady(false),
+        m_compositeStreamResult(CompositeBatchStatus::Pending)
 	{}
 
 	Client::~Client() {
@@ -102,6 +105,8 @@ namespace IPC {
 		m_dynVisResultPending = false;
 		m_dynVisResultReady = false;
 		m_dynVisResultAccepted = false;
+		m_compositeStreamResultReady = false;
+		m_compositeStreamResult = CompositeBatchStatus::Pending;
 		m_deferredVecFrees.clear();
 
 		// make the mapping handle inheritable
@@ -155,6 +160,10 @@ namespace IPC {
 
 		// wait for the server to finish bootstrapping
 		if (waitForCompletion() == WakeReason::Complete) {
+			++m_sessionGeneration;
+			if (m_sessionGeneration == 0) {
+				++m_sessionGeneration;
+			}
 			return true;
 		}
 
@@ -400,14 +409,28 @@ namespace IPC {
 	}
 
 	bool Client::streamVisibleComposites(VecId delta, VecId outHeaders, VecId outBytes) {
-		WAIT_FOR_PREVIOUS_COMMAND;
+		if (tryWaitForCompletion(0) != WakeReason::Complete || !isServerActive()) {
+			return false;
+		}
 
 		auto& params = m_ipcParameters->params.streamCompositesParams;
 		params.delta = delta;
 		params.outHeaders = outHeaders;
 		params.outBytes = outBytes;
+        params.result = CompositeBatchStatus::Pending;
+        m_compositeStreamResultReady = false;
+        m_compositeStreamResult = CompositeBatchStatus::Pending;
 		return beginRpc(Command::StreamVisibleComposites);
 	}
+
+    bool Client::takeCompositeStreamResult(CompositeBatchStatus& result) {
+        if (!m_compositeStreamResultReady) {
+            return false;
+        }
+        result = m_compositeStreamResult;
+        m_compositeStreamResultReady = false;
+        return true;
+    }
 
     bool Client::getRetainedWorldCatalogBlocking(
         VecId header,
@@ -519,6 +542,12 @@ namespace IPC {
 					m_dynVisResultAccepted = m_ipcParameters->params.dynVisParams.accepted;
 					m_dynVisResultReady = true;
 				}
+                if (m_isRpcPending &&
+                    m_ipcParameters->command == Command::StreamVisibleComposites) {
+                    m_compositeStreamResult =
+                        m_ipcParameters->params.streamCompositesParams.result;
+                    m_compositeStreamResultReady = true;
+                }
 				m_isRpcPending = false;
 				return WakeReason::Complete;
 			default:

@@ -282,12 +282,10 @@ namespace IPC {
 	}
 
 	void Server::streamVisibleComposites() {
-		// Bridge the on-the-wire delta (a shared Vec<CompositeCellId> the client filled with
-		// the cells newly entering the Visible_Cell_Set) into the streamer's pure
-		// VisibleCellDelta, then let CompositeStreamerServer fill the header + byte output
-		// channels from the loaded composite pool. The streamer is inert when the pool never
-		// went active (Old_Format / absent / malformed), leaving both channels empty (Req 4.6).
+		// Bridge the on-the-wire delta into the streamer's pure VisibleCellDelta and
+		// publish an explicit batch result before signaling RPC completion.
 		auto& params = m_ipcParameters->params.streamCompositesParams;
+		params.result = CompositeBatchStatus::InvalidVectors;
 
 		auto deltaVec = getVec<CompositeCellId>(params.delta);
 		auto outHeaders = getVec<CompositeChunkMsg>(params.outHeaders);
@@ -310,7 +308,7 @@ namespace IPC {
 		}
 
 		CompositeStreamerServer streamer(DistantLandShare::compositePool);
-		streamer.streamNewlyVisible(delta, *outHeaders, outBytes);
+		params.result = streamer.streamNewlyVisible(delta, *outHeaders, *outBytes);
 	}
 
     void Server::getRetainedWorldCatalog() {

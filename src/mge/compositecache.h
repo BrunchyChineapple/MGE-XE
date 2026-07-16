@@ -1,116 +1,253 @@
 #pragma once
 
-#include "ipc/bridge.h"   // CompositeChunkMsg, ptr32<>, IDirect3D* (via proxydx/d3d9header.h)
-#include "mge/dlcomposite.h"   // canonical CellId / CellIdHash (shared with the server pool)
+#include "ipc/bridge.h"
+#include "mge/dlcomposite.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
-// ResidentCompositeCache (Architecture B, IPC client side / d3d8.dll, 32-bit).
-//
-// The 64-bit server (mgeHost64.exe) holds the full pool of compressed Per_Cell_Composite
-// bytes and streams only the visible cells' DXT1 blobs to this 32-bit client. This cache
-// owns the bounded resident set of uploaded composites on the D3D9 device that feeds Remix:
-//   - admit()          uploads one streamed cell's DXT1 + mip chain, gated by the byte budget
-//   - lookup()         resolves a cell to its resident texture (null => binder uses the atlas)
-//   - evictNotVisible()releases the D3D textures of cells that left the Visible_Cell_Set
-//   - setBudgetMB()    configures the Texture_Memory_Budget
-//   - residentCount/residentBytes/atlasServedThisFrame  feed Composite_Telemetry
-//
-// The byte-budget admission rule is the testable core and is kept exact and self-consistent
-// with the authoritative model tests/composite_stream_model.py:
-//   cellBytes     = edgeTexels^2 / 2 * 1.333        (DXT1 base level + full mip chain)
-//   budgetBytes   = budgetMB * 1 MiB
-//   admit iff       residentBytes + cellBytes <= budgetBytes   (non-strict)
-// A cell that would exceed the budget is NOT uploaded; admit() returns false so the
-// Texture_Binder falls back to the global world.dds atlas for that cell (Req 7.3).
-//
-// This is client-only code, so ptr32<IDirect3DTexture9> resolves to a plain
-// IDirect3DTexture9* here; the cache stores raw device pointers it owns a reference to.
-
-// CellId / CellIdHash are defined once in mge/dlcomposite.h (included above) and shared by
-// the server pool index (mge/dlstreamer.h) and tests/composite_stream_model.py. They were
-// duplicated here originally; unifying them (task 8.5) is required because distantland.h
-// includes both this header and dlstreamer.h in one TU. CellId is { int32_t x; int32_t y; }
-// keyed by a 64-bit mix hash — the same identity the server pool and the model use.
-
-// The Visible_Cell_Set for a frame: the cells the renderer needs resident this frame. The
-// client derives it from the existing cull (frustum + Draw_Distance * kCellSize) in task 8.5.
 using VisibleCellSet = std::unordered_set<CellId, CellIdHash>;
 
+enum class CompositeAdmissionResult : std::uint8_t {
+    AlreadyResident,
+    Admitted,
+    BudgetRejected,
+    UploadFailed,
+};
+
+inline bool compositeAdmissionSucceeded(CompositeAdmissionResult result) {
+    return result == CompositeAdmissionResult::AlreadyResident ||
+           result == CompositeAdmissionResult::Admitted;
+}
+
+struct CompositeRequestCounts {
+    std::uint32_t budgetBlocked = 0;
+    std::uint32_t retryDeferred = 0;
+    std::uint32_t missing = 0;
+    std::uint32_t pending = 0;
+};
+
+// Tracks non-resident composite request outcomes across frames. Budget failures remain
+// blocked until visibility or available residency changes; absent cells remain negatively
+// cached while visible; transient transport/upload failures retry with bounded backoff.
+class CompositeRequestController {
+public:
+    void reset() {
+        records_.clear();
+        frameIndex_ = 0;
+        budgetGeneration_ = 0;
+        lastResidentBytes_ = 0;
+        lastBudgetBytes_ = 0;
+        capacityValid_ = false;
+    }
+
+    void beginFrame(const VisibleCellSet& visible, bool visibleSetChanged,
+                    std::uint32_t residentBytes, std::uint32_t budgetBytes) {
+        ++frameIndex_;
+        if (!capacityValid_ || visibleSetChanged ||
+            residentBytes < lastResidentBytes_ || budgetBytes != lastBudgetBytes_) {
+            ++budgetGeneration_;
+        }
+        lastResidentBytes_ = residentBytes;
+        lastBudgetBytes_ = budgetBytes;
+        capacityValid_ = true;
+
+        for (auto it = records_.begin(); it != records_.end();) {
+            if (visible.find(it->first) == visible.end()) {
+                it = records_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    bool shouldRequest(CellId cell, bool transitionTarget) {
+        auto it = records_.find(cell);
+        if (it == records_.end()) {
+            return true;
+        }
+
+        RequestRecord& record = it->second;
+        switch (record.status) {
+        case RequestStatus::Pending:
+        case RequestStatus::Missing:
+            return false;
+        case RequestStatus::BudgetBlocked:
+            if (record.budgetGeneration != budgetGeneration_ ||
+                (!record.transitionTarget && transitionTarget)) {
+                records_.erase(it);
+                return true;
+            }
+            record.transitionTarget = transitionTarget;
+            return false;
+        case RequestStatus::RetryDeferred:
+            return frameIndex_ >= record.retryAfterFrame;
+        }
+        return false;
+    }
+
+    void markPending(CellId cell, bool transitionTarget) {
+        RequestRecord& record = records_[cell];
+        record.status = RequestStatus::Pending;
+        record.transitionTarget = transitionTarget;
+    }
+
+    void markResident(CellId cell) {
+        records_.erase(cell);
+    }
+
+    void markBudgetBlocked(CellId cell, bool transitionTarget) {
+        RequestRecord& record = records_[cell];
+        record.status = RequestStatus::BudgetBlocked;
+        record.budgetGeneration = budgetGeneration_;
+        record.retryAfterFrame = 0;
+        record.failureCount = 0;
+        record.transitionTarget = transitionTarget;
+    }
+
+    void markMissing(CellId cell) {
+        RequestRecord& record = records_[cell];
+        record.status = RequestStatus::Missing;
+        record.retryAfterFrame = 0;
+        record.failureCount = 0;
+    }
+
+    // Capacity deferral is not a transport failure. Retry on the next frame without
+    // increasing the exponential failure backoff.
+    void markDeferred(CellId cell) {
+        RequestRecord& record = records_[cell];
+        record.status = RequestStatus::RetryDeferred;
+        record.retryAfterFrame = frameIndex_ + 1;
+    }
+
+    void markRetry(CellId cell) {
+        RequestRecord& record = records_[cell];
+        record.status = RequestStatus::RetryDeferred;
+        if (record.failureCount < kMaxBackoffSteps) {
+            ++record.failureCount;
+        }
+
+        std::uint64_t delay = kInitialRetryFrames;
+        for (std::uint32_t step = 1; step < record.failureCount; ++step) {
+            delay = delay >= kMaxRetryFrames / 2 ? kMaxRetryFrames : delay * 2;
+        }
+        record.retryAfterFrame = frameIndex_ + delay;
+    }
+
+    bool isPending(CellId cell) const {
+        const auto it = records_.find(cell);
+        return it != records_.end() && it->second.status == RequestStatus::Pending;
+    }
+
+    CompositeRequestCounts counts() const {
+        CompositeRequestCounts result;
+        for (const auto& item : records_) {
+            switch (item.second.status) {
+            case RequestStatus::BudgetBlocked:
+                ++result.budgetBlocked;
+                break;
+            case RequestStatus::RetryDeferred:
+                if (frameIndex_ < item.second.retryAfterFrame) {
+                    ++result.retryDeferred;
+                }
+                break;
+            case RequestStatus::Missing:
+                ++result.missing;
+                break;
+            case RequestStatus::Pending:
+                ++result.pending;
+                break;
+            }
+        }
+        return result;
+    }
+
+private:
+    enum class RequestStatus : std::uint8_t {
+        Pending,
+        BudgetBlocked,
+        RetryDeferred,
+        Missing,
+    };
+
+    struct RequestRecord {
+        RequestStatus status = RequestStatus::Pending;
+        std::uint64_t retryAfterFrame = 0;
+        std::uint64_t budgetGeneration = 0;
+        std::uint32_t failureCount = 0;
+        bool transitionTarget = false;
+    };
+
+    static constexpr std::uint64_t kInitialRetryFrames = 30;
+    static constexpr std::uint64_t kMaxRetryFrames = 600;
+    static constexpr std::uint32_t kMaxBackoffSteps = 6;
+
+    std::unordered_map<CellId, RequestRecord, CellIdHash> records_;
+    std::uint64_t frameIndex_ = 0;
+    std::uint64_t budgetGeneration_ = 0;
+    std::uint32_t lastResidentBytes_ = 0;
+    std::uint32_t lastBudgetBytes_ = 0;
+    bool capacityValid_ = false;
+};
+
+// Owns the bounded set of uploaded per-cell DXT1 composites used by distant terrain.
 class ResidentCompositeCache {
 public:
     ResidentCompositeCache();
     ~ResidentCompositeCache();
 
-    // Capture the D3D9 device that feeds Remix (DistantLand::device). Uploads target it.
     void init(IDirect3DDevice9* device);
-
-    // Configure the steady resident budget and the bounded one-cell allowance used while
-    // a retained target pair is transitioning.
+    std::uint64_t generation() const { return generation_; }
     void setBudgetMB(std::uint32_t mb);
     void setTransitionTargets(const VisibleCellSet& cells);
     void includeTransitionTargets(VisibleCellSet& cells) const;
     bool isTransitionTarget(CellId cell) const;
     void trimToBudget();
 
-    // Upload one newly-streamed cell's DXT1 + mip chain to the device, enforcing the byte
-    // budget. Returns true if the cell is resident after the call (admitted now, or already
-    // resident). Returns false if the cell would exceed the budget (NOT uploaded -> atlas
-    // fallback, Req 7.3) or if a CreateTexture / LockRect / UpdateTexture step fails
-    // (Req 6.4, 4.3). dxt1Bytes points at the compressed blob (byteLength, incl. mips) that
-    // followed msg in the shared-memory window.
+    // Returns the precise admission outcome so the streaming controller can distinguish a
+    // stable budget miss from a transient device/upload failure.
+    CompositeAdmissionResult admitWithResult(const CompositeChunkMsg& msg,
+                                              const std::uint8_t* dxt1Bytes);
+
+    // Compatibility convenience for callers that only need resident/not-resident.
     bool admit(const CompositeChunkMsg& msg, const std::uint8_t* dxt1Bytes);
 
-    // Resolve a cell to its resident composite texture, or null if it is not resident.
     IDirect3DTexture9* lookup(CellId cell) const;
-
-    // Retained materials lease cache ownership instead of taking an unaccounted COM reference.
-    // A pinned entry remains resident and budgeted even after leaving the visible set.
     IDirect3DTexture9* pin(CellId cell);
     void unpin(CellId cell);
-
-    // Release unpinned textures absent from the Visible_Cell_Set. Pinned entries are marked for
-    // deferred eviction and remain in resident byte/count telemetry until the final unpin.
     void evictNotVisible(const VisibleCellSet& visible);
-
-    // Release every unpinned texture and defer pinned entries (device reset / shutdown).
     void releaseAll();
 
-    // Telemetry accessors (Composite_Telemetry; design Property 13).
-    std::uint32_t residentCount() const;   // Req 8.1
+    std::uint32_t residentCount() const;
     std::uint32_t visibleResidentCount(const VisibleCellSet& visible) const;
-    std::uint32_t residentBytes() const;   // Req 8.2 source
-    std::uint32_t atlasServedThisFrame() const;  // Req 8.4
-
-    // Set the per-frame Single_Atlas_Path-served tally (visible cells not resident this frame).
+    std::uint32_t residentBytes() const;
+    std::uint32_t atlasServedThisFrame() const;
     void setAtlasServedThisFrame(std::uint32_t count);
 
-    // Budget helpers (also exercised by the budget tests). Public + static so the worst-case
-    // budget unit test (task 8.6) can call compositeBytes() without a device.
+    // Validate a Found payload's bounded DXT1 base/full-chain shape before callers allocate
+    // or copy its byte range.
+    static bool validatePayload(const CompositeChunkMsg& msg);
     static std::uint32_t compositeBytes(std::uint32_t edgeTexels);
     std::uint32_t budgetBytes() const { return budgetBytes_; }
 
 private:
-    // One uploaded composite resident on the device.
     struct ResidentComposite {
         CellId cell;
-        IDirect3DTexture9* tex;     // uploaded DXT1 + mips (default pool), owned reference
-        std::uint32_t bytes;        // GPU footprint estimate = compositeBytes(edgeTexels)
-        std::uint32_t lastSeenFrame;// reserved for future LRU; eviction here is visibility-driven
-        std::uint32_t pins;         // retained-material leases
-        bool evictionPending;       // left visibility while pinned
+        IDirect3DTexture9* tex;
+        std::uint32_t bytes;
+        std::uint32_t lastSeenFrame;
+        std::uint32_t pins;
+        bool evictionPending;
     };
 
-    // Upload the precompressed DXT1 + mip chain into a default-pool texture via a system-memory
-    // staging texture (the project's CreateTexture + LockRect + UpdateTexture idiom). Returns
-    // false on any CreateTexture / LockRect / UpdateTexture failure or a short/invalid blob.
     bool uploadDXT1(const CompositeChunkMsg& msg, const std::uint8_t* dxt1Bytes,
                     IDirect3DTexture9** outTex) const;
 
     IDirect3DDevice9* device_;
+    std::uint64_t generation_;
     std::uint32_t budgetBytes_;
     std::uint32_t residentBytes_;
     std::uint32_t atlasServedThisFrame_;

@@ -119,11 +119,12 @@ std::vector<std::uint8_t> buildBlob(std::uint32_t edge, std::uint8_t salt) {
 }
 
 CompositeChunkMsg makeMsg(std::int32_t cellX, std::int32_t cellY, std::uint32_t edge) {
-    CompositeChunkMsg m;
+    CompositeChunkMsg m = {};
     m.cellX = cellX;
     m.cellY = cellY;
     m.edgeTexels = edge;
     m.byteLength = dxt1FullChainBytes(edge);
+    m.status = CompositeCellStatus::Found;
     return m;
 }
 

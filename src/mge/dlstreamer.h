@@ -83,7 +83,8 @@ struct CompositePool {
 // pulled in by dlstreamer.cpp, not by every server translation unit that includes
 // dlshare.h. A reference/pointer to an incomplete IPC::Vec<T> is legal in a declaration;
 // the full type is needed only at the call site, which lives in the .cpp.
-struct CompositeChunkMsg;                       // defined in ipc/bridge.h
+struct CompositeChunkMsg;
+enum class CompositeBatchStatus : std::uint32_t;
 namespace IPC { template<typename T> class Vec; }
 
 // The Visible_Cell_Set delta the client hands the server each frame: the list of cells
@@ -108,22 +109,12 @@ public:
     // makes streamNewlyVisible inert and keeps the client on the Single_Atlas_Path (Req 4.6).
     bool isActive() const { return pool_.active; }
 
-    // Fill the output channel(s) for every cell newly entering the Visible_Cell_Set this
-    // frame. For each delta cell that resolves in the pool (byCell), one CompositeChunkMsg
-    // header { cellX, cellY, edgeTexels, byteLength } is appended to `out`; when `outBytes`
-    // is supplied, that cell's compressed DXT1 + mip blob (sliced from CompositePool::blob)
-    // is appended to the parallel byte channel in the SAME order, so the client reconstructs
-    // each cell by consuming byteLength bytes per header (the concrete transport: an
-    // IPC::Vec<T> has a fixed element stride and cannot inline the variable-length DXT1 span,
-    // so the design's single-channel sketch is realized as a header vec + a byte vec).
-    //
-    // Both channels are cleared first; when isActive() is false the method returns leaving
-    // them empty (inert Old_Format path, Req 4.6). Cells absent from the pool are skipped so
-    // the client falls back to the atlas for them. Cells outside the delta are never read,
-    // so non-visible composites stay resident only in the server pool (Req 4.4).
-    void streamNewlyVisible(const VisibleCellDelta& delta,
-                            IPC::Vec<CompositeChunkMsg>& out,
-                            IPC::Vec<std::uint8_t>* outBytes = nullptr) const;
+    // Emit exactly one explicit outcome per requested cell. Found payloads are limited by the
+    // actual server-known byte lengths; deferred cells carry no bytes and are retryable.
+    CompositeBatchStatus streamNewlyVisible(
+        const VisibleCellDelta& delta,
+        IPC::Vec<CompositeChunkMsg>& out,
+        IPC::Vec<std::uint8_t>& outBytes) const;
 
 private:
     const CompositePool& pool_;

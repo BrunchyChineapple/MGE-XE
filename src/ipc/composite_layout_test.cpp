@@ -175,7 +175,10 @@ static_assert(offsetof(CompositeChunkMsg, cellX)      == 0,  "CompositeChunkMsg:
 static_assert(offsetof(CompositeChunkMsg, cellY)      == 4,  "CompositeChunkMsg::cellY moved");
 static_assert(offsetof(CompositeChunkMsg, edgeTexels) == 8,  "CompositeChunkMsg::edgeTexels moved");
 static_assert(offsetof(CompositeChunkMsg, byteLength) == 12, "CompositeChunkMsg::byteLength moved");
-static_assert(sizeof(CompositeChunkMsg) == 16, "CompositeChunkMsg size changed -- IPC layout drift");
+static_assert(offsetof(CompositeChunkMsg, status)     == 16, "CompositeChunkMsg::status moved");
+static_assert(sizeof(CompositeChunkMsg) == 20, "CompositeChunkMsg size changed -- IPC layout drift");
+static_assert(sizeof(CompositeCellStatus) == 4, "CompositeCellStatus IPC layout changed");
+static_assert(sizeof(CompositeBatchStatus) == 4, "CompositeBatchStatus IPC layout changed");
 
 int main() {
     // All meaningful checks are compile-time static_asserts above. Reaching here means

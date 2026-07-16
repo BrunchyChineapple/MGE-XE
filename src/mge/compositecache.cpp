@@ -16,18 +16,35 @@ namespace {
 
 // DXT1 packs a 4x4 texel block into 8 bytes. Block-compressed level sizing rounds the
 // dimensions up to whole 4x4 blocks.
-constexpr std::uint32_t kDXT1BlockBytes = 8;
-
+constexpr std::uint64_t kDXT1BlockBytes = 8;
 constexpr std::uint64_t kBytesPerMB = 1024ull * 1024ull;
 
-// DXT1 byte size of one mip level of the given dimensions (rounded up to 4x4 blocks).
-std::uint32_t dxt1LevelBytes(std::uint32_t w, std::uint32_t h) {
-    const std::uint32_t blocksW = std::max<std::uint32_t>(1, (w + 3) / 4);
-    const std::uint32_t blocksH = std::max<std::uint32_t>(1, (h + 3) / 4);
-    return blocksW * blocksH * kDXT1BlockBytes;
+bool checkedMultiply(std::uint64_t a, std::uint64_t b, std::uint64_t& result) {
+    if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) {
+        return false;
+    }
+    result = a * b;
+    return true;
 }
 
-// Full mip-chain level count for a square edge (down to 1x1): floor(log2(edge)) + 1.
+bool checkedAdd(std::uint64_t a, std::uint64_t b, std::uint64_t& result) {
+    if (b > std::numeric_limits<std::uint64_t>::max() - a) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+bool dxt1LevelBytes(std::uint32_t w, std::uint32_t h, std::uint64_t& result) {
+    const std::uint64_t blocksW = std::max<std::uint64_t>(
+        1, (static_cast<std::uint64_t>(w) + 3) / 4);
+    const std::uint64_t blocksH = std::max<std::uint64_t>(
+        1, (static_cast<std::uint64_t>(h) + 3) / 4);
+    std::uint64_t blockCount = 0;
+    return checkedMultiply(blocksW, blocksH, blockCount) &&
+           checkedMultiply(blockCount, kDXT1BlockBytes, result);
+}
+
 std::uint32_t mipLevelCount(std::uint32_t edge) {
     std::uint32_t levels = 1;
     while (edge > 1) {
@@ -37,25 +54,58 @@ std::uint32_t mipLevelCount(std::uint32_t edge) {
     return levels;
 }
 
-// Total DXT1 bytes for a square edge with a full mip chain down to 1x1.
-std::uint64_t dxt1FullChainBytes(std::uint32_t edge) {
-    std::uint64_t total = 0;
-    std::uint32_t w = edge, h = edge;
+bool dxt1FullChainBytes(std::uint32_t edge, std::uint64_t& result) {
+    if (edge == 0) {
+        return false;
+    }
+
+    result = 0;
+    std::uint32_t w = edge;
+    std::uint32_t h = edge;
     for (;;) {
-        total += dxt1LevelBytes(w, h);
+        std::uint64_t levelBytes = 0;
+        if (!dxt1LevelBytes(w, h, levelBytes) ||
+            !checkedAdd(result, levelBytes, result)) {
+            return false;
+        }
         if (w == 1 && h == 1) {
-            break;
+            return true;
         }
         w = std::max<std::uint32_t>(1, w >> 1);
         h = std::max<std::uint32_t>(1, h >> 1);
     }
-    return total;
+}
+
+bool payloadShape(const CompositeChunkMsg& msg, std::uint32_t& levels) {
+    if (msg.status != CompositeCellStatus::Found ||
+        msg.edgeTexels == 0 || msg.edgeTexels > kCompositeMaxEdgeTexels ||
+        msg.byteLength == 0 || msg.byteLength > kCompositeMaxPayloadBytes) {
+        return false;
+    }
+
+    std::uint64_t fullChain = 0;
+    std::uint64_t baseOnly = 0;
+    if (!dxt1FullChainBytes(msg.edgeTexels, fullChain) ||
+        !dxt1LevelBytes(msg.edgeTexels, msg.edgeTexels, baseOnly)) {
+        return false;
+    }
+
+    if (msg.byteLength == fullChain) {
+        levels = mipLevelCount(msg.edgeTexels);
+        return true;
+    }
+    if (msg.byteLength == baseOnly) {
+        levels = 1;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
 
 ResidentCompositeCache::ResidentCompositeCache()
     : device_(nullptr),
+      generation_(0),
       budgetBytes_(0),
       residentBytes_(0),
       atlasServedThisFrame_(0) {}
@@ -66,10 +116,17 @@ ResidentCompositeCache::~ResidentCompositeCache() {
 
 void ResidentCompositeCache::init(IDirect3DDevice9* device) {
     device_ = device;
+    ++generation_;
+    if (generation_ == 0) {
+        ++generation_;
+    }
 }
 
 void ResidentCompositeCache::setBudgetMB(std::uint32_t mb) {
-    budgetBytes_ = static_cast<std::uint32_t>(static_cast<std::uint64_t>(mb) * kBytesPerMB);
+    const std::uint64_t bytes = static_cast<std::uint64_t>(mb) * kBytesPerMB;
+    budgetBytes_ = bytes > std::numeric_limits<std::uint32_t>::max()
+        ? std::numeric_limits<std::uint32_t>::max()
+        : static_cast<std::uint32_t>(bytes);
 }
 
 void ResidentCompositeCache::setTransitionTargets(const VisibleCellSet& cells) {
@@ -99,14 +156,20 @@ void ResidentCompositeCache::trimToBudget() {
     }
 }
 
-// compositeBytes - per-cell resident GPU footprint estimate: edgeTexels^2 / 2 * 1.333
-// (DXT1 base level + full mip chain). Computed exactly as composite_stream_model.composite_bytes:
-// integer base = (edge*edge)/2, then floor(base * 1.333). Kept identical so the budget
-// admission decision is byte-for-byte consistent between the C++ and the model.
+// Exact resident byte count for a square DXT1 texture including every mip level. Small
+// levels still occupy one complete 4x4 block.
 std::uint32_t ResidentCompositeCache::compositeBytes(std::uint32_t edgeTexels) {
-    const std::uint64_t baseLevelBytes =
-        (static_cast<std::uint64_t>(edgeTexels) * edgeTexels) / 2ull;
-    return static_cast<std::uint32_t>(static_cast<double>(baseLevelBytes) * 1.333);
+    std::uint64_t bytes = 0;
+    if (!dxt1FullChainBytes(edgeTexels, bytes) ||
+        bytes > std::numeric_limits<std::uint32_t>::max()) {
+        return edgeTexels == 0 ? 0 : std::numeric_limits<std::uint32_t>::max();
+    }
+    return static_cast<std::uint32_t>(bytes);
+}
+
+bool ResidentCompositeCache::validatePayload(const CompositeChunkMsg& msg) {
+    std::uint32_t levels = 0;
+    return payloadShape(msg, levels);
 }
 
 bool ResidentCompositeCache::uploadDXT1(const CompositeChunkMsg& msg,
@@ -117,28 +180,15 @@ bool ResidentCompositeCache::uploadDXT1(const CompositeChunkMsg& msg,
     if (device_ == nullptr || dxt1Bytes == nullptr) {
         return false;
     }
-    const std::uint32_t edge = msg.edgeTexels;
-    if (edge == 0 || msg.byteLength == 0) {
-        return false;
-    }
 
-    // Decide the mip-level count the streamed blob actually carries. A composite is baked with
-    // a full DXT1 mip chain; tolerate a base-level-only blob too. Anything else is treated as a
-    // malformed blob and rejected so the binder falls back to the atlas (Req 6.4).
-    std::uint32_t levels;
-    const std::uint64_t fullChain = dxt1FullChainBytes(edge);
-    const std::uint64_t baseOnly = dxt1LevelBytes(edge, edge);
-    if (msg.byteLength == fullChain) {
-        levels = mipLevelCount(edge);
-    } else if (msg.byteLength == baseOnly) {
-        levels = 1;
-    } else {
-        LOG::logline("!! ResidentCompositeCache: cell (%d,%d) blob length %u != DXT1 chain %llu/base %llu",
-                     msg.cellX, msg.cellY, msg.byteLength,
-                     static_cast<unsigned long long>(fullChain),
-                     static_cast<unsigned long long>(baseOnly));
+    std::uint32_t levels = 0;
+    if (!payloadShape(msg, levels)) {
+        LOG::logline(
+            "!! ResidentCompositeCache: invalid DXT1 payload for cell (%d,%d): edge=%u bytes=%u",
+            msg.cellX, msg.cellY, msg.edgeTexels, msg.byteLength);
         return false;
     }
+    const std::uint32_t edge = msg.edgeTexels;
 
     // Staging texture in system memory, then UpdateTexture into a default-pool texture so the
     // resident composite lives in GPU memory the Remix path can ray-trace (the project's
@@ -216,25 +266,31 @@ bool ResidentCompositeCache::uploadDXT1(const CompositeChunkMsg& msg,
     return true;
 }
 
-bool ResidentCompositeCache::admit(const CompositeChunkMsg& msg, const std::uint8_t* dxt1Bytes) {
+CompositeAdmissionResult ResidentCompositeCache::admitWithResult(
+    const CompositeChunkMsg& msg,
+    const std::uint8_t* dxt1Bytes) {
     const CellId cell{ msg.cellX, msg.cellY };
 
     auto existing = resident_.find(cell);
     if (existing != resident_.end()) {
         existing->second.evictionPending = false;
-        return true;
+        return CompositeAdmissionResult::AlreadyResident;
+    }
+
+    if (dxt1Bytes == nullptr || !validatePayload(msg)) {
+        return CompositeAdmissionResult::UploadFailed;
     }
 
     const std::uint32_t cellBytes = msg.byteLength;
     const std::uint64_t admissionBudget = static_cast<std::uint64_t>(budgetBytes_) +
         (isTransitionTarget(cell) ? cellBytes : 0u);
     if (static_cast<std::uint64_t>(residentBytes_) + cellBytes > admissionBudget) {
-        return false;
+        return CompositeAdmissionResult::BudgetRejected;
     }
 
     IDirect3DTexture9* tex = nullptr;
     if (!uploadDXT1(msg, dxt1Bytes, &tex)) {
-        return false;
+        return CompositeAdmissionResult::UploadFailed;
     }
 
     ResidentComposite rc = {};
@@ -243,7 +299,12 @@ bool ResidentCompositeCache::admit(const CompositeChunkMsg& msg, const std::uint
     rc.bytes = cellBytes;
     resident_.emplace(cell, rc);
     residentBytes_ += cellBytes;
-    return true;
+    return CompositeAdmissionResult::Admitted;
+}
+
+bool ResidentCompositeCache::admit(const CompositeChunkMsg& msg,
+                                   const std::uint8_t* dxt1Bytes) {
+    return compositeAdmissionSucceeded(admitWithResult(msg, dxt1Bytes));
 }
 
 IDirect3DTexture9* ResidentCompositeCache::lookup(CellId cell) const {

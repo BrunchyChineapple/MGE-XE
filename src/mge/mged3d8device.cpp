@@ -363,8 +363,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             DistantLand::renderStage1();
 #else
             // RTX: Render grass via FFP (stage1's shader-based grass is incompatible)
-            if (DistantLand::isDistantCell()) {
-                DistantLand::cullGrass(&DistantLand::mwView, &DistantLand::mwProj);
+            if (DistantLand::isDistantCell() &&
+                DistantLand::canDrawDistantVisibility()) {
+                if (DistantLand::canRefreshDistantVisibility()) {
+                    DistantLand::cullGrass(&DistantLand::mwView, &DistantLand::mwProj);
+                }
                 if (Configuration.MGEFlags & USE_GRASS) {
                     DistantLand::renderGrassFFP();
                 }
@@ -382,6 +385,10 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             if (distantWater) {
                 DistantLand::renderStageWaterFFP();
             }
+
+            // Composite streaming is the last shared-memory command in scene 0. The next
+            // frame polls it before any worldspace or visibility RPC is allowed to run.
+            DistantLand::issueCompositeStreamBatch();
 #endif
         } else if (!isFrameComplete) {
             // Everything else except UI

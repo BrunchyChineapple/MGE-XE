@@ -52,15 +52,33 @@ struct RenderMesh {
     bool    cellValid;
 };
 
-// One per cell newly entering the Visible_Cell_Set, streamed server -> client by the
-// StreamVisibleComposites command. The compressed DXT1 bytes (byteLength, incl. mips)
-// follow in the shared-memory window referenced by the IPC::Vec<CompositeChunkMsg>
-// element; this header carries only the cell identity and shape. Pure fixed-width
-// record so the 32-bit client and 64-bit server agree on layout under #pragma pack(4).
+// Composite transport outcomes are explicit: only NotFound is safe to negative-cache.
+enum class CompositeCellStatus : uint32_t {
+    Found,
+    NotFound,
+    Deferred,
+    Error,
+};
+
+enum class CompositeBatchStatus : uint32_t {
+    Pending,
+    Complete,
+    Inactive,
+    InvalidVectors,
+    OutputExhausted,
+};
+
+constexpr uint32_t kCompositeStreamBatchBytes = 3u * 1024u * 1024u;
+constexpr uint32_t kCompositeMaxEdgeTexels = 4096u;
+constexpr uint32_t kCompositeMaxPayloadBytes = 16u * 1024u * 1024u;
+
+// One response per requested cell. Found responses consume byteLength bytes from the parallel
+// byte channel; every other status has a zero byteLength and carries no payload.
 struct CompositeChunkMsg {
     int32_t  cellX, cellY;
     uint32_t edgeTexels;
-    uint32_t byteLength;        // DXT1 + mips
+    uint32_t byteLength;
+    CompositeCellStatus status;
 };
 
 // Delta element sent client -> server in the StreamVisibleComposites request: one cell
@@ -211,17 +229,13 @@ namespace IPC {
         IN D3DXVECTOR4 viewSphere;
     };
 
-    // StreamVisibleComposites request parameters (Composite_Streamer). The client fills
-    // `delta` (a Vec<CompositeCellId> of cells newly entering the Visible_Cell_Set this
-    // frame), and the server appends one CompositeChunkMsg header per resolved cell to
-    // `outHeaders` and that cell's compressed DXT1 + mip blob to `outBytes`, in matching
-    // order. All three are shared-vector ids (the byte channel carries the variable-length
-    // payload that a fixed-stride header vec cannot inline). For an Old_Format / inert pool
-    // the server leaves both output channels empty (Req 4.6).
+    // The server returns one explicit per-cell outcome and a batch-level completion status.
+    // Only CompositeCellStatus::Found contributes bytes to outBytes.
     struct StreamCompositesParameters {
-        IN  VecId delta;        // Vec<CompositeCellId>: newly-visible cells
-        OUT VecId outHeaders;   // Vec<CompositeChunkMsg>: one per streamed cell
-        OUT VecId outBytes;     // Vec<uint8_t>: concatenated DXT1 blobs, byteLength each
+        IN  VecId delta;
+        OUT VecId outHeaders;
+        OUT VecId outBytes;
+        OUT CompositeBatchStatus result;
     };
 
     struct RetainedCatalogParameters {

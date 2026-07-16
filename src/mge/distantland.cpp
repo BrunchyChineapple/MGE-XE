@@ -725,8 +725,16 @@ void DistantLand::renderStage0() {
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    // Update current cell and select distant static set
-    selectDistantCell();
+    // A composite batch may still own the single IPC lane from the prior frame. Poll it
+    // before selectDistantCell(), which can itself issue worldspace and catalog commands.
+#ifdef MGE_RTX
+    const bool refreshDistantVisibility = pollCompositeStreamBatch();
+#else
+    const bool refreshDistantVisibility = true;
+#endif
+    if (refreshDistantVisibility) {
+        selectDistantCell();
+    }
 
     // Get Morrowind camera matrices
     device->GetTransform(D3DTS_VIEW, &mwView);
@@ -741,6 +749,11 @@ void DistantLand::renderStage0() {
         mwProj,
         kDistantNearPlane,
         Configuration.DL.DrawDist * kCellSize);
+    if (mwBridge->IsExterior()) {
+        RetainedWorld::prepareCompositeTransition(eyePos, mwView, compositeCache);
+    }
+    streamAndReconcileComposites();
+    const bool drawDistantVisibility = canDrawDistantVisibility();
 #endif
     adjustFog();
 #ifdef MGE_RTX
@@ -761,8 +774,10 @@ void DistantLand::renderStage0() {
             effect->BeginPass(PASS_SETUP);
             effect->EndPass();
 
-            // Shadow map early render
-            if (Configuration.MGEFlags & USE_SHADOWS) {
+            // Shadow culls share the same IPC lane and visibility vectors as the main pass.
+            // Keep the previous shadow map while a composite batch owns that lane.
+            if (refreshDistantVisibility &&
+                (Configuration.MGEFlags & USE_SHADOWS)) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     renderShadowMap();
@@ -782,24 +797,21 @@ void DistantLand::renderStage0() {
 #ifdef MGE_RTX
                 // RTX Remix: Use fixed-function pipeline for distant land rendering.
                 // Remix can't extract proper textures from D3DX effect shaders.
-                if (mwBridge->IsExterior()) {
-                    // Architecture B (task 8.5): reconcile the per-cell composite residency for
-                    // this frame BEFORE the distant-land draw, so renderDistantLandFFP's
-                    // per-chunk Texture_Binder sees freshly-streamed composites and the
-                    // newly-evicted cells are gone. A no-op unless a New_Format composite pool
-                    // loaded (hasCompositeSet); Old_Format / stock stays on the atlas (Req 4.6).
-                    RetainedWorld::prepareCompositeTransition(eyePos, mwView, compositeCache);
-                    streamAndReconcileComposites();
+                if (mwBridge->IsExterior() && drawDistantVisibility) {
                     RetainedWorld::reconcile(eyePos, mwView, compositeCache);
                     // Distant land terrain is sourced from the heightmap and always
                     // renders here; this draw also couples culling (visLand) with the
                     // draw and feeds the depth pass.
-                    renderDistantLandFFP();
+                    renderDistantLandFFP(refreshDistantVisibility);
                 }
 
                 if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
-                    cullDistantStatics(&mwView, &distProj);
-                    renderDistantStaticsFFP();
+                    if (drawDistantVisibility) {
+                        if (refreshDistantVisibility) {
+                            cullDistantStatics(&mwView, &distProj);
+                        }
+                        renderDistantStaticsFFP();
+                    }
                 }
                 else {
                     visDistant.RemoveAll();

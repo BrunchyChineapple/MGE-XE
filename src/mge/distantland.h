@@ -129,16 +129,6 @@ public:
     static IPC::VecView<CompositeChunkMsg> compositeHeadersView;
     static IPC::VecView<std::uint8_t> compositeBytesView;
     static std::uint32_t compositeDefaultEdge;
-    // NEW (additive; Architecture B telemetry, task 11.2). Change-detection signature for the
-    // Visible_Cell_Set, so Composite_Telemetry is emitted only WHEN the visible set changes
-    // (Req 8.1/8.2/8.4) rather than rewriting the sidecar every frame. compositeVisibleSig is
-    // an order-independent hash of the current frame's visible cells (XOR/additive fold, so it
-    // is independent of unordered_set iteration order); compositeVisibleSigValid is false until
-    // the first New_Format frame emits, forcing that first emit. Both stay untouched on
-    // Old_Format / inert frames (streamAndReconcileComposites early-returns), so no sidecar is
-    // ever written and the distant land is bit-identical to stock.
-    static bool compositeVisibleSigValid;
-    static std::uint64_t compositeVisibleSig;
     // Default Texture_Memory_Budget in megabytes (design Req 7.2 / 7.4: 64 MB caps the
     // Draw_Distance=2, 1024^2 DXT1 worst-case resident ring at or below 64 MB).
     static constexpr std::uint32_t kCompositeBudgetMB = 64;
@@ -232,15 +222,15 @@ public:
     // Texture_Memory_Budget, and allocates the three StreamVisibleComposites shared channels.
     // On Old_Format / inert it leaves everything off so the renderer stays on the atlas.
     static void initCompositeStreaming(bool hasComposites, std::uint32_t cellCount, std::uint32_t defaultEdgeTexels);
-    // NEW (additive; Architecture B, task 8.5). Per-frame IPC-client composite residency.
-    // Derives the Visible_Cell_Set from the SAME parameters the distant-land cull uses
-    // (eye position + Draw_Distance * kCellSize viewsphere), requests the delta
-    // (newVisible \ resident) via StreamVisibleComposites, admits the streamed CompositeChunkMsg
-    // blobs into compositeCache, evicts cells that left the set, and tallies the atlas-served
-    // count for telemetry. A no-op unless hasCompositeSet (Old_Format / inert / non-IPC stay
-    // bit-identical to stock). Reuses the cull's viewsphere; it does NOT run a second quadtree
-    // traversal (the client's RenderMesh cull output carries no per-chunk cell identity).
+    // Poll the prior low-priority batch before any frame-critical IPC. False means the
+    // previous visibility sets must be reused for this frame.
+    static bool pollCompositeStreamBatch();
+    // Reconcile completed results and prepare, but do not issue, the next bounded batch.
     static void streamAndReconcileComposites();
+    static bool canRefreshDistantVisibility();
+    static bool canDrawDistantVisibility();
+    // Issue the prepared batch after terrain, static, and grass visibility work is complete.
+    static void issueCompositeStreamBatch();
     static bool initDistantStaticsClient();
     static bool initShadow();
     static bool initGrass();
@@ -295,7 +285,7 @@ public:
 #ifdef MGE_RTX
     // Fixed-function pipeline rendering for RTX Remix
     static void renderDistantStaticsFFP();
-    static void renderDistantLandFFP();
+    static void renderDistantLandFFP(bool refreshVisibility);
     static void renderGrassFFP();
     static void releaseFFPBuffers();
 #endif

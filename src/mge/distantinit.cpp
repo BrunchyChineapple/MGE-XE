@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <new>
 #include <vector>
 
 #ifdef MGE_RTX
@@ -91,11 +92,81 @@ IPC::VecView<CompositeCellId> DistantLand::compositeDeltaView;
 IPC::VecView<CompositeChunkMsg> DistantLand::compositeHeadersView;
 IPC::VecView<std::uint8_t> DistantLand::compositeBytesView;
 std::uint32_t DistantLand::compositeDefaultEdge = 0;
-// NEW (additive; Architecture B telemetry, task 11.2). Visible_Cell_Set change-detection state.
-// Default to "no prior signature" so the first New_Format frame always emits a telemetry record;
-// thereafter the sidecar is rewritten only when the visible set's signature changes (Req 8.1).
-bool DistantLand::compositeVisibleSigValid = false;
-std::uint64_t DistantLand::compositeVisibleSig = 0;
+
+namespace {
+
+struct CompositeInFlightBatch {
+    bool active = false;
+    bool timeoutReported = false;
+    bool waitErrorReported = false;
+    std::uint32_t ageFrames = 0;
+    std::uint64_t sessionGeneration = 0;
+    std::uint64_t channelGeneration = 0;
+    std::uint64_t cacheGeneration = 0;
+    std::vector<CellId> cells;
+};
+
+std::uint64_t s_compositeChannelGeneration = 0;
+constexpr std::uint32_t kMaxCompositeStaleVisibilityFrames = 4;
+CompositeRequestController s_compositeRequestController;
+CompositeTelemetry::Reporter s_compositeTelemetryReporter;
+VisibleCellSet s_previousCompositeVisible;
+bool s_previousCompositeVisibleValid = false;
+std::uint64_t s_observedCompositeCacheGeneration = 0;
+std::uint64_t s_observedCompositeSessionGeneration = 0;
+std::uint64_t s_observedCompositeChannelGeneration = 0;
+CompositeInFlightBatch s_compositeInFlight;
+bool s_compositeTransportFailed = false;
+bool s_refreshDistantVisibility = true;
+std::uint32_t s_distantVisibilityStaleFrames = 0;
+const void* s_distantVisibilityCell = nullptr;
+bool s_distantVisibilityCellValid = false;
+CompositeTelemetry::FrameSample s_compositePreflightSample;
+CompositeTelemetry::FrameSample s_preparedCompositeSample;
+std::vector<CellId> s_preparedCompositeCells;
+bool s_preparedCompositeVisibleSetChanged = false;
+bool s_preparedCompositeFrameReady = false;
+
+void clearCompositeInFlight() {
+    s_compositeInFlight.active = false;
+    s_compositeInFlight.timeoutReported = false;
+    s_compositeInFlight.waitErrorReported = false;
+    s_compositeInFlight.ageFrames = 0;
+    s_compositeInFlight.sessionGeneration = 0;
+    s_compositeInFlight.channelGeneration = 0;
+    s_compositeInFlight.cacheGeneration = 0;
+    s_compositeInFlight.cells.clear();
+}
+
+void resetCompositeControllerState() {
+    s_compositeRequestController.reset();
+    s_compositeTelemetryReporter.reset();
+    s_previousCompositeVisible.clear();
+    s_previousCompositeVisibleValid = false;
+    s_distantVisibilityCell = nullptr;
+    s_distantVisibilityCellValid = false;
+    s_preparedCompositeCells.clear();
+    s_preparedCompositeFrameReady = false;
+}
+
+std::uint64_t compositeElapsedMicros(const LARGE_INTEGER& start) {
+    static const LARGE_INTEGER frequency = []() {
+        LARGE_INTEGER value = {};
+        QueryPerformanceFrequency(&value);
+        return value;
+    }();
+
+    LARGE_INTEGER end = {};
+    QueryPerformanceCounter(&end);
+    if (frequency.QuadPart <= 0 || end.QuadPart <= start.QuadPart) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(
+        ((end.QuadPart - start.QuadPart) * 1000000ll) / frequency.QuadPart);
+}
+
+}  // namespace
+
 IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texDistantBlend;
@@ -1274,6 +1345,17 @@ bool DistantLand::initLandscapeClient() {
 // absent / malformed / inert load leaves the cache empty, allocates no channels, and keeps
 // the distant land bit-identical to stock (Req 4.6, 6.2).
 void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellCount, std::uint32_t defaultEdgeTexels) {
+    ++s_compositeChannelGeneration;
+    if (s_compositeChannelGeneration == 0) {
+        ++s_compositeChannelGeneration;
+    }
+
+    compositeDeltaView = IPC::VecView<CompositeCellId>();
+    compositeHeadersView = IPC::VecView<CompositeChunkMsg>();
+    compositeBytesView = IPC::VecView<std::uint8_t>();
+    compositeDeltaSharedId = IPC::InvalidVector;
+    compositeHeadersSharedId = IPC::InvalidVector;
+    compositeBytesSharedId = IPC::InvalidVector;
     hasCompositeSet = false;
     compositeDefaultEdge = 0;
 
@@ -1283,13 +1365,23 @@ void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellC
         return;
     }
 
+    const std::uint32_t defaultEdge = defaultEdgeTexels ? defaultEdgeTexels : 1024;
+    const std::uint32_t cellBytesEstimate =
+        ResidentCompositeCache::compositeBytes(defaultEdge);
+    if (defaultEdge > kCompositeMaxEdgeTexels || cellBytesEstimate == 0 ||
+        cellBytesEstimate > kCompositeMaxPayloadBytes) {
+        LOG::logline(
+            "!! Composite streaming rejected invalid default shape: edge=%u bytes=%u",
+            defaultEdge, cellBytesEstimate);
+        return;
+    }
+
     // New_Format: bind the resident cache to the same D3D9 device that feeds Remix and set the
     // default Texture_Memory_Budget (Req 7.2; 64 MB caps the Draw_Distance=2, 1024^2 worst case
-    // at or below 64 MB, Req 7.4). The configured per-cell resolution is the server-reported
-    // default; it estimates each cell's budget cost in the cache's admission rule.
+    // at or below 64 MB, Req 7.4).
     compositeCache.init(device);
     compositeCache.setBudgetMB(kCompositeBudgetMB);
-    compositeDefaultEdge = defaultEdgeTexels ? defaultEdgeTexels : 1024;
+    compositeDefaultEdge = defaultEdge;
 
     // Allocate the three StreamVisibleComposites shared channels, mirroring the visible-mesh
     // vectors allocated in initIpc(). The delta channel carries the per-frame newVisible \
@@ -1299,12 +1391,11 @@ void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellC
     // shared memory only grows as cells actually stream.
     auto maybeDelta = ipcClient.allocVecBlocking<CompositeCellId>(256, 65536, 1);
     auto maybeHeaders = ipcClient.allocVecBlocking<CompositeChunkMsg>(256, 65536, 1);
-    // The byte channel must hold a frame's worth of compressed cells: a generous ring of cells
-    // at the default edge (DXT1 + mips ~= edge^2 * 2/3 bytes each). Reserve a large maximum so a
-    // big visible set never overflows the channel; only touched pages are committed.
-    const std::uint32_t cellBytesEstimate =
-        std::max<std::uint32_t>(1u, ResidentCompositeCache::compositeBytes(compositeDefaultEdge));
-    auto maybeBytes = ipcClient.allocVecBlocking<std::uint8_t>(cellBytesEstimate, cellBytesEstimate * 128, cellBytesEstimate);
+    // The server enforces a 3 MiB normal batch and permits one supported oversized first
+    // payload. Reserving the protocol maximum therefore covers every valid response without
+    // estimate multiplication or 32-bit overflow.
+    auto maybeBytes = ipcClient.allocVecBlocking<std::uint8_t>(
+        cellBytesEstimate, kCompositeMaxPayloadBytes, cellBytesEstimate);
 
     if (!maybeDelta.has_value() || !maybeHeaders.has_value() || !maybeBytes.has_value()) {
         LOG::logline("!! Failed to allocate composite streaming channels; using single atlas");
@@ -1338,6 +1429,105 @@ void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellC
                  cellCount, compositeDefaultEdge, kCompositeBudgetMB);
 }
 
+bool DistantLand::pollCompositeStreamBatch() {
+    s_compositePreflightSample = CompositeTelemetry::FrameSample{};
+    s_preparedCompositeFrameReady = false;
+    s_preparedCompositeCells.clear();
+    s_refreshDistantVisibility = true;
+
+    const std::uint64_t sessionGeneration = ipcClient.sessionGeneration();
+    const std::uint64_t cacheGeneration = compositeCache.generation();
+    const bool transportEpochChanged =
+        s_observedCompositeSessionGeneration != sessionGeneration ||
+        s_observedCompositeChannelGeneration != s_compositeChannelGeneration;
+    if (transportEpochChanged) {
+        if (s_compositeInFlight.active) {
+            LOG::logline(
+                "-- Retiring composite batch from replaced IPC epoch: session=%llu channel=%llu",
+                static_cast<unsigned long long>(s_compositeInFlight.sessionGeneration),
+                static_cast<unsigned long long>(s_compositeInFlight.channelGeneration));
+        }
+        clearCompositeInFlight();
+        resetCompositeControllerState();
+        s_compositeTransportFailed = false;
+        s_observedCompositeSessionGeneration = sessionGeneration;
+        s_observedCompositeChannelGeneration = s_compositeChannelGeneration;
+        s_observedCompositeCacheGeneration = cacheGeneration;
+    }
+
+    if (s_compositeTransportFailed) {
+        s_refreshDistantVisibility = false;
+        return false;
+    }
+    if (!s_compositeInFlight.active) {
+        s_distantVisibilityStaleFrames = 0;
+        return true;
+    }
+
+    LARGE_INTEGER pollStart = {};
+    QueryPerformanceCounter(&pollStart);
+    const IPC::WakeReason result = ipcClient.pollForCompletion();
+    s_compositePreflightSample.rpcWaitUs += compositeElapsedMicros(pollStart);
+
+    switch (result) {
+    case IPC::WakeReason::Complete:
+        // Completion state and output vectors remain retained until reconcile consumes them.
+        s_distantVisibilityStaleFrames = 0;
+        return true;
+    case IPC::WakeReason::ServerLost:
+        ++s_compositePreflightSample.rpcFailures;
+        ++s_compositePreflightSample.batchFailures;
+        for (const CellId& cell : s_compositeInFlight.cells) {
+            s_compositeRequestController.markRetry(cell);
+        }
+        clearCompositeInFlight();
+        s_compositeTransportFailed = true;
+        LOG::logline(
+            "!! Composite IPC host lost; suppressing distant visibility until a new IPC session starts");
+        break;
+    case IPC::WakeReason::Error:
+        ++s_compositePreflightSample.rpcFailures;
+        ++s_compositePreflightSample.batchFailures;
+        for (const CellId& cell : s_compositeInFlight.cells) {
+            s_compositeRequestController.markRetry(cell);
+        }
+        clearCompositeInFlight();
+        s_compositeTransportFailed = true;
+        LOG::logline(
+            "!! Composite IPC wait failed; channel quarantined until IPC session replacement");
+        break;
+    case IPC::WakeReason::Timeout:
+    case IPC::WakeReason::Update:
+    default:
+        break;
+    }
+
+    s_refreshDistantVisibility = false;
+    // Visibility staleness spans sequential composite batches; per-batch age can be cleared
+    // by the reconcile poll before this frame reaches the draw gate.
+    if (!s_compositeTransportFailed && s_compositeInFlight.active &&
+        s_distantVisibilityStaleFrames < std::numeric_limits<std::uint32_t>::max()) {
+        ++s_distantVisibilityStaleFrames;
+    }
+    return false;
+}
+
+bool DistantLand::canRefreshDistantVisibility() {
+    return s_refreshDistantVisibility;
+}
+
+bool DistantLand::canDrawDistantVisibility() {
+    if (!hasCompositeSet || !Configuration.UseSharedMemory ||
+        s_refreshDistantVisibility) {
+        return true;
+    }
+    if (s_compositeTransportFailed || !s_distantVisibilityCellValid ||
+        s_distantVisibilityCell != MWBridge::get()->getPlayerCell()) {
+        return false;
+    }
+    return s_distantVisibilityStaleFrames <= kMaxCompositeStaleVisibilityFrames;
+}
+
 // Architecture B (task 8.5): per-frame IPC-client composite residency reconcile. Mirrors the
 // authoritative model tests/composite_stream_model.py (reconcile + budget admission +
 // telemetry tally): derive the Visible_Cell_Set, stream newVisible \ resident, admit the
@@ -1345,133 +1535,537 @@ void DistantLand::initCompositeStreaming(bool hasComposites, std::uint32_t cellC
 // and record the atlas-served count. A no-op for Old_Format / inert / non-IPC loads.
 void DistantLand::streamAndReconcileComposites() {
     if (!hasCompositeSet || !Configuration.UseSharedMemory) {
-        return;  // Old_Format / inert: binder stays on the atlas (Req 4.6, 6.1).
+        return;
     }
 
-    // --- Derive the Visible_Cell_Set from the SAME cull parameters the renderer uses ---------
-    // The distant-land cull builds a viewsphere of (eyePos, Draw_Distance * kCellSize) and a
-    // frustum (renderDistantLandFFP / renderDistantLand). The client's RenderMesh cull output
-    // carries no per-chunk cell identity, so we reuse the cull's viewsphere directly: every
-    // exterior cell whose square overlaps the eye-centred Draw_Distance ring is required
-    // resident this frame. This is the same ring the server streams against; we do NOT run a
-    // second quadtree traversal.
+    static constexpr std::uint32_t kMaxRequestCellsPerFrame = 4;
+    static constexpr std::uint32_t kInFlightWarningFrames = 60;
+
+    auto& requestController = s_compositeRequestController;
+    auto& previousVisible = s_previousCompositeVisible;
+    auto& previousVisibleValid = s_previousCompositeVisibleValid;
+    auto& observedCacheGeneration = s_observedCompositeCacheGeneration;
+    auto& inFlight = s_compositeInFlight;
+
+    const std::uint64_t cacheGeneration = compositeCache.generation();
+    if (observedCacheGeneration != cacheGeneration) {
+        requestController.reset();
+        s_compositeTelemetryReporter.reset();
+        previousVisible.clear();
+        previousVisibleValid = false;
+        observedCacheGeneration = cacheGeneration;
+    }
+
+    static const LARGE_INTEGER qpcFrequency = []() {
+        LARGE_INTEGER frequency = {};
+        QueryPerformanceFrequency(&frequency);
+        return frequency;
+    }();
+    const auto elapsedMicros = [&](const LARGE_INTEGER& start) -> std::uint64_t {
+        LARGE_INTEGER end = {};
+        QueryPerformanceCounter(&end);
+        if (qpcFrequency.QuadPart <= 0 || end.QuadPart <= start.QuadPart) {
+            return 0;
+        }
+        return static_cast<std::uint64_t>(
+            ((end.QuadPart - start.QuadPart) * 1000000ll) / qpcFrequency.QuadPart);
+    };
+
+    LARGE_INTEGER reconcileStart = {};
+    QueryPerformanceCounter(&reconcileStart);
+
     const float drawDistCells = std::max(1.0f, Configuration.DL.DrawDist);
     const int ring = static_cast<int>(std::ceil(drawDistCells));
     const int eyeCellX = static_cast<int>(std::floor(eyePos.x / kCellSize));
     const int eyeCellY = static_cast<int>(std::floor(eyePos.y / kCellSize));
+    const bool exterior = MWBridge::get()->IsExterior();
 
     VisibleCellSet visible;
-    visible.reserve(static_cast<std::size_t>((2 * ring + 1) * (2 * ring + 1)));
-    for (int dy = -ring; dy <= ring; ++dy) {
-        for (int dx = -ring; dx <= ring; ++dx) {
-            visible.insert(CellId{ eyeCellX + dx, eyeCellY + dy });
+    if (exterior) {
+        visible.reserve(static_cast<std::size_t>((2 * ring + 1) * (2 * ring + 1)));
+        for (int dy = -ring; dy <= ring; ++dy) {
+            for (int dx = -ring; dx <= ring; ++dx) {
+                visible.insert(CellId{ eyeCellX + dx, eyeCellY + dy });
+            }
         }
+        compositeCache.includeTransitionTargets(visible);
+    } else {
+        compositeCache.setTransitionTargets({});
     }
-    // Hysteresis can keep the retained anchor just outside the raw eye-centred ring.
-    // Retained targets are required inputs even when the legacy cull would omit them.
-    compositeCache.includeTransitionTargets(visible);
     const std::uint32_t visibleCount = static_cast<std::uint32_t>(visible.size());
 
-    // Free stale unpinned entries before admission. A retained material may keep one
-    // off-screen cell pinned; the cache grants one bounded incoming-cell allowance until
-    // that deferred eviction completes after the retained pair commits.
-    compositeCache.evictNotVisible(visible);
-
-    // Retained targets are requested first so only target composites can consume the
-    // one-cell transition allowance. Remaining visible cells use the steady budget.
-    compositeDeltaView.clear();
-    const auto appendMissing = [&](bool transitionTargets) {
-        for (const CellId& cell : visible) {
-            if (compositeCache.isTransitionTarget(cell) != transitionTargets ||
-                compositeCache.lookup(cell) != nullptr) {
-                continue;
-            }
-            CompositeCellId wire;
-            wire.cellX = cell.x;
-            wire.cellY = cell.y;
-            if (!compositeDeltaView.push_back(wire)) {
-                return false;
-            }
-        }
-        return true;
-    };
-    if (appendMissing(true)) {
-        appendMissing(false);
+    const bool visibleSetChanged = !previousVisibleValid || visible != previousVisible;
+    if (visibleSetChanged) {
+        previousVisible = visible;
+        previousVisibleValid = true;
     }
 
-    // --- Issue StreamVisibleComposites and wait for the server to fill the OUT channels ------
-    compositeHeadersView.clear();
-    compositeBytesView.clear();
-    if (compositeDeltaView.size() > 0) {
-        if (ipcClient.streamVisibleComposites(
-                compositeDeltaSharedId,
-                compositeHeadersSharedId,
-                compositeBytesSharedId) &&
-            ipcClient.waitForCompletion() == IPC::WakeReason::Complete) {
+    compositeCache.evictNotVisible(visible);
+    requestController.beginFrame(
+        visible, visibleSetChanged, compositeCache.residentBytes(),
+        compositeCache.budgetBytes());
 
-            // --- Admit each streamed cell, consuming byteLength bytes per header in lockstep --
-            // The server wrote one CompositeChunkMsg header per resolved cell to the header
-            // channel and that cell's compressed DXT1 + mip blob to the byte channel in matching
-            // order (ipc/server.cpp streamVisibleComposites). Walk the headers, slicing the byte
-            // channel by byteLength, and admit each into the cache. admit() enforces the budget
-            // and returns false on over-budget / upload failure -> the binder falls back to the
-            // atlas for that cell (Req 4.3, 7.2, 7.3, 7.5, 6.4).
-            const std::uint32_t headerCount = compositeHeadersView.size();
-            const std::uint32_t totalBytes = compositeBytesView.size();
-            std::uint32_t byteCursor = 0;
-            std::vector<std::uint8_t> blob;
+    CompositeTelemetry::FrameSample frameSample = s_compositePreflightSample;
+    frameSample.visibleCount = visibleCount;
+
+    const auto clearInFlight = [&]() {
+        clearCompositeInFlight();
+    };
+
+    const auto retryCells = [&](const std::vector<CellId>& cells) {
+        for (const CellId& cell : cells) {
+            if (visible.find(cell) != visible.end()) {
+                requestController.markRetry(cell);
+            }
+        }
+    };
+
+    const auto completeInFlight = [&]() {
+        CompositeBatchStatus batchStatus = CompositeBatchStatus::Pending;
+        const bool hasBatchResult = ipcClient.takeCompositeStreamResult(batchStatus);
+        if (inFlight.sessionGeneration != ipcClient.sessionGeneration() ||
+            inFlight.channelGeneration != s_compositeChannelGeneration ||
+            inFlight.cacheGeneration != compositeCache.generation()) {
+            clearInFlight();
+            return;
+        }
+
+        const std::uint32_t headerCount = compositeHeadersView.size();
+        const std::uint32_t totalBytes = compositeBytesView.size();
+        frameSample.responseBytes += totalBytes;
+
+        struct ParsedOutcome {
+            CompositeChunkMsg message;
+            std::uint32_t byteOffset;
+        };
+
+        const std::unordered_set<CellId, CellIdHash> requestedSet(
+            inFlight.cells.begin(), inFlight.cells.end());
+        std::unordered_set<CellId, CellIdHash> returnedCells;
+        std::vector<ParsedOutcome> outcomes;
+        std::uint64_t byteCursor = 0;
+        std::uint32_t largestPayload = 0;
+        bool responseWellFormed = hasBatchResult &&
+            headerCount <= inFlight.cells.size() &&
+            totalBytes <= kCompositeMaxPayloadBytes;
+        bool processOutcomes = false;
+        bool batchFailed = false;
+
+        if (responseWellFormed) {
+            switch (batchStatus) {
+            case CompositeBatchStatus::Complete:
+                processOutcomes = true;
+                break;
+            case CompositeBatchStatus::OutputExhausted:
+                processOutcomes = true;
+                batchFailed = true;
+                break;
+            case CompositeBatchStatus::Inactive:
+            case CompositeBatchStatus::InvalidVectors:
+                batchFailed = true;
+                responseWellFormed = headerCount == 0 && totalBytes == 0;
+                break;
+            case CompositeBatchStatus::Pending:
+            default:
+                batchFailed = true;
+                responseWellFormed = false;
+                break;
+            }
+        } else {
+            batchFailed = true;
+        }
+
+        if (responseWellFormed && processOutcomes) {
+            returnedCells.reserve(headerCount);
+            outcomes.reserve(headerCount);
             for (std::uint32_t h = 0; h < headerCount; ++h) {
                 const CompositeChunkMsg msg = compositeHeadersView[h];
-
-                // Guard against a desynced/short byte channel before reading the slice.
-                if (msg.byteLength == 0 ||
-                    static_cast<std::uint64_t>(byteCursor) + msg.byteLength > totalBytes) {
+                const CellId cell{ msg.cellX, msg.cellY };
+                if (requestedSet.find(cell) == requestedSet.end() ||
+                    !returnedCells.insert(cell).second) {
+                    responseWellFormed = false;
                     break;
                 }
 
-                // Copy this cell's contiguous blob out of the windowed byte channel into a
-                // flat buffer for admit() (the channel is not guaranteed contiguous across
-                // window boundaries, so element-wise read is the safe idiom).
-                blob.resize(msg.byteLength);
-                for (std::uint32_t b = 0; b < msg.byteLength; ++b) {
-                    blob[b] = compositeBytesView[byteCursor + b];
+                switch (msg.status) {
+                case CompositeCellStatus::Found:
+                    if (!ResidentCompositeCache::validatePayload(msg) ||
+                        byteCursor + msg.byteLength > totalBytes) {
+                        responseWellFormed = false;
+                    } else {
+                        outcomes.push_back(ParsedOutcome{
+                            msg, static_cast<std::uint32_t>(byteCursor) });
+                        byteCursor += msg.byteLength;
+                        largestPayload = std::max(largestPayload, msg.byteLength);
+                    }
+                    break;
+                case CompositeCellStatus::NotFound:
+                case CompositeCellStatus::Deferred:
+                case CompositeCellStatus::Error:
+                    if (msg.byteLength != 0) {
+                        responseWellFormed = false;
+                    } else {
+                        outcomes.push_back(ParsedOutcome{
+                            msg, static_cast<std::uint32_t>(byteCursor) });
+                    }
+                    break;
+                default:
+                    responseWellFormed = false;
+                    break;
                 }
-                byteCursor += msg.byteLength;
-
-                compositeCache.admit(msg, blob.data());
+                if (!responseWellFormed) {
+                    break;
+                }
             }
+
+            if (byteCursor != totalBytes ||
+                (batchStatus == CompositeBatchStatus::Complete &&
+                 returnedCells.size() != requestedSet.size())) {
+                responseWellFormed = false;
+            }
+        }
+
+        if (!responseWellFormed) {
+            batchFailed = true;
+            ++frameSample.malformedResponses;
+            LOG::logline(
+                "!! Composite stream response malformed: requested=%u headers=%u bytes=%u consumed=%llu status=%u",
+                static_cast<unsigned>(inFlight.cells.size()), headerCount, totalBytes,
+                static_cast<unsigned long long>(byteCursor),
+                static_cast<unsigned>(batchStatus));
+        }
+        if (batchFailed) {
+            ++frameSample.batchFailures;
+        }
+
+        if (!responseWellFormed || !processOutcomes) {
+            retryCells(inFlight.cells);
+            clearInFlight();
+            return;
+        }
+
+        std::vector<std::uint8_t> blob;
+        try {
+            blob.resize(largestPayload);
+        } catch (const std::bad_alloc&) {
+            ++frameSample.uploadFailed;
+            if (!batchFailed) {
+                ++frameSample.batchFailures;
+            }
+            LOG::logline(
+                "!! Composite stream response allocation failed: bytes=%u",
+                largestPayload);
+            retryCells(inFlight.cells);
+            clearInFlight();
+            return;
+        }
+
+        frameSample.responseCells += static_cast<std::uint32_t>(outcomes.size());
+        for (const ParsedOutcome& outcome : outcomes) {
+            const CompositeChunkMsg& msg = outcome.message;
+            const CellId cell{ msg.cellX, msg.cellY };
+            const bool stillVisible = visible.find(cell) != visible.end();
+
+            switch (msg.status) {
+            case CompositeCellStatus::Found: {
+                if (!stillVisible) {
+                    break;
+                }
+                for (std::uint32_t b = 0; b < msg.byteLength; ++b) {
+                    blob[b] = compositeBytesView[outcome.byteOffset + b];
+                }
+
+                const CompositeAdmissionResult result =
+                    compositeCache.admitWithResult(msg, blob.data());
+                switch (result) {
+                case CompositeAdmissionResult::AlreadyResident:
+                    requestController.markResident(cell);
+                    break;
+                case CompositeAdmissionResult::Admitted:
+                    requestController.markResident(cell);
+                    ++frameSample.admittedCells;
+                    frameSample.admittedBytes += msg.byteLength;
+                    break;
+                case CompositeAdmissionResult::BudgetRejected:
+                    requestController.markBudgetBlocked(
+                        cell, compositeCache.isTransitionTarget(cell));
+                    ++frameSample.budgetRejected;
+                    break;
+                case CompositeAdmissionResult::UploadFailed:
+                    requestController.markRetry(cell);
+                    ++frameSample.uploadFailed;
+                    break;
+                }
+                break;
+            }
+            case CompositeCellStatus::NotFound:
+                ++frameSample.notFoundResponses;
+                if (stillVisible) {
+                    requestController.markMissing(cell);
+                }
+                break;
+            case CompositeCellStatus::Deferred:
+                ++frameSample.deferredResponses;
+                if (stillVisible) {
+                    requestController.markDeferred(cell);
+                }
+                break;
+            case CompositeCellStatus::Error:
+                ++frameSample.serverErrors;
+                if (stillVisible) {
+                    requestController.markRetry(cell);
+                }
+                break;
+            }
+        }
+
+        // OutputExhausted may omit cells for which no explicit outcome fit. Omission is never
+        // authoritative absence; only explicit NotFound enters the negative cache.
+        for (const CellId& cell : inFlight.cells) {
+            if (visible.find(cell) != visible.end() && requestController.isPending(cell)) {
+                requestController.markRetry(cell);
+            }
+        }
+        clearInFlight();
+    };
+
+    const auto pollInFlight = [&](bool advanceAge) {
+        if (!inFlight.active) {
+            return;
+        }
+        if (advanceAge && inFlight.ageFrames < std::numeric_limits<std::uint32_t>::max()) {
+            ++inFlight.ageFrames;
+        }
+
+        LARGE_INTEGER pollStart = {};
+        QueryPerformanceCounter(&pollStart);
+        const IPC::WakeReason result = ipcClient.pollForCompletion();
+        frameSample.rpcWaitUs += elapsedMicros(pollStart);
+
+        switch (result) {
+        case IPC::WakeReason::Complete:
+            completeInFlight();
+            break;
+        case IPC::WakeReason::ServerLost:
+            ++frameSample.rpcFailures;
+            ++frameSample.batchFailures;
+            retryCells(inFlight.cells);
+            clearInFlight();
+            s_compositeTransportFailed = true;
+            s_refreshDistantVisibility = false;
+            break;
+        case IPC::WakeReason::Timeout:
+            if (inFlight.ageFrames >= kInFlightWarningFrames &&
+                !inFlight.timeoutReported) {
+                inFlight.timeoutReported = true;
+                ++frameSample.rpcTimeouts;
+            }
+            break;
+        case IPC::WakeReason::Error:
+            if (!inFlight.waitErrorReported) {
+                inFlight.waitErrorReported = true;
+                ++frameSample.rpcFailures;
+                ++frameSample.batchFailures;
+            }
+            retryCells(inFlight.cells);
+            clearInFlight();
+            s_compositeTransportFailed = true;
+            s_refreshDistantVisibility = false;
+            break;
+        case IPC::WakeReason::Update:
+        default:
+            break;
+        }
+    };
+
+    // Poll before touching any shared request or response vector. Timeout/Error preserves
+    // ownership; only completion or proven host loss releases the vectors for reuse.
+    pollInFlight(true);
+
+    struct Candidate {
+        CellId cell;
+        bool transitionTarget;
+        std::int64_t distanceSq;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(visible.size());
+    for (const CellId& cell : visible) {
+        if (compositeCache.lookup(cell) != nullptr) {
+            requestController.markResident(cell);
+            continue;
+        }
+
+        const bool transitionTarget = compositeCache.isTransitionTarget(cell);
+        if (!requestController.shouldRequest(cell, transitionTarget)) {
+            continue;
+        }
+
+        const std::int64_t dx = static_cast<std::int64_t>(cell.x) - eyeCellX;
+        const std::int64_t dy = static_cast<std::int64_t>(cell.y) - eyeCellY;
+        candidates.push_back(Candidate{ cell, transitionTarget, dx * dx + dy * dy });
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const Candidate& a, const Candidate& b) {
+            if (a.transitionTarget != b.transitionTarget) {
+                return a.transitionTarget > b.transitionTarget;
+            }
+            if (a.distanceSq != b.distanceSq) {
+                return a.distanceSq < b.distanceSq;
+            }
+            if (a.cell.y != b.cell.y) {
+                return a.cell.y < b.cell.y;
+            }
+            return a.cell.x < b.cell.x;
+        });
+
+    std::vector<CellId> requestedCells;
+    requestedCells.reserve(kMaxRequestCellsPerFrame);
+    if (!inFlight.active && s_refreshDistantVisibility &&
+        !s_compositeTransportFailed) {
+        const std::uint64_t estimatedCellBytes = std::max<std::uint32_t>(
+            1u, ResidentCompositeCache::compositeBytes(compositeDefaultEdge));
+        std::uint64_t selectedBytes = 0;
+
+        for (const Candidate& candidate : candidates) {
+            if (requestedCells.size() >= kMaxRequestCellsPerFrame) {
+                break;
+            }
+            if (!requestedCells.empty() &&
+                selectedBytes + estimatedCellBytes > kCompositeStreamBatchBytes) {
+                break;
+            }
+
+            requestedCells.push_back(candidate.cell);
+            selectedBytes += estimatedCellBytes;
         }
     }
 
-    // --- Telemetry tally: cells served by the Single_Atlas_Path this frame (Req 8.4) --------
-    // Pinned off-screen entries remain in total residency accounting but do not serve this
-    // frame's visible set.
-    const std::uint32_t visibleResident = compositeCache.visibleResidentCount(visible);
+    frameSample.queuedCells = static_cast<std::uint32_t>(
+        candidates.size() > requestedCells.size()
+            ? candidates.size() - requestedCells.size()
+            : 0);
+
+    s_preparedCompositeCells.swap(requestedCells);
+
+    const std::uint32_t visibleResident =
+        compositeCache.visibleResidentCount(visible);
     compositeCache.setAtlasServedThisFrame(
         visibleCount > visibleResident ? visibleCount - visibleResident : 0);
 
-    // --- Composite_Telemetry emit on Visible_Cell_Set change (task 11.2; Req 8.1/8.2/8.4) ----
-    // The requirement is to report resident count / resident MB / atlas-served "WHEN the
-    // Visible_Cell_Set changes" — not every frame. Build an order-independent signature of this
-    // frame's visible cells (fold each cell's CellIdHash with XOR + an additive rotate so the
-    // result is independent of unordered_set iteration order) and emit only when it differs from
-    // the previous frame's signature. The counts/bytes/atlas-served tally are sourced straight
-    // from compositeCache (write(cache) pulls residentCount()/residentBytes()/
-    // atlasServedThisFrame()), reflecting the freshly-reconciled frame state above. This emit is
-    // reached only on New_Format frames: the function early-returns for Old_Format / inert /
-    // non-IPC loads, so Old_Format writes no sidecar and stays bit-identical to stock.
-    std::uint64_t sig = 0x9E3779B97F4A7C15ull ^ static_cast<std::uint64_t>(visibleCount);
-    const CellIdHash cellHasher;
-    for (const CellId& cell : visible) {
-        const std::uint64_t h = static_cast<std::uint64_t>(cellHasher(cell));
-        sig ^= h;                                  // order-independent (XOR is commutative)
-        sig += (h << 1) | (h >> 63);               // mix in a rotate so distinct sets separate
+    frameSample.reconcileUs = elapsedMicros(reconcileStart);
+    s_preparedCompositeSample = frameSample;
+    s_preparedCompositeVisibleSetChanged = visibleSetChanged;
+    s_preparedCompositeFrameReady = true;
+}
+
+void DistantLand::issueCompositeStreamBatch() {
+    if (!s_preparedCompositeFrameReady) {
+        return;
     }
-    if (!compositeVisibleSigValid || sig != compositeVisibleSig) {
-        compositeVisibleSig = sig;
-        compositeVisibleSigValid = true;
-        CompositeTelemetry::write(compositeCache);
+
+    if (s_refreshDistantVisibility) {
+        s_distantVisibilityCell = MWBridge::get()->getPlayerCell();
+        s_distantVisibilityCellValid = true;
     }
+
+    CompositeTelemetry::FrameSample& frameSample = s_preparedCompositeSample;
+    bool issued = false;
+    if (!s_preparedCompositeCells.empty()) {
+        frameSample.attemptedBatches = 1;
+        frameSample.attemptedCells =
+            static_cast<std::uint32_t>(s_preparedCompositeCells.size());
+
+        const bool epochMatches =
+            s_observedCompositeSessionGeneration == ipcClient.sessionGeneration() &&
+            s_observedCompositeChannelGeneration == s_compositeChannelGeneration;
+        if (hasCompositeSet && epochMatches && !s_compositeInFlight.active &&
+            !s_compositeTransportFailed && canDrawDistantVisibility()) {
+            LARGE_INTEGER lanePollStart = {};
+            QueryPerformanceCounter(&lanePollStart);
+            const IPC::WakeReason laneState = ipcClient.pollForCompletion();
+            frameSample.rpcWaitUs += compositeElapsedMicros(lanePollStart);
+
+            if (laneState == IPC::WakeReason::Complete) {
+                compositeDeltaView.clear();
+                bool requestWritten = true;
+                for (const CellId& cell : s_preparedCompositeCells) {
+                    CompositeCellId wire = {};
+                    wire.cellX = cell.x;
+                    wire.cellY = cell.y;
+                    if (!compositeDeltaView.push_back(wire)) {
+                        requestWritten = false;
+                        break;
+                    }
+                }
+
+                if (requestWritten) {
+                    compositeHeadersView.clear();
+                    compositeBytesView.clear();
+
+                    LARGE_INTEGER rpcStart = {};
+                    QueryPerformanceCounter(&rpcStart);
+                    const bool rpcStarted = ipcClient.streamVisibleComposites(
+                        compositeDeltaSharedId,
+                        compositeHeadersSharedId,
+                        compositeBytesSharedId);
+                    frameSample.rpcWaitUs += compositeElapsedMicros(rpcStart);
+
+                    if (rpcStarted) {
+                        for (const CellId& cell : s_preparedCompositeCells) {
+                            s_compositeRequestController.markPending(
+                                cell, compositeCache.isTransitionTarget(cell));
+                        }
+                        frameSample.issuedBatches = 1;
+                        frameSample.issuedCells = static_cast<std::uint32_t>(
+                            s_preparedCompositeCells.size());
+                        s_compositeInFlight.active = true;
+                        s_compositeInFlight.timeoutReported = false;
+                        s_compositeInFlight.waitErrorReported = false;
+                        s_compositeInFlight.ageFrames = 0;
+                        s_compositeInFlight.sessionGeneration =
+                            ipcClient.sessionGeneration();
+                        s_compositeInFlight.channelGeneration =
+                            s_compositeChannelGeneration;
+                        s_compositeInFlight.cacheGeneration =
+                            compositeCache.generation();
+                        s_compositeInFlight.cells = s_preparedCompositeCells;
+                        issued = true;
+                    } else {
+                        ++frameSample.rpcFailures;
+                        ++frameSample.batchFailures;
+                        s_compositeTransportFailed = true;
+                    }
+                } else {
+                    compositeDeltaView.clear();
+                    ++frameSample.batchFailures;
+                }
+            } else if (laneState == IPC::WakeReason::ServerLost ||
+                       laneState == IPC::WakeReason::Error) {
+                ++frameSample.rpcFailures;
+                ++frameSample.batchFailures;
+                s_compositeTransportFailed = true;
+            }
+        }
+
+        if (!issued) {
+            frameSample.queuedCells += static_cast<std::uint32_t>(
+                s_preparedCompositeCells.size());
+        }
+    }
+
+    const CompositeRequestCounts requestCounts =
+        s_compositeRequestController.counts();
+    frameSample.deferredBudget = requestCounts.budgetBlocked;
+    frameSample.deferredRetry = requestCounts.retryDeferred;
+    frameSample.missingCached = requestCounts.missing;
+    frameSample.pending = requestCounts.pending;
+
+    s_compositeTelemetryReporter.recordFrame(
+        compositeCache, frameSample, s_preparedCompositeVisibleSetChanged);
+    s_preparedCompositeCells.clear();
+    s_preparedCompositeFrameReady = false;
 }
 
 bool DistantLand::initLandscape() {
@@ -1651,12 +2245,9 @@ void DistantLand::release() {
     // re-init can't run the streamer against stale channels; the cache stays empty until the
     // next initCompositeStreaming re-activates it.
     compositeCache.releaseAll();
+    compositeCache.init(nullptr);
     hasCompositeSet = false;
     compositeDefaultEdge = 0;
-    // Reset the telemetry change-detection signature so a subsequent re-init forces a fresh
-    // emit on its first New_Format frame (task 11.2).
-    compositeVisibleSigValid = false;
-    compositeVisibleSig = 0;
 
     if (texWorldColour) {
         texWorldColour->Release();

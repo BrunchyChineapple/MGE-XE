@@ -51,6 +51,7 @@ namespace IPC {
 			HANDLE m_waitHandles[2];
 		};
 		Parameters* m_ipcParameters;
+		std::uint64_t m_sessionGeneration;
 		bool m_isRpcPending;
 		bool m_freeVecResultPending;
 		bool m_freeVecResultReady;
@@ -59,6 +60,8 @@ namespace IPC {
 		bool m_dynVisResultPending;
 		bool m_dynVisResultReady;
 		bool m_dynVisResultAccepted;
+        bool m_compositeStreamResultReady;
+        CompositeBatchStatus m_compositeStreamResult;
 		std::vector<VecId> m_deferredVecFrees;
 
 		bool beginRpc(Command command);
@@ -73,6 +76,7 @@ namespace IPC {
 
 		bool startServer(const char* executable);
 		bool isServerActive();
+        std::uint64_t sessionGeneration() const { return m_sessionGeneration; }
 
 		/**
 		* @brief Asynchronously allocate a shared vector.
@@ -246,9 +250,14 @@ namespace IPC {
 		* @param delta      ID of a Vec<CompositeCellId> the client filled with newly-visible cells.
 		* @param outHeaders ID of a Vec<CompositeChunkMsg> the server fills (one per streamed cell).
 		* @param outBytes   ID of a Vec<uint8_t> the server fills (concatenated DXT1 blobs).
-		* @return Whether the RPC was issued successfully.
+		* @return Whether the RPC was issued successfully. This low-priority call never waits
+		*         for another command; false leaves all vector ownership with the current RPC.
 		*/
 		bool streamVisibleComposites(VecId delta, VecId outHeaders, VecId outBytes);
+
+        // Consume the batch result captured when the composite RPC completed. The result is
+        // retained even if another IPC command subsequently reuses the shared parameter union.
+        bool takeCompositeStreamResult(CompositeBatchStatus& result);
 
         /**
          * @brief Populate a complete terrain/non-grass-static retained-world catalog.
@@ -306,5 +315,9 @@ namespace IPC {
 		bool sortVisibleSet(VecId visibleSet, VisibleSetSort sort);
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
+
+        // Non-blocking ownership poll used by callers that retain an in-flight batch after a
+        // timeout. Complete means the command no longer owns its shared vectors.
+        WakeReason pollForCompletion(DWORD ms = 0) { return tryWaitForCompletion(ms); }
 	};
 }
