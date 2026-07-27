@@ -215,6 +215,7 @@ namespace MGEgui {
         public const string fn_statics = fn_dl + @"\statics";
         public const string fn_usagedata = fn_dl + @"\statics\usage.data";
         public const string fn_statmesh = fn_dl + @"\statics\static_meshes";
+        public const string fn_staticsource = fn_dl + @"\statics\static_sources";
         public const string fn_stattex = fn_dl + @"\statics\textures";
         public const string fn_postShaders = fn_dataFiles + @"\shaders\XEshaders";
         public const string fn_testImagePath = "MGE3";
@@ -233,6 +234,10 @@ namespace MGEgui {
         public static Macro[] Macros = new Macro[MACROS];
         public static Trigger[] Triggers = new Trigger[TRIGGERS];
         public static byte[] Remapper = new byte[256];
+
+        // Released before fatal exception logging so the logger can still open and flush its file
+        // when the 32-bit process has exhausted ordinary allocation headroom.
+        private static byte[] unhandledExceptionReserve = new byte[4 * 1024 * 1024];
 
         public static readonly Serializer formatter = new Serializer();
 
@@ -270,6 +275,76 @@ namespace MGEgui {
             return (Control[])controls.ToArray(typeof(Control));
         }
 
+        private static void PrepareUnhandledExceptionLogging() {
+            unhandledExceptionReserve = null;
+            try {
+                GC.Collect();
+            } catch {
+            }
+        }
+
+        private static void LogUnhandledException(string boundary, Exception ex) {
+            try {
+                using (var sw = new System.IO.StreamWriter(fn_dlLog, true)) {
+                    sw.WriteLine();
+                    sw.WriteLine("### Unhandled application exception ###");
+                    sw.Write("Boundary: ");
+                    sw.WriteLine(boundary);
+
+                    int depth = 0;
+                    while (ex != null) {
+                        sw.WriteLine(depth == 0 ? "Exception:" : "Inner exception:");
+                        sw.WriteLine(ex.GetType().FullName);
+                        sw.WriteLine(ex.Message);
+                        sw.Flush();
+
+                        try {
+                            string stackTrace = ex.StackTrace;
+                            if (!String.IsNullOrEmpty(stackTrace)) {
+                                sw.WriteLine(stackTrace);
+                            }
+                        } catch {
+                        }
+
+                        ex = ex.InnerException;
+                        depth++;
+                    }
+
+                    try {
+                        using (Process process = Process.GetCurrentProcess()) {
+                            sw.Write("Private memory: ");
+                            sw.Write(process.PrivateMemorySize64 / (1024 * 1024));
+                            sw.WriteLine(" MiB");
+                            sw.Write("Managed memory: ");
+                            sw.Write(GC.GetTotalMemory(false) / (1024 * 1024));
+                            sw.WriteLine(" MiB");
+                        }
+                    } catch {
+                    }
+                    sw.WriteLine();
+                }
+            } catch {
+                // FailFast below preserves the original exception for WER when file logging is unavailable.
+            }
+        }
+
+        private static void Application_ThreadException(object sender, ThreadExceptionEventArgs e) {
+            PrepareUnhandledExceptionLogging();
+            try {
+                LogUnhandledException("WinForms UI thread", e.Exception);
+            } catch {
+            }
+            Environment.FailFast("Unhandled MGEXEgui WinForms UI-thread exception.", e.Exception);
+        }
+
+        private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e) {
+            PrepareUnhandledExceptionLogging();
+            try {
+                LogUnhandledException("AppDomain", e.ExceptionObject as Exception);
+            } catch {
+            }
+        }
+
         /// <summary>
         /// Entry point for this program
         /// </summary>
@@ -286,6 +361,10 @@ namespace MGEgui {
             Application.SetCompatibleTextRenderingDefault(false);
 
             Directory.SetCurrentDirectory(System.IO.Path.GetDirectoryName(Application.ExecutablePath));
+
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += Application_ThreadException;
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
 
             Localizations = new LocalizationInterface();
             try {

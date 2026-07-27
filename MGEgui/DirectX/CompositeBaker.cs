@@ -91,9 +91,9 @@ namespace MGEgui.DirectX {
             EnsureResources(edgeTexels > 0 ? edgeTexels : DefaultEdgeTexels);
         }
 
-        // Bakes a single cell to its own DXT1 composite. On any compositing failure the cell is logged,
-        // a placeholder composite (flagged isPlaceholder) is produced at the configured resolution so
-        // the cell index stays dense, and baking can continue with the next cell (Req 1.7).
+        // Bakes a single cell to its own DXT1 composite. Recoverable compositing failures are logged
+        // and replaced with a placeholder composite so the cell index stays dense. Address-space
+        // exhaustion is propagated because allocating a same-sized placeholder cannot recover it.
         public CompositeBakeResult BakeCell(LAND cell, int edgeTexels) {
             if (cell == null) {
                 throw new ArgumentNullException("cell");
@@ -138,6 +138,8 @@ namespace MGEgui.DirectX {
                     edgeTexels = edgeTexels,
                     isPlaceholder = false
                 };
+            } catch (OutOfMemoryException) {
+                throw;
             } catch (Exception ex) {
                 LogFailure(cellId, bakeStage, ex);
                 return MakePlaceholder(cellId, edgeTexels);
@@ -162,19 +164,28 @@ namespace MGEgui.DirectX {
         // (Re)creates the render-target and compression textures plus the CellTexCreator when the
         // requested resolution differs from what is currently allocated.
         private void EnsureResources(int edgeTexels) {
-            if (ctc != null && resourceEdgeTexels == edgeTexels) {
+            if (ctc != null && renderTargetTex != null && renderTarget != null &&
+                uncompressedTex != null && compressedTex != null && resourceEdgeTexels == edgeTexels) {
                 return;
             }
 
             DisposeResources();
 
-            resourceEdgeTexels = edgeTexels;
-            ctc = new CellTexCreator(edgeTexels);
-
-            renderTargetTex = new Texture(DXMain.device, edgeTexels, edgeTexels, 0, Usage.RenderTarget, Format.X8R8G8B8, Pool.Default);
-            uncompressedTex = new Texture(DXMain.device, edgeTexels, edgeTexels, 0, Usage.None, Format.X8R8G8B8, Pool.SystemMemory);
-            compressedTex = new Texture(DXMain.device, edgeTexels, edgeTexels, 0, Usage.None, Format.Dxt1, Pool.SystemMemory);
-            renderTarget = renderTargetTex.GetSurfaceLevel(0);
+            try {
+                ctc = new CellTexCreator(edgeTexels);
+                renderTargetTex = new Texture(DXMain.device, edgeTexels, edgeTexels, 0, Usage.RenderTarget, Format.X8R8G8B8, Pool.Default);
+                uncompressedTex = new Texture(DXMain.device, edgeTexels, edgeTexels, 0, Usage.None, Format.X8R8G8B8, Pool.SystemMemory);
+                compressedTex = new Texture(DXMain.device, edgeTexels, edgeTexels, 0, Usage.None, Format.Dxt1, Pool.SystemMemory);
+                renderTarget = renderTargetTex.GetSurfaceLevel(0);
+                resourceEdgeTexels = edgeTexels;
+            } catch {
+                try {
+                    DisposeResources();
+                } catch {
+                    // Preserve the allocation failure; cleanup has already attempted every resource.
+                }
+                throw;
+            }
         }
 
         // Bind the per-cell render target and clear it to black, ready for additive accumulation.
@@ -228,12 +239,36 @@ namespace MGEgui.DirectX {
         // world.dds). The scratch file lives in the user temp dir, never under the game install.
         private byte[] ReadCompressedBytes(Texture tex) {
             Texture.ToFile(tex, scratchDdsPath, ImageFileFormat.Dds);
-            byte[] dds = System.IO.File.ReadAllBytes(scratchDdsPath);
-            int headerBytes = DdsHeaderLength(dds);
-            int payloadLen = dds.Length - headerBytes;
-            var payload = new byte[payloadLen];
-            Buffer.BlockCopy(dds, headerBytes, payload, 0, payloadLen);
-            return payload;
+
+            using (var fs = new System.IO.FileStream(scratchDdsPath, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read)) {
+                var header = new byte[DdsMagicAndHeaderBytes];
+                int headerRead = 0;
+                while (headerRead < header.Length) {
+                    int read = fs.Read(header, headerRead, header.Length - headerRead);
+                    if (read == 0) {
+                        throw new System.IO.InvalidDataException("Composite DDS is shorter than its header.");
+                    }
+                    headerRead += read;
+                }
+
+                int headerBytes = DdsHeaderLength(header);
+                if (fs.Length < headerBytes) {
+                    throw new System.IO.InvalidDataException("Composite DDS has an incomplete extended header.");
+                }
+
+                int payloadLen = checked((int)(fs.Length - headerBytes));
+                var payload = new byte[payloadLen];
+                fs.Position = headerBytes;
+                int payloadRead = 0;
+                while (payloadRead < payload.Length) {
+                    int read = fs.Read(payload, payloadRead, payload.Length - payloadRead);
+                    if (read == 0) {
+                        throw new System.IO.EndOfStreamException("Composite DDS payload ended early.");
+                    }
+                    payloadRead += read;
+                }
+                return payload;
+            }
         }
 
         // Length of a DDS file header: 4-byte "DDS " magic + 124-byte DDS_HEADER, plus the optional
@@ -299,26 +334,60 @@ namespace MGEgui.DirectX {
             }
         }
 
+        private static void RememberCleanupFailure(ref Exception firstFailure, Exception failure) {
+            if (firstFailure == null) {
+                firstFailure = failure;
+            }
+        }
+
+        private static void TryRestoreBackBuffer() {
+            if (DXMain.device == null || DXMain.BackBuffer == null || DXMain.BackBuffer.Disposed) {
+                return;
+            }
+            try {
+                DXMain.device.SetRenderTarget(0, DXMain.BackBuffer);
+            } catch {
+                // Resource release remains non-throwing if the device cannot accept state changes.
+            }
+        }
+
+        private static void DisposeResource<T>(ref T resource, ref Exception firstFailure) where T : class, IDisposable {
+            if (resource == null) {
+                return;
+            }
+            try {
+                resource.Dispose();
+                resource = null;
+            } catch (Exception ex) {
+                RememberCleanupFailure(ref firstFailure, ex);
+            }
+        }
+
         private void DisposeResources() {
-            if (renderTarget != null) {
-                renderTarget.Dispose();
-                renderTarget = null;
+            resourceEdgeTexels = 0;
+            TryRestoreBackBuffer();
+
+            Exception firstFailure = null;
+            DisposeResource(ref ctc, ref firstFailure);
+            DisposeResource(ref renderTarget, ref firstFailure);
+            DisposeResource(ref renderTargetTex, ref firstFailure);
+            DisposeResource(ref uncompressedTex, ref firstFailure);
+            DisposeResource(ref compressedTex, ref firstFailure);
+            if (firstFailure != null) {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
             }
-            if (renderTargetTex != null) {
-                renderTargetTex.Dispose();
-                renderTargetTex = null;
-            }
-            if (uncompressedTex != null) {
-                uncompressedTex.Dispose();
-                uncompressedTex = null;
-            }
-            if (compressedTex != null) {
-                compressedTex.Dispose();
-                compressedTex = null;
-            }
-            if (ctc != null) {
-                ctc.Dispose();
-                ctc = null;
+        }
+
+        private void LogCleanupFailure(Exception ex) {
+            try {
+                string message = "Composite cleanup failed: " + ex.GetType().Name + ": " + ex.Message;
+                if (log != null) {
+                    log(message);
+                } else {
+                    System.IO.File.AppendAllText(Statics.fn_dlLog, message + "\r\n");
+                }
+            } catch {
+                // Cleanup reporting must not replace the operation that triggered disposal.
             }
         }
 
@@ -326,13 +395,27 @@ namespace MGEgui.DirectX {
             if (disposed) {
                 return;
             }
-            disposed = true;
-            DisposeResources();
+
+            bool resourcesReleased = false;
+            Exception cleanupFailure = null;
+            try {
+                DisposeResources();
+                resourcesReleased = true;
+            } catch (Exception ex) {
+                cleanupFailure = ex;
+            }
+
             try {
                 if (scratchDdsPath != null && System.IO.File.Exists(scratchDdsPath)) {
                     System.IO.File.Delete(scratchDdsPath);
                 }
-            } catch {
+            } catch (Exception ex) {
+                RememberCleanupFailure(ref cleanupFailure, ex);
+            }
+
+            disposed = resourcesReleased;
+            if (cleanupFailure != null) {
+                LogCleanupFailure(cleanupFailure);
             }
         }
     }

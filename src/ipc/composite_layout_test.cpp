@@ -79,6 +79,10 @@ static_assert(sizeof(((RenderMesh*)nullptr)->compositeTex) > 0, "RenderMesh must
 static_assert(sizeof(((RenderMesh*)nullptr)->cellX)        > 0, "RenderMesh must expose cellX");
 static_assert(sizeof(((RenderMesh*)nullptr)->cellY)        > 0, "RenderMesh must expose cellY");
 static_assert(sizeof(((RenderMesh*)nullptr)->cellValid)    > 0, "RenderMesh must expose cellValid");
+static_assert(sizeof(((RenderMesh*)nullptr)->boundsCenter) > 0, "RenderMesh must expose boundsCenter");
+static_assert(sizeof(((RenderMesh*)nullptr)->boundsRadius) > 0, "RenderMesh must expose boundsRadius");
+static_assert(sizeof(((RenderMesh*)nullptr)->retainedPlacementIdentity) > 0,
+              "RenderMesh must expose retainedPlacementIdentity");
 
 // (B) ...with the types the Texture_Binder expects. compositeTex must be the same
 //     per-cell composite handle type as the existing RenderMesh::tex (ptr32<IDirect3DTexture9>),
@@ -90,6 +94,8 @@ static_assert(std::is_same_v<decltype(RenderMesh::compositeTex), ptr32<IDirect3D
 static_assert(std::is_same_v<decltype(RenderMesh::cellX), int32_t>, "RenderMesh::cellX must be int32_t");
 static_assert(std::is_same_v<decltype(RenderMesh::cellY), int32_t>, "RenderMesh::cellY must be int32_t");
 static_assert(std::is_same_v<decltype(RenderMesh::cellValid), bool>, "RenderMesh::cellValid must be bool");
+static_assert(std::is_same_v<decltype(RenderMesh::retainedPlacementIdentity), std::uint64_t>,
+              "RenderMesh::retainedPlacementIdentity must be uint64_t");
 
 // (C) Pre-existing RenderMesh fields keep their exact offsets (append did not shift them).
 static_assert(offsetof(RenderMesh, enabled)   == baseline::kRM_enabled,   "RenderMesh::enabled moved");
@@ -115,12 +121,20 @@ static_assert(offsetof(RenderMesh, compositeTex) == 88,  "RenderMesh::compositeT
 static_assert(offsetof(RenderMesh, cellX)        == 92,  "RenderMesh::cellX offset drift");
 static_assert(offsetof(RenderMesh, cellY)        == 96,  "RenderMesh::cellY offset drift");
 static_assert(offsetof(RenderMesh, cellValid)    == 100, "RenderMesh::cellValid offset drift");
+static_assert(offsetof(RenderMesh, boundsCenter) == 104, "RenderMesh::boundsCenter offset drift");
+static_assert(offsetof(RenderMesh, boundsRadius) == 116, "RenderMesh::boundsRadius offset drift");
+static_assert(offsetof(RenderMesh, retainedPlacementIdentity) == 120,
+              "RenderMesh::retainedPlacementIdentity offset drift");
 static_assert(offsetof(RenderMesh, compositeTex) < offsetof(RenderMesh, cellX), "compositeTex must precede cellX");
 static_assert(offsetof(RenderMesh, cellX)        < offsetof(RenderMesh, cellY), "cellX must precede cellY");
 static_assert(offsetof(RenderMesh, cellY)        < offsetof(RenderMesh, cellValid), "cellY must precede cellValid");
+static_assert(offsetof(RenderMesh, cellValid)    < offsetof(RenderMesh, boundsCenter), "cellValid must precede boundsCenter");
+static_assert(offsetof(RenderMesh, boundsCenter) < offsetof(RenderMesh, boundsRadius), "boundsCenter must precede boundsRadius");
+static_assert(offsetof(RenderMesh, boundsRadius) < offsetof(RenderMesh, retainedPlacementIdentity),
+              "boundsRadius must precede retainedPlacementIdentity");
 
 // (F) Total size is the pack(4) cross-process value (locks the whole layout).
-static_assert(sizeof(RenderMesh) == 104, "RenderMesh size changed -- 32/64-bit IPC layout drift");
+static_assert(sizeof(RenderMesh) == 128, "RenderMesh size changed -- 32/64-bit IPC layout drift");
 
 // ===========================================================================
 // LandMesh — runtime distant-land chunk struct (mge/dlformat.h)

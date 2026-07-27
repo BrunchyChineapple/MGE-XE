@@ -44,6 +44,9 @@ QuadTreeMesh::QuadTreeMesh(
     this->cellX = 0;
     this->cellY = 0;
     this->cellValid = false;
+    this->boundsCenter = sphere.center;
+    this->boundsRadius = sphere.radius;
+    this->retainedPlacementIdentity = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -72,6 +75,11 @@ QuadTreeMesh& QuadTreeMesh::operator=(const QuadTreeMesh& rh) {
     cellX = rh.cellX;
     cellY = rh.cellY;
     cellValid = rh.cellValid;
+    boundsCenter = rh.boundsCenter;
+    boundsRadius = rh.boundsRadius;
+    retainedPrototypeIdentity = rh.retainedPrototypeIdentity;
+    retainedPlacementIdentity = rh.retainedPlacementIdentity;
+    sourceRecordIdentity = rh.sourceRecordIdentity;
 
     return *this;
 }

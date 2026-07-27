@@ -17,7 +17,7 @@
 #include "videobackground.h"
 
 #ifdef MGE_RTX
-#include "rt_anticull.h"
+#include "msoc_bridge.h"
 #include "retained_world.h"
 
 static std::atomic<bool> retainedReleasePending{ false };
@@ -249,13 +249,11 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     isHUDComplete = false;
 
 #ifdef MGE_RTX
-    // Auto-select RT_AntiCull's reachability range by cell type, then advance its frame
-    // counter. CellHasWeather() is true for exterior + behaves-as-exterior cells, false for
-    // true interiors — exactly the split RT_AntiCull's two ranges target.
-    if (mwBridge->IsLoaded()) {
-        RTAntiCull::selectRangeForCell(mwBridge->CellHasWeather());
-    }
-    RTAntiCull::beginFrame();
+    // Apply retained activity at the unconditional frame boundary so menus,
+    // underwater views, and skipped distant-land passes still reactivate fail-open.
+    // Then close the shared confirmation epoch after every consumer has queried it.
+    RetainedWorld::onPresentActivity();
+    MSOCBridge::beginFrame();
 #endif
 
     return Direct3DDevice8::Present(a, b, c, d);

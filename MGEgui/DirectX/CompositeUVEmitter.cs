@@ -56,17 +56,16 @@ namespace MGEgui.DirectX {
     //     exactly one cell, hence exactly one composite (Req 2.2). A world vertex (worldX, worldY)
     //     belongs to cell (floor(worldX / CellSize), floor(worldY / CellSize)); this is the same
     //     per-cell partition the generator already iterates for the atlas bake.
-    //   * Emits per-cell [0,1] UVs for those vertices (Req 2.1):
-    //         u = frac((worldX - cellMinX) / CellSize)
-    //         v = 1 - frac((worldY - cellMinY) / CellSize)
-    //     The V axis is flipped to match the top-left texture origin the bake writes into.
+    //   * Emits clamped per-cell [0,1] UVs for those vertices (Req 2.1):
+    //         u = clamp((worldX - cellMinX) / CellSize, 0, 1)
+    //         v = 1 - clamp((worldY - cellMinY) / CellSize, 0, 1)
+    //     The V axis is flipped to match the top-left texture origin the bake writes into. Clamping
+    //     keeps an exact far-edge vertex on u=1 or v=0 instead of wrapping it to the opposite edge.
     //   * Stores the result only in the additive Composite_Set (as PerCellUV records); the world mesh
     //     and its atlas UVs are left byte-for-byte unchanged so the Single_Atlas_Path stays usable from
     //     the same generation (Req 2.3).
     //
-    // This is the C# port of tests/composite_blend_model.cell_uv; that Python oracle is authoritative
-    // and Property 5 (test 2.4) verifies both the [0,1] range and the exactly-one-composite-per-chunk
-    // partition. The math here is pure and device-independent (no SlimDX / D3D9), mirroring the model.
+    // The math here is pure and device-independent (no SlimDX / D3D9).
     class CompositeUVEmitter {
 
         // World-unit extent of one exterior cell edge (8192 units), matching LAND cell spacing and the
@@ -78,9 +77,8 @@ namespace MGEgui.DirectX {
         // cell owns (the 65th seam vertex belongs to the neighbouring cell, matching floor ownership).
         public const int DefaultCellSubdivisions = 64;
 
-        // Fractional part value - floor(value), always in [0,1) for finite input (ports model._frac).
-        private static double Frac(double value) {
-            return value - Math.Floor(value);
+        private static double Clamp01(double value) {
+            return Math.Max(0.0, Math.Min(1.0, value));
         }
 
         // The cell that owns a world vertex: (floor(worldX / CellSize), floor(worldY / CellSize)).
@@ -93,14 +91,12 @@ namespace MGEgui.DirectX {
         }
 
         // Per-cell [0,1] UV for one world vertex, relative to the given cell's minimum corner.
-        // u = frac((worldX - cellMinX)/CellSize), v = 1 - frac((worldY - cellMinY)/CellSize). Because
-        // frac stays in [0,1), u lands in [0,1) and v in (0,1]; both components are always within [0,1]
-        // for any world position regardless of which cell it falls in (Req 2.1 / Property 5).
+        // Clamping preserves the inclusive far boundary and absorbs small coordinate drift.
         public static CompositeUV CellUV(double worldX, double worldY, CellId cell) {
             double cellMinX = (double)cell.cellX * CellSize;
             double cellMinY = (double)cell.cellY * CellSize;
-            float u = (float)Frac((worldX - cellMinX) / CellSize);
-            float v = (float)(1.0 - Frac((worldY - cellMinY) / CellSize));
+            float u = (float)Clamp01((worldX - cellMinX) / CellSize);
+            float v = (float)(1.0 - Clamp01((worldY - cellMinY) / CellSize));
             return new CompositeUV(u, v);
         }
 
@@ -178,7 +174,7 @@ namespace MGEgui.DirectX {
         // span [cellMin, cellMin + CellSize). Vertex k (0..subdivisions-1) sits at
         // cellMin + k * (CellSize / subdivisions), so all emitted UVs stay in [0,1) and the shared seam
         // (the next integer cell boundary) belongs to the neighbouring cell - consistent with the
-        // floor-based chunking and the frac UV formula. This is a convenience for callers that want a
+        // floor-based chunking and clamped UV formula. This is a convenience for callers that want a
         // dense per-cell UV set at the heightmap resolution without owning the world-position layout;
         // it does not read or alter the world mesh.
         public static List<WorldVertex> CellGridWorldVertices(CellId cell, int subdivisions) {
@@ -201,10 +197,28 @@ namespace MGEgui.DirectX {
             return verts;
         }
 
-        // Emit per-cell UVs over the canonical half-open per-cell grid (see CellGridWorldVertices),
-        // tagged with chunkId. Convenience wrapper around CellGridWorldVertices + EmitCellUVs.
+        // Emit per-cell UVs directly over the canonical half-open grid. Building the coordinates in
+        // place avoids the intermediate WorldVertex list and List<CompositeUV> for every cell.
         public PerCellUV EmitCellGrid(CellId cell, int chunkId, int subdivisions) {
-            return EmitCellUVs(cell, chunkId, CellGridWorldVertices(cell, subdivisions));
+            if (subdivisions <= 0) {
+                subdivisions = DefaultCellSubdivisions;
+            }
+
+            var uvs = new CompositeUV[subdivisions * subdivisions];
+            int index = 0;
+            for (int j = 0; j < subdivisions; j++) {
+                float v = (float)(1.0 - (double)j / subdivisions);
+                for (int i = 0; i < subdivisions; i++) {
+                    float u = (float)((double)i / subdivisions);
+                    uvs[index++] = new CompositeUV(u, v);
+                }
+            }
+
+            return new PerCellUV {
+                cell = cell,
+                chunkId = chunkId,
+                uvs = uvs
+            };
         }
 
         // LAND overload of EmitCellGrid (above).

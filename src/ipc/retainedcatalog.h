@@ -5,11 +5,21 @@
 
 namespace RetainedCatalog {
     constexpr std::uint32_t Magic = 0x43575452u; // "RTWC" in little-endian storage
-    constexpr std::uint32_t Version = 1;
+    constexpr std::uint32_t Version = 4;
 
     enum class Category : std::uint32_t {
         Terrain = 1,
         Static = 2,
+    };
+
+    // Which distant-static visibility tier a placement came from. MGE-XE sorts statics
+    // into three quadtrees by object size and draws each to its own range
+    // (Configuration.DL.{Near,Far,VeryFar}StaticEnd), so the tier is what lets a
+    // consumer retain small objects only nearby while keeping landmarks to the horizon.
+    enum class Tier : std::uint32_t {
+        Near = 1,
+        Far = 2,
+        VeryFar = 3,
     };
 
     enum MeshFlags : std::uint32_t {
@@ -59,16 +69,24 @@ namespace RetainedCatalog {
         std::uint32_t materialBytes;
         std::int32_t cellX;
         std::int32_t cellY;
+        std::uint64_t sourceNifIdentity;
+        std::uint32_t sourceStaticId;
+        std::uint32_t sourceSubsetIndex;
+        std::uint32_t sourceNifOffset;
+        std::uint32_t sourceNifBytes;
     };
 
     struct Placement {
         std::uint64_t identity;
         std::uint64_t prototypeIdentity;
+        std::uint64_t sourceRecordIdentity;
+        std::uint32_t sourceRecordOffset;
+        std::uint32_t sourceRecordBytes;
         float transform[16];
         std::int32_t cellX;
         std::int32_t cellY;
         std::uint32_t flags;
-        std::uint32_t reserved;
+        Tier tier;
     };
 #pragma pack(pop)
 
@@ -77,10 +95,15 @@ namespace RetainedCatalog {
     static_assert(offsetof(Header, blobBytes) == 44);
     static_assert(sizeof(Cell) == 24);
     static_assert(offsetof(Cell, staticPlacementFirst) == 16);
-    static_assert(sizeof(Mesh) == 72);
+    static_assert(sizeof(Mesh) == 96);
     static_assert(offsetof(Mesh, vertexOffset) == 24);
     static_assert(offsetof(Mesh, materialOffset) == 56);
-    static_assert(sizeof(Placement) == 96);
-    static_assert(offsetof(Placement, transform) == 16);
-    static_assert(offsetof(Placement, flags) == 88);
+    static_assert(offsetof(Mesh, sourceNifIdentity) == 72);
+    static_assert(offsetof(Mesh, sourceNifOffset) == 88);
+    static_assert(sizeof(Placement) == 112);
+    static_assert(offsetof(Placement, sourceRecordIdentity) == 16);
+    static_assert(offsetof(Placement, transform) == 32);
+    static_assert(offsetof(Placement, flags) == 104);
+    static_assert(offsetof(Placement, tier) == 108);
+    static_assert(sizeof(Tier) == 4);
 }

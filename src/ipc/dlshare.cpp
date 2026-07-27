@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <unordered_set>
+#include <utility>
 
 using std::string;
 using std::unordered_map;
@@ -29,7 +30,14 @@ vector<RetainedCatalog::Mesh> DistantLandShare::retainedTerrainMeshes;
 vector<std::uint8_t> DistantLandShare::retainedStaticBlob;
 vector<std::uint8_t> DistantLandShare::retainedTerrainBlob;
 vector<std::uint64_t> DistantLandShare::retainedStaticPrototypeIds;
+vector<std::uint64_t> DistantLandShare::retainedStaticPlacementRecordIds;
+unordered_map<std::uint64_t, std::string> DistantLandShare::retainedStaticRecordNames;
 std::uint64_t DistantLandShare::retainedCatalogGeneration = 0;
+
+namespace {
+std::string retainedCatalogWorldspaceKey;
+bool hasRetainedCatalogWorldspaceKey = false;
+}
 
 void DistantLandShare::bumpRetainedCatalogGeneration() noexcept {
     ++retainedCatalogGeneration;
@@ -211,6 +219,52 @@ namespace {
         return true;
     }
 
+    bool validateUsageData(
+        const std::vector<std::uint8_t>& bytes,
+        std::uint32_t expectedStaticCount,
+        std::uint32_t expectedPlacementCount) {
+        ByteCursor cursor(bytes);
+        std::uint32_t staticCount = 0;
+        std::uint32_t visGroupCount = 0;
+        if (!cursor.read(&staticCount, sizeof(staticCount)) ||
+            !cursor.read(&visGroupCount, sizeof(visGroupCount)) ||
+            staticCount != expectedStaticCount) {
+            return false;
+        }
+        std::uint32_t visBytes = 0;
+        if (!checkedBytes(visGroupCount, 130, visBytes) ||
+            (!cursor.take(visBytes) && visBytes != 0)) {
+            return false;
+        }
+
+        std::uint64_t placementCount = 0;
+        for (std::uint32_t worldspace = 0; ; ++worldspace) {
+            std::uint32_t count = 0;
+            if (!cursor.read(&count, sizeof(count))) {
+                return false;
+            }
+            if (worldspace != 0 && count == 0) {
+                break;
+            }
+            if (worldspace != 0 && !cursor.take(64)) {
+                return false;
+            }
+            std::uint32_t placementBytes = 0;
+            if (!checkedBytes(count, 34, placementBytes) ||
+                (!cursor.take(placementBytes) && placementBytes != 0)) {
+                return false;
+            }
+            placementCount += count;
+            if (placementCount > std::numeric_limits<std::uint32_t>::max()) {
+                return false;
+            }
+        }
+
+        float minimumStaticSize = 0.0f;
+        return cursor.read(&minimumStaticSize, sizeof(minimumStaticSize)) &&
+            cursor.atEnd() && placementCount == expectedPlacementCount;
+    }
+
     bool appendBytes(
         std::vector<std::uint8_t>& destination,
         const std::uint8_t* source,
@@ -224,6 +278,225 @@ namespace {
         offset = static_cast<std::uint32_t>(destination.size());
         if (bytes != 0) {
             destination.insert(destination.end(), source, source + bytes);
+        }
+        return true;
+    }
+
+#pragma pack(push, 4)
+    struct StaticSourceHeaderV1 {
+        std::uint32_t magic;
+        std::uint32_t version;
+        std::uint32_t headerBytes;
+        std::uint32_t recordBytes;
+        std::uint32_t recordCount;
+        std::uint32_t blobBytes;
+        std::uint64_t contentHash;
+        std::uint64_t staticMeshesHash;
+    };
+
+    struct StaticSourceHeaderV2 {
+        std::uint32_t magic;
+        std::uint32_t version;
+        std::uint32_t headerBytes;
+        std::uint32_t staticRecordBytes;
+        std::uint32_t staticRecordCount;
+        std::uint32_t placementRecordBytes;
+        std::uint32_t placementRecordCount;
+        std::uint32_t blobBytes;
+        std::uint64_t contentHash;
+        std::uint64_t staticMeshesHash;
+        std::uint64_t usageDataHash;
+    };
+
+    struct StaticSourceRecord {
+        std::uint32_t staticId;
+        std::uint32_t pathOffset;
+        std::uint32_t pathBytes;
+        std::uint32_t reserved;
+    };
+
+    struct StaticPlacementSourceRecord {
+        std::uint32_t recordOffset;
+        std::uint32_t recordBytes;
+        std::uint64_t recordIdentity;
+    };
+#pragma pack(pop)
+
+    static_assert(sizeof(StaticSourceHeaderV1) == 40);
+    static_assert(sizeof(StaticSourceHeaderV2) == 56);
+    static_assert(sizeof(StaticSourceRecord) == 16);
+    static_assert(sizeof(StaticPlacementSourceRecord) == 16);
+
+    struct StaticSourceIdentity {
+        std::string path;
+        std::uint64_t identity = 0;
+    };
+
+    bool loadStaticSourceIdentities(
+        std::uint32_t staticCount,
+        const std::vector<std::uint8_t>& staticMeshes,
+        std::vector<StaticSourceIdentity>& identities,
+        std::vector<std::uint64_t>& placementRecordIds,
+        std::unordered_map<std::uint64_t, std::string>& recordNames) {
+        identities.clear();
+        placementRecordIds.clear();
+        recordNames.clear();
+        const auto fail = [&]() {
+            identities.clear();
+            placementRecordIds.clear();
+            recordNames.clear();
+            return false;
+        };
+
+        std::vector<std::uint8_t> bytes;
+        if (!readWholeFile(
+                "Data Files\\distantland\\statics\\static_sources", bytes) ||
+            bytes.size() < 2 * sizeof(std::uint32_t)) {
+            return false;
+        }
+
+        std::uint32_t magic = 0;
+        std::uint32_t version = 0;
+        std::memcpy(&magic, bytes.data(), sizeof(magic));
+        std::memcpy(&version, bytes.data() + sizeof(magic), sizeof(version));
+        if (magic != 0x4352534Du) {
+            return false;
+        }
+
+        std::uint32_t headerBytes = 0;
+        std::uint32_t staticRecordCount = 0;
+        std::uint32_t blobBytes = 0;
+        std::uint64_t contentHash = 0;
+        std::uint64_t staticMeshesHash = 0;
+        std::uint32_t placementRecordCount = 0;
+        std::uint64_t usageDataHash = 0;
+        bool hasPlacementRecords = false;
+
+        if (version == 1 && bytes.size() >= sizeof(StaticSourceHeaderV1)) {
+            StaticSourceHeaderV1 header = {};
+            std::memcpy(&header, bytes.data(), sizeof(header));
+            if (header.headerBytes != sizeof(header) ||
+                header.recordBytes != sizeof(StaticSourceRecord)) {
+                return false;
+            }
+            headerBytes = header.headerBytes;
+            staticRecordCount = header.recordCount;
+            blobBytes = header.blobBytes;
+            contentHash = header.contentHash;
+            staticMeshesHash = header.staticMeshesHash;
+        } else if (version == 2 && bytes.size() >= sizeof(StaticSourceHeaderV2)) {
+            StaticSourceHeaderV2 header = {};
+            std::memcpy(&header, bytes.data(), sizeof(header));
+            if (header.headerBytes != sizeof(header) ||
+                header.staticRecordBytes != sizeof(StaticSourceRecord) ||
+                header.placementRecordBytes != sizeof(StaticPlacementSourceRecord)) {
+                return false;
+            }
+            headerBytes = header.headerBytes;
+            staticRecordCount = header.staticRecordCount;
+            placementRecordCount = header.placementRecordCount;
+            blobBytes = header.blobBytes;
+            contentHash = header.contentHash;
+            staticMeshesHash = header.staticMeshesHash;
+            usageDataHash = header.usageDataHash;
+            hasPlacementRecords = true;
+        } else {
+            return false;
+        }
+
+        const std::uint64_t staticRecordsBytes64 =
+            static_cast<std::uint64_t>(staticRecordCount) * sizeof(StaticSourceRecord);
+        const std::uint64_t placementRecordsBytes64 =
+            static_cast<std::uint64_t>(placementRecordCount) *
+            sizeof(StaticPlacementSourceRecord);
+        const std::uint64_t expectedBytes =
+            static_cast<std::uint64_t>(headerBytes) + staticRecordsBytes64 +
+            placementRecordsBytes64 + blobBytes;
+        if (staticRecordCount != staticCount || expectedBytes != bytes.size() ||
+            staticRecordsBytes64 > std::numeric_limits<std::size_t>::max() ||
+            placementRecordsBytes64 > std::numeric_limits<std::size_t>::max() ||
+            staticMeshesHash != hashBytes(staticMeshes.data(), staticMeshes.size())) {
+            return false;
+        }
+
+        if (hasPlacementRecords) {
+            std::vector<std::uint8_t> usageData;
+            if (!readWholeFile(
+                    "Data Files\\distantland\\statics\\usage.data", usageData) ||
+                usageDataHash != hashBytes(usageData.data(), usageData.size()) ||
+                !validateUsageData(
+                    usageData,
+                    staticCount,
+                    placementRecordCount)) {
+                return false;
+            }
+        }
+
+        const std::size_t staticRecordsBytes =
+            static_cast<std::size_t>(staticRecordsBytes64);
+        const std::size_t placementRecordsBytes =
+            static_cast<std::size_t>(placementRecordsBytes64);
+        const auto* staticRecords = bytes.data() + headerBytes;
+        const auto* placementRecords = staticRecords + staticRecordsBytes;
+        const auto* blob = placementRecords + placementRecordsBytes;
+        std::uint64_t calculatedContentHash =
+            hashBytes(staticRecords, staticRecordsBytes);
+        calculatedContentHash = hashBytes(
+            placementRecords, placementRecordsBytes, calculatedContentHash);
+        calculatedContentHash = hashBytes(blob, blobBytes, calculatedContentHash);
+        if (calculatedContentHash != contentHash) {
+            return false;
+        }
+
+        identities.resize(staticCount);
+        for (std::uint32_t i = 0; i < staticCount; ++i) {
+            StaticSourceRecord record = {};
+            std::memcpy(
+                &record,
+                staticRecords + static_cast<std::size_t>(i) * sizeof(record),
+                sizeof(record));
+            if (record.staticId != i || record.reserved != 0 ||
+                record.pathBytes == 0 ||
+                static_cast<std::uint64_t>(record.pathOffset) + record.pathBytes >
+                    blobBytes ||
+                std::memchr(blob + record.pathOffset, '\0', record.pathBytes) != nullptr) {
+                return fail();
+            }
+            auto& identity = identities[i];
+            identity.path.assign(
+                reinterpret_cast<const char*>(blob + record.pathOffset),
+                record.pathBytes);
+            identity.identity = hashBytes(identity.path.data(), identity.path.size());
+            if (identity.identity == 0) {
+                return fail();
+            }
+        }
+
+        placementRecordIds.reserve(placementRecordCount);
+        for (std::uint32_t i = 0; i < placementRecordCount; ++i) {
+            StaticPlacementSourceRecord record = {};
+            std::memcpy(
+                &record,
+                placementRecords + static_cast<std::size_t>(i) * sizeof(record),
+                sizeof(record));
+            if (record.recordIdentity == 0 || record.recordBytes == 0 ||
+                static_cast<std::uint64_t>(record.recordOffset) + record.recordBytes >
+                    blobBytes ||
+                std::memchr(blob + record.recordOffset, '\0', record.recordBytes) != nullptr) {
+                return fail();
+            }
+            const std::string recordName(
+                reinterpret_cast<const char*>(blob + record.recordOffset),
+                record.recordBytes);
+            if (hashBytes(recordName.data(), recordName.size()) != record.recordIdentity) {
+                return fail();
+            }
+            const auto [known, inserted] =
+                recordNames.emplace(record.recordIdentity, recordName);
+            if (!inserted && known->second != recordName) {
+                return fail();
+            }
+            placementRecordIds.push_back(record.recordIdentity);
         }
         return true;
     }
@@ -276,10 +549,32 @@ bool DistantLandShare::loadRetainedStaticCatalog(std::uint32_t staticCount) {
     retainedStaticMeshes.clear();
     retainedStaticBlob.clear();
     retainedStaticPrototypeIds.clear();
+    retainedStaticPlacementRecordIds.clear();
+    retainedStaticRecordNames.clear();
 
     std::vector<std::uint8_t> source;
     if (!readWholeFile("Data Files\\distantland\\statics\\static_meshes", source)) {
         return false;
+    }
+
+    std::vector<StaticSourceIdentity> sourceIdentities;
+    std::vector<std::uint64_t> placementRecordIds;
+    std::unordered_map<std::uint64_t, std::string> recordNames;
+    const bool hasSourceIdentities = loadStaticSourceIdentities(
+        staticCount,
+        source,
+        sourceIdentities,
+        placementRecordIds,
+        recordNames);
+    if (hasSourceIdentities) {
+        retainedStaticPlacementRecordIds.swap(placementRecordIds);
+        retainedStaticRecordNames.swap(recordNames);
+        LOG::logline(
+            "-- Retained static source identities loaded: %u",
+            static_cast<unsigned>(sourceIdentities.size()));
+    } else {
+        LOG::logline(
+            "-- Retained static source identities unavailable; replacement bindings disabled");
     }
 
     ByteCursor cursor(source);
@@ -348,6 +643,21 @@ bool DistantLandShare::loadRetainedStaticCatalog(std::uint32_t staticCount) {
             witness = hashBytes(indices, indexBytes, witness);
             witness = hashBytes(textureFlags, sizeof(textureFlags), witness);
             witness = hashBytes(texturePath, pathBytes, witness);
+
+            const StaticSourceIdentity* sourceIdentity =
+                hasSourceIdentities ? &sourceIdentities[staticIndex] : nullptr;
+            if (sourceIdentity) {
+                identity = hashBytes(
+                    &sourceIdentity->identity,
+                    sizeof(sourceIdentity->identity),
+                    identity);
+                identity = hashBytes(&subsetIndex, sizeof(subsetIndex), identity);
+                witness = hashBytes(
+                    sourceIdentity->path.data(),
+                    sourceIdentity->path.size(),
+                    witness);
+                witness = hashBytes(&subsetIndex, sizeof(subsetIndex), witness);
+            }
             if (identity == 0) {
                 return false;
             }
@@ -374,9 +684,20 @@ bool DistantLandShare::loadRetainedStaticCatalog(std::uint32_t staticCount) {
             mesh.indexStride = 2;
             mesh.indexBytes = indexBytes;
             mesh.materialBytes = pathBytes;
+            if (sourceIdentity) {
+                mesh.sourceNifIdentity = sourceIdentity->identity;
+                mesh.sourceStaticId = staticIndex;
+                mesh.sourceSubsetIndex = subsetIndex;
+                mesh.sourceNifBytes = static_cast<std::uint32_t>(sourceIdentity->path.size());
+            }
             if (!appendBytes(retainedStaticBlob, vertices, vertexBytes, mesh.vertexOffset) ||
                 !appendBytes(retainedStaticBlob, indices, indexBytes, mesh.indexOffset) ||
-                !appendBytes(retainedStaticBlob, texturePath, pathBytes, mesh.materialOffset)) {
+                !appendBytes(retainedStaticBlob, texturePath, pathBytes, mesh.materialOffset) ||
+                (sourceIdentity && !appendBytes(
+                    retainedStaticBlob,
+                    reinterpret_cast<const std::uint8_t*>(sourceIdentity->path.data()),
+                    mesh.sourceNifBytes,
+                    mesh.sourceNifOffset))) {
                 return false;
             }
 
@@ -563,6 +884,8 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
         return fail();
     }
 
+    std::uint64_t sharedTerrainIndexBytes = 0;
+    std::uint32_t uniqueTerrainIndexStreams = 0;
     vector<LandMesh> meshesLand(mesh_count);
     landscapeBuffers.start_read();
     readingBuffers = true;
@@ -572,6 +895,35 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
         D3DXMATRIX world;
         D3DXMatrixIdentity(&world);
         std::unordered_set<std::uint64_t> terrainIdentities;
+        struct IndexSpan {
+            std::uint32_t offset;
+            std::uint32_t bytes;
+        };
+        std::unordered_map<std::uint64_t, std::vector<IndexSpan>> terrainIndexSpans;
+
+        const auto internTerrainIndices = [&](const std::vector<std::uint8_t>& indices,
+                                              std::uint32_t& offset) {
+            const auto topologyHash = hashBytes(indices.data(), indices.size());
+            auto& candidates = terrainIndexSpans[topologyHash];
+            for (const auto& candidate : candidates) {
+                if (candidate.bytes == indices.size() &&
+                    (indices.empty() ||
+                     std::memcmp(retainedTerrainBlob.data() + candidate.offset,
+                                 indices.data(), indices.size()) == 0)) {
+                    offset = candidate.offset;
+                    sharedTerrainIndexBytes += candidate.bytes;
+                    return true;
+                }
+            }
+
+            if (!appendBytes(retainedTerrainBlob, indices.data(),
+                             static_cast<std::uint32_t>(indices.size()), offset)) {
+                return false;
+            }
+            candidates.push_back(IndexSpan{ offset, static_cast<std::uint32_t>(indices.size()) });
+            ++uniqueTerrainIndexStreams;
+            return true;
+        };
 
         const auto finiteVector = [](const D3DXVECTOR3& value) {
             return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
@@ -650,7 +1002,7 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
             catalogMesh.cellX = cellX;
             catalogMesh.cellY = cellY;
             if (!appendBytes(retainedTerrainBlob, vertices.data(), vertexBytes, catalogMesh.vertexOffset) ||
-                !appendBytes(retainedTerrainBlob, indices.data(), indexBytes, catalogMesh.indexOffset)) {
+                !internTerrainIndices(indices, catalogMesh.indexOffset)) {
                 return fail();
             }
             retainedTerrainMeshes.push_back(catalogMesh);
@@ -702,6 +1054,11 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
 
     // Log approximate memory use
     LOG::logline("-- Distant landscape memory use: %u MB", file_size / (1 << 20));
+    LOG::logline(
+        "-- Retained terrain catalog payload: %u MB (%u MB of repeated indices shared; %u unique streams)",
+        static_cast<unsigned>(retainedTerrainBlob.size() / (1 << 20)),
+        static_cast<unsigned>(sharedTerrainIndexBytes / (1 << 20)),
+        uniqueTerrainIndexStreams);
 
     // Architecture B Format_Loader (task 6.1): after the existing mesh table read, attempt
     // to load the additive per-cell composite set. loadCompositeSet() classifies the
@@ -723,12 +1080,8 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
             const auto* bytes = compositePool.blob.data() + composite.poolOffset;
             mesh.materialIdentity = hashBytes(bytes, composite.byteLength);
             mesh.materialBytes = composite.byteLength;
+            mesh.materialOffset = 0;
             mesh.flags |= RetainedCatalog::MeshFlagCompositeDxt1;
-            if (!appendBytes(retainedTerrainBlob, bytes, composite.byteLength, mesh.materialOffset)) {
-                retainedTerrainMeshes.clear();
-                retainedTerrainBlob.clear();
-                return false;
-            }
         }
     }
 
@@ -739,18 +1092,19 @@ bool DistantLandShare::initLandscapeServer(IPC::Vec<IPC::LandscapeBuffers>& land
 bool DistantLandShare::setCurrentWorldSpace(const char* name) {
     auto it = mapWorldSpaces.find(name);
     if (it != mapWorldSpaces.end()) {
-        const auto* nextWorldSpace = &it->second;
-        if (currentWorldSpace != nextWorldSpace) {
+        if (!hasRetainedCatalogWorldspaceKey ||
+            retainedCatalogWorldspaceKey != it->first) {
             ++retainedCatalogGeneration;
+            retainedCatalogWorldspaceKey = it->first;
+            hasRetainedCatalogWorldspaceKey = true;
         }
-        currentWorldSpace = nextWorldSpace;
+        currentWorldSpace = &it->second;
         hasCurrentWorldSpace = true;
         return true;
     }
 
-    if (currentWorldSpace != nullptr || hasCurrentWorldSpace) {
-        ++retainedCatalogGeneration;
-    }
+    // Temporary interior deselection does not mutate the retained exterior catalog.
+    // Keep the last valid key so reselecting that exterior preserves its content token.
     currentWorldSpace = nullptr;
     hasCurrentWorldSpace = false;
     return false;
@@ -877,7 +1231,8 @@ bool DistantLandShare::writeRetainedCatalog(
     }
     std::unordered_map<std::uint64_t, std::uint64_t> placementWitnesses;
 
-    auto collectStatics = [&](const std::unique_ptr<QuadTree>& tree) {
+    auto collectStatics = [&](const std::unique_ptr<QuadTree>& tree,
+                              RetainedCatalog::Tier tier) {
         if (!tree) {
             return true;
         }
@@ -900,18 +1255,25 @@ bool DistantLandShare::writeRetainedCatalog(
             RetainedCatalog::Placement placement = {};
             placement.identity = mesh.retainedPlacementIdentity;
             placement.prototypeIdentity = mesh.retainedPrototypeIdentity;
+            placement.sourceRecordIdentity = mesh.sourceRecordIdentity;
             std::memcpy(placement.transform, &mesh.transform, sizeof(placement.transform));
             placement.cellX = mesh.cellX;
             placement.cellY = mesh.cellY;
             placement.flags = mesh.enabled ? 1u : 0u;
+            placement.tier = tier;
 
             std::uint64_t witness = hashBytes(
                 &placement.prototypeIdentity,
                 sizeof(placement.prototypeIdentity),
                 1099511628211ull);
+            witness = hashBytes(
+                &placement.sourceRecordIdentity,
+                sizeof(placement.sourceRecordIdentity),
+                witness);
             witness = hashBytes(placement.transform, sizeof(placement.transform), witness);
             witness = hashBytes(&placement.cellX, sizeof(placement.cellX), witness);
             witness = hashBytes(&placement.cellY, sizeof(placement.cellY), witness);
+            witness = hashBytes(&placement.tier, sizeof(placement.tier), witness);
             const auto [known, inserted] = placementWitnesses.emplace(placement.identity, witness);
             if (!inserted) {
                 if (known->second != witness) {
@@ -926,9 +1288,11 @@ bool DistantLandShare::writeRetainedCatalog(
     };
 
     // Complete-tree traversal is intentional: frustum visibility never owns retained lifetime.
-    if (!collectStatics(currentWorldSpace->NearStatics) ||
-        !collectStatics(currentWorldSpace->FarStatics) ||
-        !collectStatics(currentWorldSpace->VeryFarStatics)) {
+    // The tree a placement lives in is its size-derived visibility tier, which the consumer
+    // needs in order to bound small statics to short ranges.
+    if (!collectStatics(currentWorldSpace->NearStatics, RetainedCatalog::Tier::Near) ||
+        !collectStatics(currentWorldSpace->FarStatics, RetainedCatalog::Tier::Far) ||
+        !collectStatics(currentWorldSpace->VeryFarStatics, RetainedCatalog::Tier::VeryFar)) {
         return false;
     }
 
@@ -966,6 +1330,38 @@ bool DistantLandShare::writeRetainedCatalog(
     std::sort(sortedPrototypeIds.begin(), sortedPrototypeIds.end());
 
     std::vector<std::uint8_t> blob = retainedTerrainBlob;
+    std::unordered_map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>>
+        sourceRecordSpans;
+    for (auto& placement : placements) {
+        if (placement.sourceRecordIdentity == 0) {
+            continue;
+        }
+        const auto recordName =
+            retainedStaticRecordNames.find(placement.sourceRecordIdentity);
+        if (recordName == retainedStaticRecordNames.end() ||
+            recordName->second.empty() ||
+            recordName->second.size() > std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+        auto span = sourceRecordSpans.find(placement.sourceRecordIdentity);
+        if (span == sourceRecordSpans.end()) {
+            std::uint32_t offset = 0;
+            const auto bytes = static_cast<std::uint32_t>(recordName->second.size());
+            if (!appendBytes(
+                    blob,
+                    reinterpret_cast<const std::uint8_t*>(recordName->second.data()),
+                    bytes,
+                    offset)) {
+                return false;
+            }
+            span = sourceRecordSpans.emplace(
+                placement.sourceRecordIdentity,
+                std::make_pair(offset, bytes)).first;
+        }
+        placement.sourceRecordOffset = span->second.first;
+        placement.sourceRecordBytes = span->second.second;
+    }
+
     const auto copyStaticSpan = [&](std::uint32_t sourceOffset,
                                     std::uint32_t bytes,
                                     std::uint32_t& destinationOffset) {
@@ -984,7 +1380,12 @@ bool DistantLandShare::writeRetainedCatalog(
         auto mesh = sourceMesh;
         if (!copyStaticSpan(sourceMesh.vertexOffset, sourceMesh.vertexBytes, mesh.vertexOffset) ||
             !copyStaticSpan(sourceMesh.indexOffset, sourceMesh.indexBytes, mesh.indexOffset) ||
-            !copyStaticSpan(sourceMesh.materialOffset, sourceMesh.materialBytes, mesh.materialOffset)) {
+            !copyStaticSpan(sourceMesh.materialOffset, sourceMesh.materialBytes, mesh.materialOffset) ||
+            (sourceMesh.sourceNifBytes != 0 &&
+             !copyStaticSpan(
+                 sourceMesh.sourceNifOffset,
+                 sourceMesh.sourceNifBytes,
+                 mesh.sourceNifOffset))) {
             return false;
         }
         meshes.push_back(mesh);

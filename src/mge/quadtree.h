@@ -13,10 +13,10 @@
 struct QuadTreeMesh: public RenderMesh {
     BoundingSphere sphere;
     BoundingBox box;
-    // Host-only retained-world metadata. These fields are never copied into the
-    // cross-process RenderMesh base and contain no process-local pointers.
+    // Catalog-only metadata stays host-side. The stable placement identity lives in
+    // RenderMesh so visibility records preserve it across the IPC boundary.
     std::uint64_t retainedPrototypeIdentity = 0;
-    std::uint64_t retainedPlacementIdentity = 0;
+    std::uint64_t sourceRecordIdentity = 0;
 
     QuadTreeMesh(
         const BoundingSphere& b_sphere,

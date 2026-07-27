@@ -188,7 +188,7 @@ namespace MGEgui.DirectX {
         }
     }
 
-    class TextureBank {
+    class TextureBank : IDisposable {
         public LTEX t1, t2, t3, t4;
         public VertexBuffer wBuffer;
 
@@ -378,13 +378,25 @@ namespace MGEgui.DirectX {
             wBuffer.Unlock();
         }
 
+        public void Dispose() {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        private void Dispose(bool disposing) {
+            if (wBuffer != null) {
+                wBuffer.Dispose();
+                wBuffer = null;
+            }
+        }
+
         ~TextureBank() {
-            wBuffer.Dispose();
+            Dispose(false);
         }
 
     };
 
-    class CellTexCreator {
+    class CellTexCreator : IDisposable {
         private struct CellVertex {
             public float x, y, z, w;
             public float u, v;
@@ -433,6 +445,8 @@ namespace MGEgui.DirectX {
         private VertexBuffer colorBuffer;
         private System.Collections.Generic.List<TextureBank> texBanks;
         private IndexBuffer iBuffer;
+        private VertexDeclaration declaration;
+        private VertexDeclaration normalDeclaration;
         private float texelSize;
 
         private Effect effect;
@@ -497,6 +511,8 @@ namespace MGEgui.DirectX {
 
             // Create the buffers that will contain different information during each render
             colorBuffer = new VertexBuffer(DXMain.device, NormalColorVertex.Stride * 65 * 65, Usage.WriteOnly, NormalColorVertex.Format, Pool.Managed);
+            declaration = new VertexDeclaration(DXMain.device, Elements);
+            normalDeclaration = new VertexDeclaration(DXMain.device, NormalElements);
 
             ResetColorsAndNormals();
 
@@ -531,9 +547,26 @@ namespace MGEgui.DirectX {
             colorBuffer.Unlock();
         }
 
+        private void DisposeTextureBanks() {
+            Exception firstFailure = null;
+            for (int i = texBanks.Count - 1; i >= 0; i--) {
+                try {
+                    texBanks[i].Dispose();
+                    texBanks.RemoveAt(i);
+                } catch (Exception ex) {
+                    if (firstFailure == null) {
+                        firstFailure = ex;
+                    }
+                }
+            }
+            if (firstFailure != null) {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
+            }
+        }
+
         public void SetDefaultCell(LTEX tex) {
             ResetColorsAndNormals();
-            texBanks.Clear();
+            DisposeTextureBanks();
             var tb = new TextureBank();
             tb.SetSingleTexture(tex);
             texBanks.Add(tb);
@@ -561,7 +594,7 @@ namespace MGEgui.DirectX {
             colorBuffer.Unlock();
 
             // Dispose of any current texture banks
-            texBanks.Clear();
+            DisposeTextureBanks();
 
             // Group the unique textures in this cell in fours
 
@@ -585,8 +618,11 @@ namespace MGEgui.DirectX {
 
             // Create one bank for each group of 4 textures
             int index = 0;
-            var tb = new TextureBank();
+            TextureBank tb = null;
             foreach (LTEX tex in tex_dict.Values) {
+                if (tb == null) {
+                    tb = new TextureBank();
+                }
                 switch (index) {
                     case 0:
                         tb.t1 = tex;
@@ -603,13 +639,13 @@ namespace MGEgui.DirectX {
                     case 3:
                         tb.t4 = tex;
                         texBanks.Add(tb);
-                        tb = new TextureBank();
+                        tb = null;
                         index = 0;
                         break;
                 }
             }
 
-            if (index != 0) {
+            if (tb != null) {
                 texBanks.Add(tb);
             }
 
@@ -619,12 +655,83 @@ namespace MGEgui.DirectX {
             }
         }
 
+        private static void RememberCleanupFailure(ref Exception firstFailure, Exception failure) {
+            if (firstFailure == null) {
+                firstFailure = failure;
+            }
+        }
+
+        private static void TryUnbindStream(int stream) {
+            try {
+                DXMain.device.SetStreamSource(stream, null, 0, 0);
+            } catch {
+            }
+        }
+
+        private static void TryUnbindTexture(int stage) {
+            try {
+                DXMain.device.SetTexture(stage, null);
+            } catch {
+            }
+        }
+
+        private static void TryClearIndices() {
+            try {
+                DXMain.device.Indices = null;
+            } catch {
+            }
+        }
+
+        private static void TryClearVertexDeclaration() {
+            try {
+                DXMain.device.VertexDeclaration = null;
+            } catch {
+            }
+        }
+
+        private static void DisposeResource<T>(ref T resource, ref Exception firstFailure) where T : class, IDisposable {
+            if (resource == null) {
+                return;
+            }
+            try {
+                resource.Dispose();
+                resource = null;
+            } catch (Exception ex) {
+                RememberCleanupFailure(ref firstFailure, ex);
+            }
+        }
+
         public void Dispose() {
-            vBuffer.Dispose();
-            iBuffer.Dispose();
-            colorBuffer.Dispose();
-            texBanks.Clear();
-            effect.Dispose();
+            if (DXMain.device != null) {
+                // These bindings are advisory cleanup. D3D9 wrappers may reject null bindings, but
+                // that must not turn a completed texture bake into a worker failure.
+                TryUnbindStream(0);
+                TryUnbindStream(1);
+                TryUnbindStream(2);
+                TryClearIndices();
+                TryClearVertexDeclaration();
+                TryUnbindTexture(0);
+                TryUnbindTexture(1);
+                TryUnbindTexture(2);
+                TryUnbindTexture(3);
+            }
+
+            Exception firstFailure = null;
+            try {
+                DisposeTextureBanks();
+            } catch (Exception ex) {
+                RememberCleanupFailure(ref firstFailure, ex);
+            }
+            DisposeResource(ref declaration, ref firstFailure);
+            DisposeResource(ref normalDeclaration, ref firstFailure);
+            DisposeResource(ref vBuffer, ref firstFailure);
+            DisposeResource(ref iBuffer, ref firstFailure);
+            DisposeResource(ref colorBuffer, ref firstFailure);
+            DisposeResource(ref effect, ref firstFailure);
+
+            if (firstFailure != null) {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
+            }
         }
 
         public void Begin() {
@@ -634,9 +741,8 @@ namespace MGEgui.DirectX {
 
             DXMain.device.SetStreamSource(0, vBuffer, 0, CellVertex.Stride);
             DXMain.device.SetStreamSource(1, colorBuffer, 0, NormalColorVertex.Stride);
-            var decl = new VertexDeclaration(DXMain.device, Elements);
             DXMain.device.Indices = iBuffer;
-            DXMain.device.VertexDeclaration = decl;
+            DXMain.device.VertexDeclaration = declaration;
         }
 
         public void BeginNormalMap() {
@@ -646,9 +752,8 @@ namespace MGEgui.DirectX {
 
             DXMain.device.SetStreamSource(0, vBuffer, 0, CellVertex.Stride);
             DXMain.device.SetStreamSource(1, colorBuffer, 0, NormalColorVertex.Stride);
-            var decl = new VertexDeclaration(DXMain.device, NormalElements);
             DXMain.device.Indices = iBuffer;
-            DXMain.device.VertexDeclaration = decl;
+            DXMain.device.VertexDeclaration = normalDeclaration;
         }
 
         public void Render(float pos_x, float pos_y, float scale_x, float scale_y, bool applyVertexColor = true) {
@@ -736,7 +841,7 @@ namespace MGEgui.DirectX {
         }
     }
 
-    class WorldTexCreator {
+    class WorldTexCreator : IDisposable {
         private const string DefaultTex = @"data files\distantland\default.dds";
 
         private Texture CompressedTex;
@@ -763,19 +868,64 @@ namespace MGEgui.DirectX {
         }
 
         public void Begin() {
-            Surface rt = DXMain.device.GetRenderTarget(0);
-            if (rt != RenderTarget) {
-                DXMain.device.SetRenderTarget(0, RenderTarget);
-            }
-            rt.Dispose();
-
+            // GetRenderTarget can return the same SlimDX wrapper held by DXMain.BackBuffer. Binding
+            // directly avoids disposing that shared wrapper while switching to this owned target.
+            DXMain.device.SetRenderTarget(0, RenderTarget);
             DXMain.device.Clear(ClearFlags.Target, 0, 0.0f, 0);
         }
 
+        private static void DisposeSurface(Surface surface, ref Exception firstFailure) {
+            if (surface == null) {
+                return;
+            }
+            try {
+                surface.Dispose();
+            } catch (Exception ex) {
+                RememberCleanupFailure(ref firstFailure, ex);
+            }
+        }
+
+        private void CopyRenderTargetToUncompressed() {
+            Surface destination = null;
+            Exception operationFailure = null;
+            try {
+                destination = UncompressedTex.GetSurfaceLevel(0);
+                Surface.FromSurface(destination, RenderTarget, Filter.None, 0);
+            } catch (Exception ex) {
+                operationFailure = ex;
+                throw;
+            } finally {
+                Exception cleanupFailure = null;
+                DisposeSurface(destination, ref cleanupFailure);
+                if (operationFailure == null && cleanupFailure != null) {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+                }
+            }
+        }
+
+        private void CopyCompressedMip(int level) {
+            Surface destination = null;
+            Surface source = null;
+            Exception operationFailure = null;
+            try {
+                destination = CompressedTex.GetSurfaceLevel(level);
+                source = UncompressedTex.GetSurfaceLevel(level);
+                Surface.FromSurface(destination, source, Filter.None, 0);
+            } catch (Exception ex) {
+                operationFailure = ex;
+                throw;
+            } finally {
+                Exception cleanupFailure = null;
+                DisposeSurface(source, ref cleanupFailure);
+                DisposeSurface(destination, ref cleanupFailure);
+                if (operationFailure == null && cleanupFailure != null) {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+                }
+            }
+        }
+
         public void FinishCompressed(string path, bool isSRGB) {
-            Surface tmp = UncompressedTex.GetSurfaceLevel(0);
-            Surface.FromSurface(tmp, RenderTarget, Filter.None, 0);
-            tmp.Dispose();
+            CopyRenderTargetToUncompressed();
 
             // Generate mips
             Filter filter = Filter.Triangle | (isSRGB ? Filter.Srgb : 0);
@@ -783,18 +933,14 @@ namespace MGEgui.DirectX {
 
             // Compress mips
             for (int i = 0; i < CompressedTex.LevelCount; i++) {
-                Surface dest = CompressedTex.GetSurfaceLevel(i);
-                Surface src = UncompressedTex.GetSurfaceLevel(i);
-                Surface.FromSurface(dest, src, Filter.None, 0);
+                CopyCompressedMip(i);
             }
 
             Texture.ToFile(CompressedTex, path, ImageFileFormat.Dds);
         }
 
         public void FinishUncompressed(string path, bool isSRGB) {
-            Surface tmp = UncompressedTex.GetSurfaceLevel(0);
-            Surface.FromSurface(tmp, RenderTarget, Filter.None, 0);
-            tmp.Dispose();
+            CopyRenderTargetToUncompressed();
 
             // Generate mips
             Filter filter = Filter.Triangle | (isSRGB ? Filter.Srgb : 0);
@@ -803,11 +949,46 @@ namespace MGEgui.DirectX {
             Texture.ToFile(UncompressedTex, path, ImageFileFormat.Dds);
         }
 
+        private static void TryRestoreBackBuffer() {
+            if (DXMain.device == null || DXMain.BackBuffer == null || DXMain.BackBuffer.Disposed) {
+                return;
+            }
+            try {
+                DXMain.device.SetRenderTarget(0, DXMain.BackBuffer);
+            } catch {
+                // The owner still releases every wrapper if the device cannot accept state changes.
+            }
+        }
+
+        private static void RememberCleanupFailure(ref Exception firstFailure, Exception failure) {
+            if (firstFailure == null) {
+                firstFailure = failure;
+            }
+        }
+
+        private static void DisposeResource<T>(ref T resource, ref Exception firstFailure) where T : class, IDisposable {
+            if (resource == null) {
+                return;
+            }
+            try {
+                resource.Dispose();
+                resource = null;
+            } catch (Exception ex) {
+                RememberCleanupFailure(ref firstFailure, ex);
+            }
+        }
+
         public void Dispose() {
-            RenderTarget.Dispose();
-            CompressedTex.Dispose();
-            UncompressedTex.Dispose();
-            RenderTargetTex.Dispose();
+            TryRestoreBackBuffer();
+
+            Exception firstFailure = null;
+            DisposeResource(ref RenderTarget, ref firstFailure);
+            DisposeResource(ref CompressedTex, ref firstFailure);
+            DisposeResource(ref UncompressedTex, ref firstFailure);
+            DisposeResource(ref RenderTargetTex, ref firstFailure);
+            if (firstFailure != null) {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
+            }
         }
     };
 }

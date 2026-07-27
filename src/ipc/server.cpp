@@ -256,7 +256,8 @@ namespace IPC {
 			LOG::logline("Rejected GetVisibleMeshesCoarse RPC with invalid output vector %u", params.visibleSet);
 			return;
 		}
-		vec->truncate(0);
+		// The client owns reset/append semantics. In particular, distant statics issue
+		// near/far/very-far queries into one vector and require all three bands to append.
 		DistantLandShare::getVisibleMeshesCoarse(*vec, params.viewFrustum, params.sort, params.setFlags);
 	}
 
@@ -267,7 +268,8 @@ namespace IPC {
 			LOG::logline("Rejected GetVisibleMeshes RPC with invalid output vector %u", params.visibleSet);
 			return;
 		}
-		vec->truncate(0);
+		// Do not truncate here: cullDistantStatics deliberately accumulates three
+		// independently ranged categories after clearing the vector once on the client.
 		DistantLandShare::getVisibleMeshes(*vec, params.viewFrustum, params.viewSphere, params.sort, params.setFlags);
 	}
 
@@ -314,6 +316,20 @@ namespace IPC {
     void Server::getRetainedWorldCatalog() {
         auto& params = m_ipcParameters->params.retainedCatalogParams;
         params.available = false;
+        params.unchanged = false;
+        params.generation = DistantLandShare::retainedCatalogGeneration;
+
+        // Periodic client probes are intentionally cheap. The host generation is bumped
+        // whenever worldspace or dynamic visibility changes, so an equal nonzero generation
+        // proves the existing validated snapshot is still authoritative without rebuilding,
+        // copying, and hashing the full placement/blob catalog.
+        if (params.knownGeneration != 0 &&
+            params.knownGeneration == params.generation &&
+            DistantLandShare::hasCurrentWorldSpace) {
+            params.available = true;
+            params.unchanged = true;
+            return;
+        }
 
         auto header = getVec<RetainedCatalog::Header>(params.header);
         auto cells = getVec<RetainedCatalog::Cell>(params.cells);
@@ -327,5 +343,6 @@ namespace IPC {
 
         params.available = DistantLandShare::writeRetainedCatalog(
             *header, *cells, *meshes, *placements, *blob);
+        params.generation = DistantLandShare::retainedCatalogGeneration;
     }
 }

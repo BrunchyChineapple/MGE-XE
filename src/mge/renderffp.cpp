@@ -17,18 +17,11 @@
 #include "support/log.h"
 #include "mge/compositebinder.h"   // selectGroundTexture (Texture_Binder, task 9.5)
 
-// --- Direct Remix-API batched-submission experiment (distant statics) ---
-#ifndef REMIX_ALLOW_X86
-#define REMIX_ALLOW_X86
-#endif
-#include "remix_api_test.h"   // RemixAPITest::getInterface()
-#include "remix_c.h"          // remixapi_* structs / entrypoints
 #include "retained_world.h"
-#include "world_batch.h"      // worldBatchTier1Enabled() — runtime in-game toggle (MGE Batching MCM)
+#include "msoc_bridge.h"
 #include "haze_config.h"      // hazeConfig() — live MCM/env tuning for the aerial-perspective haze
 #include "dlcull_config.h"    // dlCullConfig() — live MCM/env tuning for the distant-static near-cull
 #include <cstdlib>            // getenv
-#include <cstdio>             // swprintf_s (texture-hash pseudo-path formatting)
 #include <cmath>              // powf/expf/exp2f/sqrtf/fabsf (aerial-perspective inscatter bake)
 
 // FVF for uncompressed statics: position + normal + diffuse color + texcoord
@@ -44,29 +37,24 @@ struct StaticFFPVertex {
 static const int SIZEOF_STATIC_FFP_VERT = sizeof(StaticFFPVertex);
 
 // FVF for uncompressed land: position + normal + ONE texcoord.
-// Remix's FFP geometry path only ray-traces single-texcoord-set vertices: a TEX2 (dual-UV) land
-// vertex draws successfully at the D3D9 level (HRESULT 0) but Remix silently produces no geometry,
-// so the distant land vanished. The rejection was specific to a second TEXCOORD set, NOT to a
-// normal: the distant-statics FFP vertex (StaticFFPVertex) is XYZ|NORMAL|DIFFUSE|TEX1 and Remix
-// ray-traces it correctly. We therefore keep a SINGLE texcoord set (and write the PER-CELL composite
-// UV into it, each land mesh being exactly one cell) while adding D3DFVF_NORMAL so Remix shades the
-// terrain from smooth per-vertex normals instead of faceted geometry-derived ones. The detail stage
-// tiles off the same single texcoord set. The atlas fallback (rare, transient: a cell newly entering
-// view before its composite has streamed) samples world.dds with this per-cell UV; it self-corrects
-// within a frame once resident.
+// Remix's FFP geometry path silently rejects a second TEXCOORD set, so atlas and per-cell
+// composite UVs cannot coexist in one vertex. Keep two cached one-UV buffers per source mesh:
+// one decodes the authored province-atlas UV and one derives the cell-local composite UV.
+// The draw selects the buffer whose UV domain matches the bound stage-0 texture.
 #define LAND_FFP_FVF (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1)
 
 struct LandFFPVertex {
     float x, y, z;       // Position (12 bytes)
     float nx, ny, nz;    // Normal (12 bytes) — smooth per-vertex normal decoded from the land vertex
-    float u, v;          // Per-cell composite texcoord, [0,1] within the cell (8 bytes)
+    float u, v;          // Active stage-0 texture coordinate (8 bytes)
 };                       // Total: 32 bytes
 
 static const int SIZEOF_LAND_FFP_VERT = sizeof(LandFFPVertex);
 
-// Maps from compressed VB → uncompressed FFP VB
+// Maps from compressed VB → uncompressed FFP VB.
 static std::unordered_map<IDirect3DVertexBuffer9*, IDirect3DVertexBuffer9*> staticFFPBuffers;
 static std::unordered_map<IDirect3DVertexBuffer9*, IDirect3DVertexBuffer9*> landFFPBuffers;
+static std::unordered_map<IDirect3DVertexBuffer9*, IDirect3DVertexBuffer9*> landAtlasFFPBuffers;
 
 static float halfToFloat(unsigned short h) {
     unsigned int sign = (h >> 15) & 1;
@@ -149,11 +137,18 @@ static IDirect3DVertexBuffer9* getOrCreateStaticFFPBuffer(IDirect3DDevice9* devi
     return ffpVB;
 }
 
-static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(IDirect3DDevice9* device, IDirect3DVertexBuffer9* compressedVB, int vertCount, int cellX, int cellY) {
+static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(
+    IDirect3DDevice9* device,
+    IDirect3DVertexBuffer9* compressedVB,
+    int vertCount,
+    int cellX,
+    int cellY,
+    bool useCompositeUV) {
     if (!compressedVB || vertCount <= 0) return nullptr;
 
-    auto it = landFFPBuffers.find(compressedVB);
-    if (it != landFFPBuffers.end()) {
+    auto& buffers = useCompositeUV ? landFFPBuffers : landAtlasFFPBuffers;
+    auto it = buffers.find(compressedVB);
+    if (it != buffers.end()) {
         return it->second;
     }
 
@@ -164,10 +159,6 @@ static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(IDirect3DDevice9* device
         return nullptr;
     }
 
-    // Cell origin in world units. Each land mesh is exactly one 8192-unit cell now, so per-cell
-    // composite UVs are u = frac((worldX - cellMinX)/8192), v = 1 - frac((worldY - cellMinY)/8192)
-    // (the V flip matches the top-left texture origin the Composite_Baker renders into). Computing
-    // the UV here from the vertex's own world XY keeps the on-disk world format unchanged.
     const float cellMinX = (float)cellX * 8192.0f;
     const float cellMinY = (float)cellY * 8192.0f;
 
@@ -187,24 +178,29 @@ static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(IDirect3DDevice9* device
             dst->z = pos[2];
 
             // Appended UBYTE4N surface normal at offset 16 within the 20-byte compressed land vertex
-            // (Position@0, texCoord@12, Normal@16). Decode xyz exactly like the proven statics path:
-            // (b/255)*2-1. The 4th byte is pad and ignored. Supplying this normal lets Remix shade the
-            // terrain smoothly even though the FFP land pass runs D3DRS_LIGHTING FALSE.
+            // (Position@0, texCoord@12, Normal@16). Decode xyz exactly like the proven statics path.
             const unsigned char* norm = src + 16;
             dst->nx = (norm[0] / 255.0f) * 2.0f - 1.0f;
             dst->ny = (norm[1] / 255.0f) * 2.0f - 1.0f;
             dst->nz = (norm[2] / 255.0f) * 2.0f - 1.0f;
 
-            // Per-cell composite UV from world position into the single texcoord set:
-            // u = frac((worldX - cellMinX)/8192), v = 1 - frac((worldY - cellMinY)/8192). The V flip
-            // matches the top-left texture origin the Composite_Baker renders into. Clamped via floor
-            // so a vertex on the far cell seam (frac == 0) maps to the edge instead of wrapping.
-            float cu = (pos[0] - cellMinX) / 8192.0f;
-            float cv = (pos[1] - cellMinY) / 8192.0f;
-            cu -= floorf(cu);
-            cv -= floorf(cv);
-            dst->u = cu;
-            dst->v = 1.0f - cv;
+            if (useCompositeUV) {
+                // Exact far-edge coordinates must remain 1.0 rather than wrap to the opposite
+                // side of the per-cell composite.
+                float cu = (pos[0] - cellMinX) / 8192.0f;
+                float cv = (pos[1] - cellMinY) / 8192.0f;
+                cu = cu < 0.0f ? 0.0f : (cu > 1.0f ? 1.0f : cu);
+                cv = cv < 0.0f ? 0.0f : (cv > 1.0f ? 1.0f : cv);
+                dst->u = cu;
+                dst->v = 1.0f - cv;
+            } else {
+                // The generator preserves the original province-atlas SHORT2N UV at offset 12.
+                // Use it whenever world.dds is bound; applying cell-local UVs to that atlas is the
+                // malformed brown/green blob failure this fallback must avoid.
+                const short* tc = (const short*)(src + 12);
+                dst->u = tc[0] / 32767.0f;
+                dst->v = tc[1] / 32767.0f;
+            }
 
             src += SIZEOFLANDVERT; // 20: Position(12) + texCoord(4) + Normal(4)
             dst++;
@@ -214,245 +210,25 @@ static IDirect3DVertexBuffer9* getOrCreateLandFFPBuffer(IDirect3DDevice9* device
     compressedVB->Unlock();
     ffpVB->Unlock();
 
-    landFFPBuffers[compressedVB] = ffpVB;
+    buffers[compressedVB] = ffpVB;
     return ffpVB;
 }
 
 
-// ---------------------------------------------------------------------------
-// Direct Remix-API batched submission of distant statics (Tier 1).
-//
-// Transcodes the SAME geometry renderDistantStaticsFFP already draws via FFP into the
-// fork's CreateMeshBatched + DrawInstance path: the mesh is the LOCAL decoded geometry and
-// the real per-instance world matrix rides on the DrawInstance (mirroring the working FFP
-// path, NOT MegaGeo's world-space identity bake). info.hash == the legacy replacement key so
-// existing toolkit replacements apply. Gated by worldBatchTier1Enabled() (the MGE Batching
-// MCM master + "distant" sub-toggle; falls back to the mge_batch_statics.txt marker / env
-// MGE_BATCH_STATICS when no MCM cfg is present). See world_batch.h.
-
-
-static std::unordered_map<IDirect3DVertexBuffer9*, remixapi_MeshHandle> g_batchMeshCache;
-
-// Per-VB frame number when first submitted this session. Used by the FFP-suppression
-// warm-up gate: a static is drawn additively (FFP + batched) on its first frame so the
-// FFP draw registers its texture (the fork legacy-texture registry is populated from the
-// D3D9 draw path) and the API material finalizes; from the NEXT frame on, the duplicate
-// FFP draw is suppressed and the batched copy stands alone. Cleared in releaseFFPBuffers.
-static std::unordered_map<IDirect3DVertexBuffer9*, uint32_t> g_batchVBFirstFrame;
-static uint32_t g_batchFrameCounter = 0;
-
-// FNV-1a 64. Used to give each batched mesh a STABLE, content-derived hash (not the
-// per-session VB pointer) so the geometry has a consistent identity across runs and can
-// be targeted/replaced in the Remix toolkit like a normal captured asset.
+// FNV-1a 64, used for stable content-derived identities (MSOC occlusion query keys).
 static uint64_t fnv1a64(const void* data, size_t len, uint64_t h = 1469598103934665603ull) {
     const unsigned char* p = (const unsigned char*)data;
     for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
 
-// Tier 1 materials: one Remix material per source static texture. Keyed by the
-// bound IDirect3DTexture9* (distant statics are 1 VB : 1 texture, so this is 1:1
-// with g_batchMeshCache in practice). The material binds the captured VANILLA
-// texture directly via the fork's "0x<imagehash>" albedoTexture pseudo-path
-// (rtx_fork_api_entry.cpp::textureHashPathLookup resolves it against the live
-// TextureManager table by getImageHash()), so the batched copy shows the real
-// texture WITHOUT needing a USD replacement or an on-disk file path. info.hash is
-// also set to the texture hash so that, when a USD material replacement IS keyed
-// to this texture (E-man water, retextures), Remix's getReplacementMaterial(hash)
-// still wins and the replacement is inherited. A cached null means hash lookup
-// failed (e.g. sysmem texture) — those fall back to the Remix default material.
-static std::unordered_map<IDirect3DTexture9*, remixapi_MaterialHandle> g_batchMaterialCache;
-
-static remixapi_MaterialHandle ensureBatchMaterial(remixapi_Interface* remix,
-                                                   IDirect3DTexture9* tex, bool hasAlpha) {
-    auto it = g_batchMaterialCache.find(tex);
-    if (it != g_batchMaterialCache.end()) return it->second;
-
-    remixapi_MaterialHandle h = nullptr;
-    uint64_t texHash = 0;
-    if (tex && remix->CreateMaterial && remix->dxvk_GetTextureHash &&
-        remix->dxvk_GetTextureHash(tex, &texHash) == REMIXAPI_ERROR_CODE_SUCCESS && texHash != 0) {
-
-        // Fork pseudo-path: "0x<hex>" -> captured texture with that image hash.
-        wchar_t albedoPath[24];
-        swprintf_s(albedoPath, L"0x%016llX", (unsigned long long)texHash);
-
-        remixapi_MaterialInfoOpaqueEXT op = {};
-        op.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-        op.albedoConstant.x = 1.0f; op.albedoConstant.y = 1.0f; op.albedoConstant.z = 1.0f;
-        op.opacityConstant = 1.0f;
-        op.roughnessConstant = 1.0f;
-        op.metallicConstant = 0.0f;
-        // Mirror the FFP alpha behaviour: cutout statics (foliage) use GREATEREQUAL
-        // @ ref 128 (AlphaTestType::kGreaterOrEqual = 6); opaque statics DISABLE the
-        // alpha test, which maps to kAlways = 7 (always pass). NOTE: 0 is kNever
-        // (discard every fragment) — using it for opaque made textured meshes
-        // invisible once a real albedo texture was bound (the alpha test activates).
-        op.alphaTestType = hasAlpha ? 6 : 7;
-        op.alphaReferenceValue = 128;
-
-        remixapi_MaterialInfo mi = {};
-        mi.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
-        mi.pNext = &op;
-        mi.hash = texHash;              // == texture hash -> inherit USD replacements
-        mi.albedoTexture = albedoPath;  // captured vanilla texture by image hash
-        mi.emissiveIntensity = 0.0f;
-        // Sampler: match the game's linear+wrap state. Defaults (0) are
-        // lss::Mdl::Filter::Nearest + WrapMode::Clamp, which caused point-sampling
-        // banding and far statics collapsing to one color (tiled UVs clamping to a
-        // single edge texel). Linear (1) + Repeat (1) mirror the FFP sampler.
-        mi.filterMode = 1;   // lss::Mdl::Filter::Linear
-        mi.wrapModeU  = 1;   // lss::Mdl::WrapMode::Repeat
-        mi.wrapModeV  = 1;   // lss::Mdl::WrapMode::Repeat
-
-        remixapi_ErrorCode rc = remix->CreateMaterial(&mi, &h);
-        if (rc != REMIXAPI_ERROR_CODE_SUCCESS) h = nullptr;
-    }
-
-    g_batchMaterialCache[tex] = h;  // cache even null to avoid re-attempting
-    return h;
-}
-
-static remixapi_MeshHandle createBatchedStaticMesh(remixapi_Interface* remix, const RenderMesh& mesh) {
-    if (!mesh.vBuffer || !mesh.iBuffer || mesh.verts <= 0 || mesh.faces <= 0) return nullptr;
-
-    // Decode LOCAL vertices from the compressed static VB: half3 pos @0,
-    // ubyte4 normal @8, D3DCOLOR @12, half2 uv @16, stride 20 (same as getOrCreateStaticFFPBuffer).
-    std::vector<remixapi_HardcodedVertex> verts(mesh.verts);
-    void* vsrc = nullptr;
-    if (FAILED(mesh.vBuffer->Lock(0, 0, &vsrc, D3DLOCK_READONLY)) || !vsrc) return nullptr;
-    {
-        const unsigned char* p = (const unsigned char*)vsrc;
-        for (int i = 0; i < mesh.verts; ++i) {
-            remixapi_HardcodedVertex hv = {};
-            const unsigned short* pos16 = (const unsigned short*)(p + 0);
-            hv.position[0] = halfToFloat(pos16[0]);
-            hv.position[1] = halfToFloat(pos16[1]);
-            hv.position[2] = halfToFloat(pos16[2]);
-            const unsigned char* n = p + 8;
-            hv.normal[0] = (n[0] / 255.0f) * 2.0f - 1.0f;
-            hv.normal[1] = (n[1] / 255.0f) * 2.0f - 1.0f;
-            hv.normal[2] = (n[2] / 255.0f) * 2.0f - 1.0f;
-            hv.color = *(const DWORD*)(p + 12);
-            const unsigned short* tc = (const unsigned short*)(p + 16);
-            hv.texcoord[0] = halfToFloat(tc[0]);
-            hv.texcoord[1] = halfToFloat(tc[1]);
-            verts[i] = hv;
-            p += 20;
-        }
-    }
-    mesh.vBuffer->Unlock();
-
-    // Indices: triangle list, mesh.faces tris, 0-based into the VB (the FFP draw
-    // uses BaseVertexIndex 0 / StartIndex 0).
-    const uint32_t indexCount = (uint32_t)mesh.faces * 3u;
-    std::vector<uint32_t> idx(indexCount);
-    D3DINDEXBUFFER_DESC id = {};
-    mesh.iBuffer->GetDesc(&id);
-    void* isrc = nullptr;
-    if (FAILED(mesh.iBuffer->Lock(0, 0, &isrc, D3DLOCK_READONLY)) || !isrc) return nullptr;
-    if (id.Format == D3DFMT_INDEX32) {
-        const uint32_t* s = (const uint32_t*)isrc;
-        for (uint32_t k = 0; k < indexCount; ++k) idx[k] = s[k];
-    } else {
-        const unsigned short* s = (const unsigned short*)isrc;
-        for (uint32_t k = 0; k < indexCount; ++k) idx[k] = s[k];
-    }
-    mesh.iBuffer->Unlock();
-
-    remixapi_MeshInfoSurfaceTriangles surf = {};
-    surf.vertices_values = verts.data();
-    surf.vertices_count  = verts.size();
-    surf.indices_values  = idx.data();
-    surf.indices_count   = idx.size();
-    surf.skinning_hasvalue = 0;
-    // Bake the captured-vanilla-texture material (or default on lookup failure)
-    // into the surface. Statics are 1 VB : 1 texture, so the per-VB mesh cache and
-    // per-texture material cache stay consistent.
-    surf.material = ensureBatchMaterial(remix, mesh.tex, mesh.hasAlpha);
-
-    remixapi_MeshInfo info = {};
-    info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-    // Stable content hash (vertices + indices), NOT the VB pointer: gives the batched
-    // mesh a consistent identity across runs so it captures + replaces in the toolkit
-    // like a normal asset. verts are zero-initialized (HardcodedVertex has explicit
-    // padding) so the byte hash is deterministic.
-    uint64_t meshHash = fnv1a64(verts.data(), verts.size() * sizeof(remixapi_HardcodedVertex));
-    meshHash = fnv1a64(idx.data(), idx.size() * sizeof(uint32_t), meshHash);
-    info.hash  = meshHash;
-    info.surfaces_values = &surf;
-    info.surfaces_count  = 1;
-
-    remixapi_MeshHandle h = nullptr;
-    remixapi_ErrorCode rc = remix->CreateMeshBatched(&info, &h);
-    return (rc == REMIXAPI_ERROR_CODE_SUCCESS) ? h : nullptr;
-}
-
-// Submit a distant static through the Remix API. Returns TRUE when the duplicate FFP
-// draw should be SUPPRESSED (the batched copy fully stands in for it), FALSE when the
-// caller must still run the FFP draw (warm-up frame, or batching unavailable for this
-// mesh so the FFP draw is the correct visual).
-//
-// CRITICAL ordering: the batched mesh+material are NOT created until the VB has been
-// seen on a PRIOR frame. The "0x<hash>" material albedo resolves against the fork
-// legacy-texture registry, which is populated by the FFP draw (D3D9Rtx::processTextures).
-// Since this submit runs BEFORE the FFP draw in the loop (so it can request suppression
-// via an early continue), creating the material on the first frame would finalize it
-// before that frame's FFP draw registered the texture -> white material cached forever.
-// Deferring creation to the next frame guarantees the prior frame's FFP draw already
-// registered the texture (commands are processed FIFO), so the albedo resolves.
-static bool submitStaticBatched(remixapi_Interface* remix, const RenderMesh& mesh, uint32_t frame) {
-    // Warm-up gate FIRST — before creating anything.
-    auto fit = g_batchVBFirstFrame.find(mesh.vBuffer);
-    if (fit == g_batchVBFirstFrame.end()) {
-        g_batchVBFirstFrame[mesh.vBuffer] = frame;   // first sighting
-        return false;                                 // -> FFP draws, registers the texture
-    }
-    if (frame <= fit->second) {
-        return false;                                 // same first frame (other instances) -> FFP draws
-    }
-
-    // frame > firstFrame: the texture is registered now. Create the mesh+material once.
-    remixapi_MeshHandle h = nullptr;
-    auto it = g_batchMeshCache.find(mesh.vBuffer);
-    if (it != g_batchMeshCache.end()) {
-        h = it->second;
-    } else {
-        h = createBatchedStaticMesh(remix, mesh);   // also bakes/caches the texture-resolved material
-        g_batchMeshCache[mesh.vBuffer] = h;          // cache even null to avoid re-attempting a bad VB
-    }
-
-    // Need BOTH a valid mesh and a valid (texture-resolved) material to stand in for
-    // the FFP draw. If either is missing, submit NOTHING and let the FFP draw render
-    // (a flat/default batched copy coincident with the FFP geometry would z-fight).
-    remixapi_MaterialHandle mat = nullptr;
-    auto mit = g_batchMaterialCache.find(mesh.tex);
-    if (mit != g_batchMaterialCache.end()) mat = mit->second;
-    if (!h || !mat) return false;
-
-    remixapi_InstanceInfo info = {};
-    info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    info.categoryFlags = 0;
-    info.mesh = h;
-    // D3DXMATRIX is row-vector (translation in _41.._43). remix_Transform is a
-    // row-major 3x4 used column-vector (M*v), so it's the transpose of D3D's upper
-    // 3 rows, with translation in matrix[r][3]. Real position now (Z-lift removed).
-    const D3DXMATRIX& m = mesh.transform;
-    info.transform.matrix[0][0] = m._11; info.transform.matrix[0][1] = m._21; info.transform.matrix[0][2] = m._31; info.transform.matrix[0][3] = m._41;
-    info.transform.matrix[1][0] = m._12; info.transform.matrix[1][1] = m._22; info.transform.matrix[1][2] = m._32; info.transform.matrix[1][3] = m._42;
-    info.transform.matrix[2][0] = m._13; info.transform.matrix[2][1] = m._23; info.transform.matrix[2][2] = m._33; info.transform.matrix[2][3] = m._43;
-    info.doubleSided = 1;
-    remix->DrawInstance(&info);
-    return true;   // established -> suppress the duplicate FFP draw
-}
-
 // Render distant statics using fixed-function pipeline
 #ifdef MGE_RTX
-// Squared radial cull distance for distant statics, from the live "MGE Distant Cull"
-// MCM (mge_dlcull.cfg, polled ~500ms) with MGE_DL_NEARCULL_CELLS env fallback. Returns
-// 0 when disabled. See dlcull_config.h for the why. Kills the "double trees" by skipping
-// MGE distant statics the engine is still drawing as near statics.
-static float dlNearCullDistSq() {
+// Optional extra squared radial cull distance from the live "MGE Distant Cull" MCM
+// (mge_dlcull.cfg, polled ~500ms) with MGE_DL_NEARCULL_CELLS env fallback.
+// This is independent of the mandatory native near-view ownership handoff below and
+// independent of the per-texture suppress list.
+static float dlOptionalNearCullDistSq() {
     const DLCullConfig& c = dlCullConfig();
     if (!c.enabled || c.cells <= 0.0f) {
         return 0.0f;
@@ -473,6 +249,14 @@ void DistantLand::renderDistantStaticsFFP() {
     device->SetVertexShader(nullptr);
     device->SetPixelShader(nullptr);
     device->SetFVF(STATIC_FFP_FVF);
+
+    // Static UVs are authored as a tiled domain. Own the complete sampler contract here
+    // because the preceding terrain pass clamps stage 0 for per-cell composites.
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 
     device->SetTransform(D3DTS_VIEW, &mwView);
     D3DXMATRIX distProj = mwProj;
@@ -505,18 +289,6 @@ void DistantLand::renderDistantStaticsFFP() {
     IDirect3DTexture9* lastTex = nullptr;
     IDirect3DVertexBuffer9* lastVB = nullptr;
 
-    // Batched-submission experiment: resolve the Remix interface once per frame.
-    remixapi_Interface* batchRemix = nullptr;
-    if (worldBatchTier1Enabled() && RemixAPITest::isInitialized()) {
-        batchRemix = RemixAPITest::getInterface();
-        if (batchRemix && (!batchRemix->CreateMeshBatched || !batchRemix->DrawInstance || !batchRemix->CreateMaterial)) {
-            batchRemix = nullptr;
-        }
-    }
-
-    // One batch frame number per distant-statics pass; drives the warm-up gate.
-    uint32_t batchFrame = batchRemix ? ++g_batchFrameCounter : 0u;
-
     auto drawStatics = [&](auto& vset) {
         // Reusable scratch buffer: retains capacity across frames so the per-frame
         // drain of the (already state-sorted) visible set costs no heap alloc/free.
@@ -526,24 +298,93 @@ void DistantLand::renderDistantStaticsFFP() {
         localMeshes.clear();
         vset.Reset();
 #ifdef MGE_RTX
-        const float nearCullSq = dlNearCullDistSq();  // 0 => disabled
+        const float optionalNearCullSq = dlOptionalNearCullDistSq();  // 0 => disabled
 #endif
         while (!vset.AtEnd()) {
             RenderMesh m = vset.Next();
             if (!m.vBuffer || m.verts <= 0) continue;
 #ifdef MGE_RTX
-            // Scoped per-tree suppress: drop the distant copy of any object whose source
+            // A committed retained cell owns this placement, so reject the
+            // legacy copy before near-handoff math and MSOC batch construction.
+            if (m.cellValid &&
+                RetainedWorld::isCellCommitted(m.cellX, m.cellY)) {
+                continue;
+            }
+
+            // Remix traces the complete submitted mesh, so ownership must change only after
+            // Morrowind's near range no longer intersects the instance's world-space sphere.
+            // Malformed bounds fail open to the distant copy rather than hiding geometry.
+            const float viewDepth =
+                m.boundsCenter.x * mwView._13 +
+                m.boundsCenter.y * mwView._23 +
+                m.boundsCenter.z * mwView._33 + mwView._43;
+            const bool validOwnershipBounds =
+                std::isfinite(nearViewRange) &&
+                std::isfinite(viewDepth) &&
+                std::isfinite(m.boundsRadius) &&
+                m.boundsRadius >= 0.0f;
+            if (nearViewRange > 0.0f && validOwnershipBounds &&
+                viewDepth - m.boundsRadius <= nearViewRange) {
+                continue;
+            }
+
+            // Scoped per-texture suppress: drop the distant copy of any object whose source
             // texture is on the MCM suppress list (i.e. the trees you've replaced in Remix),
-            // so only your replacement renders. Everything else keeps its distant static.
+            // so only your replacement renders. This remains independent of both near culls.
             if (dlIsDistantTextureSuppressed(m.tex)) continue;
-            // Blanket radial near-cull the engine is already drawing near (see dlNearCullDistSq).
-            if (nearCullSq > 0.0f) {
-                const float dx = m.transform._41 - eyePos.x;
-                const float dy = m.transform._42 - eyePos.y;
-                if (dx * dx + dy * dy < nearCullSq) continue;
+
+            // Optional blanket radial extension from the MCM. This can hide the loaded-cell
+            // overlap beyond Morrowind's view boundary, but disabling it never disables the
+            // mandatory native handoff above.
+            if (optionalNearCullSq > 0.0f) {
+                const float dx = m.boundsCenter.x - eyePos.x;
+                const float dy = m.boundsCenter.y - eyePos.y;
+                if (dx * dx + dy * dy < optionalNearCullSq) continue;
             }
 #endif
             localMeshes.push_back(m);
+        }
+
+        // Query the complete visible-static batch against MSOC's published main-scene
+        // mask before any D3D or Remix submission work. The host-provided placement
+        // identity is stable across the 32/64-bit IPC boundary and already scopes the
+        // worldspace, placement, prototype subset, and source record. Missing identity
+        // remains zero so the bridge rejects it and the draw fails open.
+        static std::vector<MSOCBridge::SphereQuery> occlusionQueries;
+        static std::vector<std::uint8_t> occlusionCull;
+        occlusionCull.assign(localMeshes.size(), 0);
+        if (MSOCBridge::isSnapshotReady()) {
+            occlusionQueries.resize(localMeshes.size());
+            constexpr std::uint64_t kDistantStaticOcclusionDomain = 0x4d47455354415449ull;
+            for (std::size_t i = 0; i < localMeshes.size(); ++i) {
+                const auto& mesh = localMeshes[i];
+                std::uint64_t identity = 0;
+                if (mesh.retainedPlacementIdentity != 0) {
+                    identity = fnv1a64(
+                        &kDistantStaticOcclusionDomain,
+                        sizeof(kDistantStaticOcclusionDomain));
+                    identity = fnv1a64(
+                        &mesh.retainedPlacementIdentity,
+                        sizeof(mesh.retainedPlacementIdentity),
+                        identity);
+                    if (identity == 0) {
+                        identity = 1;
+                    }
+                }
+                occlusionQueries[i] = {
+                    identity,
+                    mesh.boundsCenter.x,
+                    mesh.boundsCenter.y,
+                    mesh.boundsCenter.z,
+                    mesh.boundsRadius
+                };
+            }
+            MSOCBridge::classifySpheres(
+                occlusionQueries.data(),
+                occlusionQueries.size(),
+                occlusionCull.data());
+        } else {
+            occlusionQueries.clear();
         }
 
         // One-entry cache: the statics set is state-sorted (sortVisibleSet ByState),
@@ -552,18 +393,9 @@ void DistantLand::renderDistantStaticsFFP() {
         IDirect3DVertexBuffer9* lastCompressedVB = nullptr;
         IDirect3DVertexBuffer9* lastResolvedFFP = nullptr;
 
-        for (const auto& mesh : localMeshes) {
-            if (mesh.cellValid &&
-                RetainedWorld::isCellCommitted(mesh.cellX, mesh.cellY)) {
-                continue;
-            }
-
-            // Batched submission first. When it fully stands in for the FFP draw
-            // (warmed up + valid mesh & texture-resolved material), suppress ALL the
-            // duplicate FFP work for this mesh — the actual perf win: no per-mesh
-            // SetTexture / SetTransform / FFP-VB resolve / SetStreamSource /
-            // DrawIndexedPrimitive, and no per-frame Remix hashing of the FFP draw.
-            if (batchRemix && submitStaticBatched(batchRemix, mesh, batchFrame)) {
+        for (std::size_t meshIndex = 0; meshIndex < localMeshes.size(); ++meshIndex) {
+            const auto& mesh = localMeshes[meshIndex];
+            if (occlusionCull[meshIndex]) {
                 continue;
             }
 
@@ -645,12 +477,8 @@ void DistantLand::renderDistantLandFFP(bool refreshVisibility) {
     device->SetTransform(D3DTS_VIEW, &mwView);
     device->SetTransform(D3DTS_PROJECTION, &distProj);
 
-    // Texture_Binder (task 9.5): the stage-0 ground texture is now chosen PER CHUNK
-    // inside the drawLand loop below (selectGroundTexture -> per-cell composite or the
-    // world.dds atlas), so the single pre-loop device->SetTexture(0, texWorldColour) is
-    // gone. The stage-0 sampler state still applies to whatever texture each chunk binds.
-    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
-    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    // Texture_Binder chooses stage 0 per chunk. Filtering is common to both texture domains;
+    // the draw loop selects WRAP for the province atlas and CLAMP for a per-cell composite.
     device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
@@ -785,8 +613,10 @@ void DistantLand::renderDistantLandFFP(bool refreshVisibility) {
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-    // Render each visible land chunk
+    // Render each visible land chunk.
     IDirect3DVertexBuffer9* lastVB = nullptr;
+    bool samplerAddressValid = false;
+    bool lastUsesCompositeUV = false;
 
     auto drawLand = [&](auto& vset) {
         // Reusable scratch buffer (see drawStatics): no per-frame heap alloc/free.
@@ -806,32 +636,36 @@ void DistantLand::renderDistantLandFFP(bool refreshVisibility) {
                 continue;
             }
 
-            IDirect3DVertexBuffer9* ffpVB = getOrCreateLandFFPBuffer(device, mesh.vBuffer, mesh.verts, mesh.cellX, mesh.cellY);
-            if (!ffpVB) continue;
+            IDirect3DTexture9* groundTex = selectGroundTexture(
+                mesh, DistantLand::compositeCache, texWorldColour);
+            bool useCompositeUV = groundTex != texWorldColour;
 
-            // Texture_Binder (task 9.5): pick this chunk's stage-0 ground texture — the
-            // chunk's resident Per_Cell_Composite when available and within budget, else the
-            // global world.dds atlas (texWorldColour). selectGroundTexture never returns null
-            // (Req 5.1, 5.2, 6.1). Exactly ONE stage-0 texture is bound per chunk, matching the
-            // Remix_FFP_Constraint that Remix ray-traces the FFP path from a single bound
-            // texture per draw — no live multi-texture splat (Req 5.5).
-            IDirect3DTexture9* groundTex = selectGroundTexture(mesh, DistantLand::compositeCache, texWorldColour);
-
-            // Single texcoord set (per-cell UV) drives whatever is bound to stage 0, so no texcoord
-            // index switching is needed. Both the composite and the (transient) atlas fallback sample
-            // with the per-cell UV; once a cell's composite is resident the bind is correct.
-
-            // Per-chunk fallback (Req 6.4): if binding the composite fails, fall back to the
-            // atlas for THIS chunk only; if the atlas bind also fails, skip ONLY this chunk and
-            // keep rendering the rest of the distant land. A texture failure on one chunk never
-            // breaks the loop, so a single transient failure can't blank the whole terrain.
+            // A failed composite bind falls back only this chunk. Switching the texture also
+            // switches the vertex buffer, so world.dds never receives cell-local coordinates.
             HRESULT hrTex = device->SetTexture(0, groundTex);
-            if (FAILED(hrTex) && groundTex != texWorldColour) {
-                hrTex = device->SetTexture(0, texWorldColour);
+            if (FAILED(hrTex) && useCompositeUV) {
+                groundTex = texWorldColour;
+                useCompositeUV = false;
+                hrTex = device->SetTexture(0, groundTex);
             }
             if (FAILED(hrTex)) {
                 continue;
             }
+
+            if (!samplerAddressValid || useCompositeUV != lastUsesCompositeUV) {
+                const D3DTEXTUREADDRESS address = useCompositeUV
+                    ? D3DTADDRESS_CLAMP
+                    : D3DTADDRESS_WRAP;
+                device->SetSamplerState(0, D3DSAMP_ADDRESSU, address);
+                device->SetSamplerState(0, D3DSAMP_ADDRESSV, address);
+                lastUsesCompositeUV = useCompositeUV;
+                samplerAddressValid = true;
+            }
+
+            IDirect3DVertexBuffer9* ffpVB = getOrCreateLandFFPBuffer(
+                device, mesh.vBuffer, mesh.verts, mesh.cellX, mesh.cellY,
+                useCompositeUV);
+            if (!ffpVB) continue;
 
             if (ffpVB != lastVB) {
                 device->SetStreamSource(0, ffpVB, 0, SIZEOF_LAND_FFP_VERT);
@@ -956,6 +790,7 @@ void DistantLand::renderGrassFFP() {
 
 // Release FFP vertex buffers
 void DistantLand::releaseFFPBuffers() {
+    MSOCBridge::invalidateHistory();
     for (auto& pair : staticFFPBuffers) {
         if (pair.second) pair.second->Release();
     }
@@ -966,14 +801,10 @@ void DistantLand::releaseFFPBuffers() {
     }
     landFFPBuffers.clear();
 
-    // Batched-submission experiment: drop cached Remix mesh handles + the test
-    // material so they're recreated against the fresh device (avoids using stale
-    // handles after a reset). The Remix-side meshes leak for now — acceptable for
-    // an experiment; a real path would DestroyMesh here.
-    g_batchMeshCache.clear();
-    g_batchMaterialCache.clear();
-    g_batchVBFirstFrame.clear();
-    g_batchFrameCounter = 0;
+    for (auto& pair : landAtlasFFPBuffers) {
+        if (pair.second) pair.second->Release();
+    }
+    landAtlasFFPBuffers.clear();
 }
 
 #endif // MGE_RTX

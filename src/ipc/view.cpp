@@ -7,7 +7,9 @@
 #endif
 #include "support/log.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <utility>
 
 namespace IPC {
@@ -202,10 +204,15 @@ namespace IPC {
 		}
 
 		auto offset = i * m_windowBytes + m_headerBytes;
-		auto newEnd = offset + m_windowBytes;
+		// committedBytes is measured from the buffer mapping, which begins after the
+		// header, so the commit target must be expressed in that same space. Adding
+		// headerBytes made a vector committed to its full reservation try to map one
+		// window past the end of the mapping, which the OS refuses.
+		const std::uint64_t newEnd =
+			(static_cast<std::uint64_t>(i) + 1) * m_windowBytes;
 		// commit everything between the current end and the new end
-		while (m_shared->committedBytes < newEnd) {
-			auto nextOffset = static_cast<ULONG64>(m_shared->committedBytes + m_headerBytes);
+		while (static_cast<std::uint64_t>(m_shared->committedBytes) < newEnd) {
+			auto nextOffset = static_cast<ULONG64>(m_shared->committedBytes) + m_headerBytes;
 			if (MapViewOfFile3(m_shared->sharedMem32, NULL, m_buffer, nextOffset, m_windowBytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) == NULL) {
 				LOG::winerror("View of vector %u failed to map next window at offset %llu for commit (%u bytes reserved, index %u)", m_id, nextOffset, m_reservedBytes, i);
 				m_buffer = nullptr;
@@ -378,6 +385,46 @@ namespace IPC {
 	T& VecView<T>::operator[](std::uint32_t i) {
 		set_index(i);
 		return m_buffer[m_subIndex];
+	}
+
+	template<typename T>
+	bool VecView<T>::copy_out(
+		std::uint32_t first,
+		std::uint32_t count,
+		T* destination) {
+		if (!is_valid()) {
+			return false;
+		}
+
+		const std::uint32_t vectorSize = m_shared->size;
+		if (first > vectorSize || count > vectorSize - first) {
+			return false;
+		}
+		if (count == 0) {
+			return true;
+		}
+		if (!destination) {
+			return false;
+		}
+
+		std::uint32_t index = first;
+		std::uint32_t remaining = count;
+		while (remaining != 0) {
+			if (!set_index(index)) {
+				return false;
+			}
+			const std::uint32_t available = std::min(
+				remaining,
+				m_nextWindowIndex - index);
+			std::memcpy(
+				destination,
+				m_buffer + m_subIndex,
+				static_cast<std::size_t>(available) * sizeof(T));
+			destination += available;
+			index += available;
+			remaining -= available;
+		}
+		return true;
 	}
 
 	template<typename T>

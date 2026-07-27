@@ -121,6 +121,7 @@ bool s_refreshDistantVisibility = true;
 std::uint32_t s_distantVisibilityStaleFrames = 0;
 const void* s_distantVisibilityCell = nullptr;
 bool s_distantVisibilityCellValid = false;
+bool s_distantVisibilityExterior = false;
 CompositeTelemetry::FrameSample s_compositePreflightSample;
 CompositeTelemetry::FrameSample s_preparedCompositeSample;
 std::vector<CellId> s_preparedCompositeCells;
@@ -145,6 +146,7 @@ void resetCompositeControllerState() {
     s_previousCompositeVisibleValid = false;
     s_distantVisibilityCell = nullptr;
     s_distantVisibilityCellValid = false;
+    s_distantVisibilityExterior = false;
     s_preparedCompositeCells.clear();
     s_preparedCompositeFrameReady = false;
 }
@@ -1521,8 +1523,18 @@ bool DistantLand::canDrawDistantVisibility() {
         s_refreshDistantVisibility) {
         return true;
     }
-    if (s_compositeTransportFailed || !s_distantVisibilityCellValid ||
-        s_distantVisibilityCell != MWBridge::get()->getPlayerCell()) {
+    if (s_compositeTransportFailed || !s_distantVisibilityCellValid) {
+        return false;
+    }
+
+    auto* mwBridge = MWBridge::get();
+    const bool samePlayerCell =
+        s_distantVisibilityCell == mwBridge->getPlayerCell();
+    // Exterior cells share one worldspace and the cached meshes use global coordinates.
+    // Reusing that set briefly across a cell boundary is safer than blanking every distant
+    // draw while the composite lane finishes; interior/worldspace changes still fail closed.
+    if (!samePlayerCell &&
+        !(s_distantVisibilityExterior && mwBridge->IsExterior())) {
         return false;
     }
     return s_distantVisibilityStaleFrames <= kMaxCompositeStaleVisibilityFrames;
@@ -1538,7 +1550,9 @@ void DistantLand::streamAndReconcileComposites() {
         return;
     }
 
-    static constexpr std::uint32_t kMaxRequestCellsPerFrame = 4;
+    // Each completion performs synchronous D3D9 staging and UpdateTexture work on the
+    // render thread. Request one cell so that cost is bounded to one full mip chain per frame.
+    static constexpr std::uint32_t kMaxRequestCellsPerFrame = 1;
     static constexpr std::uint32_t kInFlightWarningFrames = 60;
 
     auto& requestController = s_compositeRequestController;
@@ -1966,8 +1980,10 @@ void DistantLand::issueCompositeStreamBatch() {
     }
 
     if (s_refreshDistantVisibility) {
-        s_distantVisibilityCell = MWBridge::get()->getPlayerCell();
+        auto* mwBridge = MWBridge::get();
+        s_distantVisibilityCell = mwBridge->getPlayerCell();
         s_distantVisibilityCellValid = true;
+        s_distantVisibilityExterior = mwBridge->IsExterior();
     }
 
     CompositeTelemetry::FrameSample& frameSample = s_preparedCompositeSample;
@@ -2206,6 +2222,7 @@ void DistantLand::release() {
         LOG::logline("RetainedWorld: renderer release deferred until retained teardown succeeds");
         return;
     }
+    dlClearDistantTextures();
 #endif
     if (!ready) {
         return;

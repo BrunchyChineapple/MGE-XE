@@ -2,6 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <float.h>
+#include <new>
 
 #include "progmesh/ProgMesh.h"
 #include "../3rdparty/tootle/src/TootleLib/include/tootlelib.h"
@@ -30,6 +31,9 @@ static_assert(static_cast<size_t>(SIZEOFLANDVERT) == sizeof(DXCompressedLandVert
 // variance-node pool invariant cannot be violated. (Introduced by task 2.1; task 2.2 adds the
 // static_assert tying RoamVarianceNode::pool capacity to this value.)
 static const size_t kMaxRoamTreeDepth = 12;
+static const size_t kSourceGridQuads = 64;
+static const size_t kSourceGridVertices = kSourceGridQuads + 1;
+static const float kSourceGridSpacing = 128.0f;
 
 // Pre-sized capacity of the ROAM variance-node pool (RoamVarianceNode::pool, defined below). The
 // pool is allocated once at this size and is NEVER resized at runtime: RoamVarianceNode::Create()
@@ -116,6 +120,54 @@ struct LargeTriangle {
     }
 };
 
+class ScopedFileHandle {
+public:
+    explicit ScopedFileHandle(HANDLE value) : handle(value) {}
+    ~ScopedFileHandle() {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+    }
+
+    HANDLE Get() const { return handle; }
+    bool IsValid() const { return handle != INVALID_HANDLE_VALUE; }
+
+private:
+    HANDLE handle;
+    ScopedFileHandle(const ScopedFileHandle&);
+    ScopedFileHandle& operator=(const ScopedFileHandle&);
+};
+
+static bool SeekFile(HANDLE file, LONGLONG offset, DWORD origin) {
+    LARGE_INTEGER distance;
+    distance.QuadPart = offset;
+    return SetFilePointerEx(file, distance, NULL, origin) != FALSE;
+}
+
+static bool ReadExact(HANDLE file, void* data, DWORD byte_count) {
+    DWORD transferred = 0;
+    if (ReadFile(file, data, byte_count, &transferred, NULL) == FALSE) {
+        return false;
+    }
+    if (transferred != byte_count) {
+        SetLastError(ERROR_HANDLE_EOF);
+        return false;
+    }
+    return true;
+}
+
+static bool WriteExact(HANDLE file, const void* data, DWORD byte_count) {
+    DWORD transferred = 0;
+    if (WriteFile(file, data, byte_count, &transferred, NULL) == FALSE) {
+        return false;
+    }
+    if (transferred != byte_count) {
+        SetLastError(ERROR_WRITE_FAULT);
+        return false;
+    }
+    return true;
+}
+
 class LandMesh {
 public:
     vector<Vector3> vertices;
@@ -159,53 +211,68 @@ public:
     }
 
     static bool SaveMeshes(LPCSTR file_path, vector<LandMesh>& meshes) {
-        HANDLE file = CreateFile(file_path, GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_ALWAYS, 0, 0);
-        if (file == INVALID_HANDLE_VALUE) {
+        ScopedFileHandle file(CreateFileA(file_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL));
+        if (!file.IsValid()) {
             return false;
         }
 
-        DWORD unused, mesh_count = meshes.size();
-        if (GetFileSize(file, NULL) > 0) {
-            DWORD existing_count;
-            ReadFile(file, &existing_count, sizeof(existing_count), &unused, 0);
-            mesh_count += existing_count;
-            SetFilePointer(file, 0, NULL, FILE_BEGIN);
+        LARGE_INTEGER file_size;
+        if (GetFileSizeEx(file.Get(), &file_size) == FALSE) {
+            return false;
         }
-        WriteFile(file, &mesh_count, sizeof(mesh_count), &unused, 0);
-        SetFilePointer(file, 0, NULL, FILE_END);
 
-        for (size_t i = 0; i < meshes.size(); ++i) {
-            if (!meshes[i].Save(file)) {
+        DWORD mesh_count = 0;
+        if (file_size.QuadPart > 0) {
+            if (file_size.QuadPart < static_cast<LONGLONG>(sizeof(mesh_count)) ||
+                !SeekFile(file.Get(), 0, FILE_BEGIN) ||
+                !ReadExact(file.Get(), &mesh_count, sizeof(mesh_count))) {
                 return false;
             }
+        } else if (!WriteExact(file.Get(), &mesh_count, sizeof(mesh_count))) {
+            return false;
         }
 
-        CloseHandle(file);
+        if (!SeekFile(file.Get(), 0, FILE_END)) {
+            return false;
+        }
 
-        return true;
+        for (size_t i = 0; i < meshes.size(); ++i) {
+            if (mesh_count == MAXDWORD) {
+                SetLastError(ERROR_ARITHMETIC_OVERFLOW);
+                return false;
+            }
+            if (!meshes[i].Save(file.Get())) {
+                return false;
+            }
+            ++mesh_count;
+        }
+
+        return SeekFile(file.Get(), 0, FILE_BEGIN) &&
+               WriteExact(file.Get(), &mesh_count, sizeof(mesh_count));
     }
 
-    bool Save(HANDLE& file) {
-        DWORD verts, faces, unused;
-        bool large;
-        verts = vertices.size();
-        faces = triangles.size();
-
-        WriteFile(file, &radius, 4, &unused, 0);
-        WriteFile(file, &center, 12, &unused, 0);
-        WriteFile(file, &min, 12, &unused, 0);
-        WriteFile(file, &max, 12, &unused, 0);
-        WriteFile(file, &verts, 4, &unused, 0);
-        WriteFile(file, &faces, 4, &unused, 0);
-
-        if (verts > 0xFFFF || faces > 0xFFFF) {
-            large = true;
-        } else {
-            large = false;
+    bool Save(HANDLE file) {
+        if (vertices.size() > MAXDWORD || triangles.size() > MAXDWORD ||
+            uvs.size() < vertices.size()) {
+            SetLastError(ERROR_INVALID_DATA);
+            return false;
         }
 
-        std::vector<DXCompressedLandVertex> compVerts(verts);
+        DWORD verts = static_cast<DWORD>(vertices.size());
+        DWORD faces = static_cast<DWORD>(triangles.size());
+        bool large = verts > 0xFFFF || faces > 0xFFFF;
 
+        if (!WriteExact(file, &radius, sizeof(radius)) ||
+            !WriteExact(file, &center, sizeof(center)) ||
+            !WriteExact(file, &min, sizeof(min)) ||
+            !WriteExact(file, &max, sizeof(max)) ||
+            !WriteExact(file, &verts, sizeof(verts)) ||
+            !WriteExact(file, &faces, sizeof(faces))) {
+            return false;
+        }
+
+        vector<DXCompressedLandVertex> compVerts(verts);
         for (size_t i = 0; i < verts; ++i) {
             compVerts[i].Position = vertices[i];
             compVerts[i].texCoord[0] = (short)(uvs[i].u * 32768.0f);
@@ -213,9 +280,6 @@ public:
 
             // Encode the per-vertex surface normal as UBYTE4N (xyz, w pad), the same encoding the
             // distant-statics vertex uses, so the runtime FFP decode is identical for both paths.
-            // `normals` is filled by GenerateMesh via SampleNormal (task 5.1); if it has not been
-            // populated for this vertex yet, fall back to straight-up (0,0,1) so the field is never
-            // left undefined and the output is well-formed regardless of task ordering.
             Vector3 n(0.0f, 0.0f, 1.0f);
             if (i < normals.size()) {
                 n = normals[i];
@@ -223,28 +287,34 @@ public:
             compVerts[i].Normal[0] = EncodeNormalByte(n.x);
             compVerts[i].Normal[1] = EncodeNormalByte(n.y);
             compVerts[i].Normal[2] = EncodeNormalByte(n.z);
-            compVerts[i].Normal[3] = 0;   // pad
+            compVerts[i].Normal[3] = 0;
         }
 
-        WriteFile(file, &*compVerts.begin(), sizeof(DXCompressedLandVertex) * verts, &unused, 0);
+        if (verts > 0 &&
+            !WriteExact(file, &compVerts[0], static_cast<DWORD>(sizeof(DXCompressedLandVertex) * verts))) {
+            return false;
+        }
 
-        for (size_t i = 0; i < faces; ++i) {
-            if (large) {
-                unsigned int tmp[3];
-                tmp[0] = triangles[i].v1;
-                tmp[1] = triangles[i].v2;
-                tmp[2] = triangles[i].v3;
-                WriteFile(file,tmp,4*3,&unused,0);
-            } else {
-                unsigned short tmp[3];
-                tmp[0] = triangles[i].v1;
-                tmp[1] = triangles[i].v2;
-                tmp[2] = triangles[i].v3;
-                WriteFile(file,tmp,2*3,&unused,0);
+        size_t index_count = static_cast<size_t>(faces) * 3;
+        if (large) {
+            vector<unsigned int> indices(index_count);
+            for (size_t i = 0; i < faces; ++i) {
+                indices[i * 3 + 0] = triangles[i].v1;
+                indices[i * 3 + 1] = triangles[i].v2;
+                indices[i * 3 + 2] = triangles[i].v3;
             }
+            return indices.empty() ||
+                   WriteExact(file, &indices[0], static_cast<DWORD>(indices.size() * sizeof(indices[0])));
         }
 
-        return true;
+        vector<unsigned short> indices(index_count);
+        for (size_t i = 0; i < faces; ++i) {
+            indices[i * 3 + 0] = static_cast<unsigned short>(triangles[i].v1);
+            indices[i * 3 + 1] = static_cast<unsigned short>(triangles[i].v2);
+            indices[i * 3 + 2] = static_cast<unsigned short>(triangles[i].v3);
+        }
+        return indices.empty() ||
+               WriteExact(file, &indices[0], static_cast<DWORD>(indices.size() * sizeof(indices[0])));
     }
 };
 
@@ -803,6 +873,75 @@ public:
         RoamVarianceNode::ResetPool();
     }
 
+    // Mega Detail's depth-12 contract is the complete 65x65 source grid. Emit that grid directly
+    // instead of materializing a persistent ROAM node tree for every cell in a large atlas region.
+    LandMesh GenerateFullResolutionMesh(unsigned int cache_size) {
+        LandMesh mesh;
+        const size_t vertex_count = kSourceGridVertices * kSourceGridVertices;
+        const size_t triangle_count = kSourceGridQuads * kSourceGridQuads * 2;
+        mesh.vertices.reserve(vertex_count);
+        mesh.triangles.reserve(triangle_count);
+
+        Vector3 max = Vector3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        Vector3 min = Vector3(FLT_MAX, FLT_MAX, FLT_MAX);
+
+        for (size_t y = 0; y < kSourceGridVertices; ++y) {
+            float world_y = bottom + (float)y * kSourceGridSpacing;
+            for (size_t x = 0; x < kSourceGridVertices; ++x) {
+                float world_x = left + (float)x * kSourceGridSpacing;
+                Vector3 vertex(world_x, world_y, sampler->SampleHeight(world_x, world_y));
+                mesh.vertices.push_back(vertex);
+
+                if (vertex.x > max.x) { max.x = vertex.x; }
+                if (vertex.y > max.y) { max.y = vertex.y; }
+                if (vertex.z > max.z) { max.z = vertex.z; }
+                if (vertex.x < min.x) { min.x = vertex.x; }
+                if (vertex.y < min.y) { min.y = vertex.y; }
+                if (vertex.z < min.z) { min.z = vertex.z; }
+            }
+        }
+
+        for (size_t y = 0; y < kSourceGridQuads; ++y) {
+            for (size_t x = 0; x < kSourceGridQuads; ++x) {
+                unsigned int bottom_left = (unsigned int)(y * kSourceGridVertices + x);
+                unsigned int bottom_right = bottom_left + 1;
+                unsigned int top_left = bottom_left + (unsigned int)kSourceGridVertices;
+                unsigned int top_right = top_left + 1;
+                mesh.triangles.push_back(LargeTriangle(top_left, bottom_left, bottom_right));
+                mesh.triangles.push_back(LargeTriangle(bottom_right, top_right, top_left));
+            }
+        }
+
+        mesh.CalcBounds(min, max);
+
+        unsigned int* iBuffer = (unsigned int*)&mesh.triangles[0];
+        void* vBuffer = (void*)&mesh.vertices[0];
+        unsigned int verts = (unsigned int)mesh.vertices.size();
+        unsigned int faces = (unsigned int)mesh.triangles.size();
+        unsigned int stride = 3 * sizeof(float);
+
+        TootleResult result = TootleOptimizeVCache(iBuffer, faces, verts, cache_size, iBuffer, NULL, TOOTLE_VCACHE_AUTO);
+        if (result != TOOTLE_OK) {
+            SetLastError(ERROR_INVALID_DATA);
+            return LandMesh();
+        }
+
+        result = TootleOptimizeVertexMemory(vBuffer, iBuffer, verts, faces, stride, vBuffer, iBuffer, NULL);
+        if (result != TOOTLE_OK) {
+            SetLastError(ERROR_INVALID_DATA);
+            return LandMesh();
+        }
+
+        mesh.uvs.reserve(mesh.vertices.size());
+        mesh.normals.reserve(mesh.vertices.size());
+        for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+            mesh.uvs.push_back(sampler->SampleTexCoord(mesh.vertices[i].x, mesh.vertices[i].y));
+            mesh.normals.push_back(sampler->SampleNormal(mesh.vertices[i].x, mesh.vertices[i].y));
+        }
+
+        return mesh;
+    }
+
     LandMesh GenerateMesh(unsigned int cache_size) {
         LandMesh mesh;
         Vector3 top_left = GetTopLeft();
@@ -888,11 +1027,6 @@ public:
             mesh.triangles.push_back(LargeTriangle(right_index, top_index, left_index));
         }
 
-        if (abs(min.z + 2048.0f) <= 0.001f && abs(max.z + 2048.0f) <= 0.001f) {
-            // This mesh is perfectly flat at the bottom of the world.  Return an empty mesh.
-            return LandMesh();
-        }
-
         // Calculate mesh bounds
         mesh.CalcBounds(min, max);
 
@@ -919,8 +1053,7 @@ public:
         // surface normal is sampled in the same loop so mesh.normals stays exactly parallel to
         // mesh.vertices (normals.size() == vertices.size()); LandMesh::Save then writes a real
         // per-vertex normal for every vertex instead of its (0,0,1) fallback (task 5.1; Req 7.2).
-        // This loop runs only for non-empty meshes -- the flat-at-world-bottom and Tootle-failure
-        // early returns above hand back an empty LandMesh before reaching here.
+        // Tootle failures return an empty LandMesh before reaching here.
         for (size_t i = 0; i < mesh.vertices.size(); ++i) {
             mesh.uvs.push_back(sampler->SampleTexCoord(mesh.vertices[i].x, mesh.vertices[i].y));
             mesh.normals.push_back(sampler->SampleNormal(mesh.vertices[i].x, mesh.vertices[i].y));
@@ -930,10 +1063,85 @@ public:
     }
 };
 
-extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, float* normal_data, unsigned int data_width, unsigned int data_height, float* atlas_data, unsigned int atlas_count, float minX, float minY, float maxX, float maxY, float error_tolerance, unsigned int tree_depth) {
+// Append one complete source-grid mesh at a time. The file header is finalized after the region,
+// preserving the existing multi-atlas append format without retaining cell meshes in memory.
+static bool SaveFullResolutionPatches(LPCSTR file_path, HeightFieldSampler* sampler,
+                                      const unsigned char* patch_validity,
+                                      size_t patches_across, size_t patches_down,
+                                      float minX, float minY, float patch_width, float patch_height) {
+    ScopedFileHandle file(CreateFileA(file_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL));
+    if (!file.IsValid()) {
+        return false;
+    }
+
+    LARGE_INTEGER file_size;
+    if (GetFileSizeEx(file.Get(), &file_size) == FALSE) {
+        return false;
+    }
+
+    DWORD mesh_count = 0;
+    if (file_size.QuadPart > 0) {
+        if (file_size.QuadPart < static_cast<LONGLONG>(sizeof(mesh_count)) ||
+            !SeekFile(file.Get(), 0, FILE_BEGIN) ||
+            !ReadExact(file.Get(), &mesh_count, sizeof(mesh_count))) {
+            return false;
+        }
+    } else if (!WriteExact(file.Get(), &mesh_count, sizeof(mesh_count))) {
+        return false;
+    }
+
+    if (!SeekFile(file.Get(), 0, FILE_END)) {
+        return false;
+    }
+
+    for (size_t y = 0; y < patches_down; ++y) {
+        for (size_t x = 0; x < patches_across; ++x) {
+            size_t index = y * patches_across + x;
+            if (patch_validity[index] == 0) {
+                continue;
+            }
+
+            float left = minX + (float)x * patch_width;
+            float bottom = minY + (float)y * patch_height;
+            RoamLandPatch patch(bottom + patch_height, left, bottom, left + patch_width, sampler);
+            SetLastError(ERROR_SUCCESS);
+            LandMesh mesh = patch.GenerateFullResolutionMesh(16);
+            if (mesh.vertices.empty()) {
+                if (GetLastError() == ERROR_SUCCESS) {
+                    SetLastError(ERROR_INVALID_DATA);
+                }
+                return false;
+            }
+            if (mesh_count == MAXDWORD) {
+                SetLastError(ERROR_ARITHMETIC_OVERFLOW);
+                return false;
+            }
+            if (!mesh.Save(file.Get())) {
+                return false;
+            }
+            ++mesh_count;
+        }
+    }
+
+    return SeekFile(file.Get(), 0, FILE_BEGIN) &&
+           WriteExact(file.Get(), &mesh_count, sizeof(mesh_count));
+}
+
+extern "C" BOOL __stdcall TessellateLandscapeAtlased(char* file_path, float* height_data, float* normal_data, unsigned int data_width, unsigned int data_height, float* atlas_data, unsigned int atlas_count, float minX, float minY, float maxX, float maxY, float error_tolerance, unsigned int tree_depth, const unsigned char* patch_validity) {
+    try {
+        if (!file_path || !height_data || !normal_data || !patch_validity ||
+            (atlas_count > 0 && !atlas_data) || data_width < 2 || data_height < 2 ||
+            (data_width - 1) % kSourceGridQuads != 0 ||
+            (data_height - 1) % kSourceGridQuads != 0) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
 
     // normal_data is a parallel xyz-per-sample field on the same grid as height_data, fed straight
     // into the HeightFieldSampler below so SampleNormal can sample it per emitted vertex (task 5.1).
+    // patch_validity is one row-major ownership byte per cell-sized patch. Geometry shape still
+    // tessellates across the full rectangular region, but only LAND-owned patches are serialized.
 
     // Clamp the caller-supplied ROAM tree depth to the maximum the variance pool is sized for.
     // The GUI passes 10 for every existing tier (byte-identical to the previous hard-coded value)
@@ -966,9 +1174,17 @@ extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, 
     // cells*64) now lands on real seam data instead of the clamped edge GetHeightValue/
     // GetNormalValue would otherwise return.
     const float patch_width = 8192.0f, patch_height = 8192.0f;
-    const size_t kSamplesPerPatch = 64;       // 8192 units / 128 units-per-sample (== one cell edge)
-    size_t patches_across = (size_t)(data_width - 1) / kSamplesPerPatch;
-    size_t patches_down = (size_t)(data_height - 1) / kSamplesPerPatch;
+    size_t patches_across = (size_t)(data_width - 1) / kSourceGridQuads;
+    size_t patches_down = (size_t)(data_height - 1) / kSourceGridQuads;
+
+    // Depth 12 is Mega Detail's exact 65x65 source-grid contract. A direct regular grid has the
+    // same maximum leaf size and seamless shared edges without retaining a ROAM forest and every
+    // completed mesh for the entire atlas region.
+    if (tree_depth == kMaxRoamTreeDepth) {
+        return SaveFullResolutionPatches(file_path, &sampler, patch_validity,
+                                         patches_across, patches_down, minX, minY,
+                                         patch_width, patch_height) ? TRUE : FALSE;
+    }
 
     vector<RoamLandPatch> patches;
 
@@ -1023,6 +1239,10 @@ extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, 
     vector<LandMesh> meshes;
 
     for (size_t i = 0; i < patches.size(); ++i) {
+        if (patch_validity[i] == 0) {
+            continue;
+        }
+
         LandMesh mesh = patches[i].GenerateMesh(16);
 
         if (mesh.vertices.size() > 0) {
@@ -1039,5 +1259,15 @@ extern "C" void TessellateLandscapeAtlased(char* file_path, float* height_data, 
     }
 
     // Save the Meshes
-    LandMesh::SaveMeshes(file_path, meshes);
+    return LandMesh::SaveMeshes(file_path, meshes) ? TRUE : FALSE;
+    } catch (const std::bad_alloc&) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    } catch (const std::exception&) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    } catch (...) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    }
 }

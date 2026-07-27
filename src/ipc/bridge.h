@@ -50,7 +50,21 @@ struct RenderMesh {
     ptr32<IDirect3DTexture9> compositeTex;  // null -> binder uses cell/cache or atlas
     int32_t cellX, cellY;
     bool    cellValid;
+
+    // World-space bounds copied from QuadTreeMesh before the base record crosses IPC.
+    // The RTX FFP static path uses the center for a whole-instance handoff at Morrowind's
+    // near-view boundary; projection clipping alone cannot stop Remix tracing the full mesh.
+    D3DXVECTOR3 boundsCenter;
+    float boundsRadius;
+
+    // Stable worldspace/placement/prototype identity for temporal MSOC confirmation.
+    // Zero means the producer cannot guarantee lifetime-stable identity and must fail open.
+    std::uint64_t retainedPlacementIdentity;
 };
+static_assert(offsetof(RenderMesh, boundsCenter) == 104, "RenderMesh bounds center IPC offset changed");
+static_assert(offsetof(RenderMesh, boundsRadius) == 116, "RenderMesh bounds radius IPC offset changed");
+static_assert(offsetof(RenderMesh, retainedPlacementIdentity) == 120, "RenderMesh MSOC identity IPC offset changed");
+static_assert(sizeof(RenderMesh) == 128, "RenderMesh IPC layout changed");
 
 // Composite transport outcomes are explicit: only NotFound is safe to negative-cache.
 enum class CompositeCellStatus : uint32_t {
@@ -239,12 +253,15 @@ namespace IPC {
     };
 
     struct RetainedCatalogParameters {
-        OUT VecId header;       // Vec<RetainedCatalog::Header>, exactly one on success
-        OUT VecId cells;        // Vec<RetainedCatalog::Cell>
-        OUT VecId meshes;       // Vec<RetainedCatalog::Mesh>
-        OUT VecId placements;   // Vec<RetainedCatalog::Placement>
-        OUT VecId blob;         // Vec<uint8_t>, offsets in Mesh are relative to this vec
+        IN VecId header;        // Vec<RetainedCatalog::Header>, exactly one on full success
+        IN VecId cells;         // Vec<RetainedCatalog::Cell>
+        IN VecId meshes;        // Vec<RetainedCatalog::Mesh>
+        IN VecId placements;    // Vec<RetainedCatalog::Placement>
+        IN VecId blob;          // Vec<uint8_t>, offsets in Mesh are relative to this vec
+        IN std::uint64_t knownGeneration;
+        OUT std::uint64_t generation;
         OUT bool available;
+        OUT bool unchanged;
     };
 
 	struct Parameters {
@@ -262,8 +279,11 @@ namespace IPC {
         } params;
 	};
 
-    static_assert(sizeof(RetainedCatalogParameters) == 24);
-    static_assert(offsetof(RetainedCatalogParameters, available) == 20);
+    static_assert(sizeof(RetainedCatalogParameters) == 40);
+    static_assert(offsetof(RetainedCatalogParameters, knownGeneration) == 20);
+    static_assert(offsetof(RetainedCatalogParameters, generation) == 28);
+    static_assert(offsetof(RetainedCatalogParameters, available) == 36);
+    static_assert(offsetof(RetainedCatalogParameters, unchanged) == 37);
     static_assert(offsetof(Parameters, params) == 4);
 }
 #pragma pack(pop)

@@ -56,13 +56,54 @@ namespace MGEgui.DistantLand {
 
         /* Static methods */
 
-        private static void DumpError(Exception ex) {
-            var str = new StringBuilder(ex.ToString());
-            while ((ex = ex.InnerException) != null) {
-                str.AppendLine();
-                str.Append(ex.ToString());
+        private void DumpError(Exception ex) {
+            // Error reporting must never replace the worker exception with a second UI-thread failure.
+            try {
+                using (var sw = new StreamWriter(Statics.fn_dlLog, true)) {
+                    sw.WriteLine();
+                    sw.WriteLine("### Generation error ###");
+                    sw.WriteLine("Stage: " + generationStage);
+                    if (!String.IsNullOrEmpty(lastFileProcessed)) {
+                        sw.WriteLine("File: " + lastFileProcessed);
+                    }
+                    sw.WriteLine();
+
+                    int depth = 0;
+                    while (ex != null) {
+                        sw.WriteLine(depth == 0 ? "Exception:" : "Inner exception " + depth + ":");
+                        sw.WriteLine(ex.GetType().FullName);
+                        sw.WriteLine(ex.Message);
+                        if (!String.IsNullOrEmpty(ex.StackTrace)) {
+                            sw.WriteLine(ex.StackTrace);
+                        }
+                        sw.WriteLine();
+                        ex = ex.InnerException;
+                        depth++;
+                    }
+                }
+            } catch {
+                // The original exception remains the actionable failure if logging is unavailable.
             }
-            File.WriteAllText(Statics.fn_dlLog, str.ToString());
+        }
+
+        private static string ErrorSummary(Exception ex) {
+            return ex.GetType().Name + ": " + ex.Message + "\n\nSee DistantLand.log for the stage and stack trace.";
+        }
+
+        private void HandleStaticsError(Exception ex) {
+            DumpError(ex);
+            try {
+                MessageBox.Show(strings["StaticsError"] + "\n\n" + ErrorSummary(ex));
+            } catch {
+                // The persisted worker exception remains authoritative if the low-memory UI cannot render.
+            }
+
+            ChangingPage = true;
+            try {
+                Close();
+            } catch {
+                // Closing the failed wizard must not replace the persisted worker exception.
+            }
         }
 
         /* Common properties */
@@ -74,6 +115,8 @@ namespace MGEgui.DistantLand {
         private List<string> warnings;
         private List<string> allWarnings;
         private string lastFileProcessed;
+        private string generationStage = "Initialization";
+        private bool progressUiFailed;
 
         // Keeps track of map extents in terms of cells
         private int MapSize = 0;
@@ -109,9 +152,20 @@ namespace MGEgui.DistantLand {
         }
 
         private void UpdateProgress(object sender, System.ComponentModel.ProgressChangedEventArgs e) {
-            statusProgress.Value = e.ProgressPercentage;
-            if (e.UserState != null) {
-                statusText.Text = (string)e.UserState;
+            if (progressUiFailed) {
+                return;
+            }
+
+            try {
+                int value = Math.Max(statusProgress.Minimum, Math.Min(statusProgress.Maximum, e.ProgressPercentage));
+                statusProgress.Value = value;
+                if (e.UserState != null) {
+                    statusText.Text = (string)e.UserState;
+                }
+            } catch (Exception ex) {
+                // Progress rendering is optional; preserve the first UI failure and let generation finish.
+                progressUiFailed = true;
+                DumpError(ex);
             }
         }
 
@@ -134,6 +188,10 @@ namespace MGEgui.DistantLand {
                     }
                 }
             }
+
+            if (!e.Cancel && !backgroundWorker.IsBusy) {
+                ReleaseLandGenerationState();
+            }
         }
 
         // Used for override ListBox items
@@ -148,6 +206,83 @@ namespace MGEgui.DistantLand {
         }
 
         /* Common methods */
+
+        private static void CollectReleasedGenerationState() {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+        }
+
+        private static void CompactReleasedGenerationState() {
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+                System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            CollectReleasedGenerationState();
+        }
+
+        private void ReleaseLandGenerationState() {
+            Exception cleanupFailure = null;
+            try {
+                if (DXMain.device != null && DXMain.BackBuffer != null) {
+                    DXMain.device.SetRenderTarget(0, DXMain.BackBuffer);
+                }
+            } catch (Exception ex) {
+                cleanupFailure = ex;
+            }
+
+            try {
+                LTEX.ReleaseCache();
+            } catch (Exception ex) {
+                if (cleanupFailure == null) {
+                    cleanupFailure = ex;
+                }
+            }
+
+            LandMap = null;
+            DefaultTex = null;
+            Atlas = null;
+
+            try {
+                CompactReleasedGenerationState();
+            } catch (Exception ex) {
+                if (cleanupFailure == null) {
+                    cleanupFailure = ex;
+                }
+            }
+
+            if (cleanupFailure != null) {
+                try {
+                    File.AppendAllText(Statics.fn_dlLog,
+                        "Land-state cleanup warning at " + generationStage + ": " +
+                        cleanupFailure.GetType().FullName + ": " + cleanupFailure.Message + "\r\n");
+                } catch {
+                    // Cleanup reporting is best-effort at the x86 memory boundary.
+                }
+            }
+        }
+
+        private void ReleaseStaticsGenerationState(bool collect) {
+            StaticsList.Clear();
+            UsedStaticsList.Clear();
+            StaticMap.Clear();
+            DisableScripts.Clear();
+            if (collect) {
+                CollectReleasedGenerationState();
+            }
+        }
+
+        private void SetGenerationStage(string stage) {
+            generationStage = stage;
+            try {
+                using (var process = System.Diagnostics.Process.GetCurrentProcess()) {
+                    long privateMiB = process.PrivateMemorySize64 / (1024 * 1024);
+                    long managedMiB = GC.GetTotalMemory(false) / (1024 * 1024);
+                    File.AppendAllText(Statics.fn_dlLog,
+                        "Generation stage: " + stage + "; private=" + privateMiB + " MiB; managed=" + managedMiB + " MiB\r\n");
+                }
+            } catch {
+                // Stage telemetry is best-effort and must not affect generation.
+            }
+        }
 
         private void saveWarnings(string source) {
             try {
@@ -657,6 +792,8 @@ namespace MGEgui.DistantLand {
                         }
                         try {
                             tex.LoadTexture();
+                        } catch (OutOfMemoryException) {
+                            throw;
                         } catch (Exception ex) {
                             // Log texture errors, except for known errors in morrowind.esm
                             var fi = new FileInfo(file);
@@ -681,6 +818,7 @@ namespace MGEgui.DistantLand {
 
         private void workerFLoadPlugins(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e.Error != null) {
+                ReleaseLandGenerationState();
                 DumpError(e.Error);
                 MessageBox.Show(strings["LoadLandError"] + "\n<" + lastFileProcessed + ">\n\n" + e.Error.ToString());
                 ChangingPage = true;
@@ -728,12 +866,14 @@ namespace MGEgui.DistantLand {
 
         void workerCreateTextures(object sender, System.ComponentModel.DoWorkEventArgs e) {
             var args = (CreateTextureArgs)e.Argument;
+            SetGenerationStage("Land textures: allocating cell renderer");
             var ctc = new CellTexCreator(args.WorldRes);
             int count = 0;
             backgroundWorker.ReportProgress(count, strings["LandTextureCreate"]);
 
-            // Render world texture
+            SetGenerationStage("Land textures: allocating world texture");
             var wtc = new WorldTexCreator(args.WorldRes, AtlasSpanX, AtlasSpanY);
+            SetGenerationStage("Land textures: rendering world texture");
             wtc.Begin();
             ctc.Begin();
             foreach (var r in Atlas) {
@@ -753,12 +893,14 @@ namespace MGEgui.DistantLand {
                 }
             }
             ctc.End();
-            // Save the world texture.
+            SetGenerationStage("Land textures: compressing world texture");
             wtc.FinishCompressed(Statics.fn_worldds, true);
+            SetGenerationStage("Land textures: releasing world texture");
             wtc.Dispose();
 
-            // World normal map
+            SetGenerationStage("Land textures: allocating world normal map");
             wtc = new WorldTexCreator(args.WorldNormal, AtlasSpanX, AtlasSpanY);
+            SetGenerationStage("Land textures: rendering world normal map");
             wtc.Begin();
             ctc.BeginNormalMap();
             foreach (var r in Atlas) {
@@ -778,28 +920,31 @@ namespace MGEgui.DistantLand {
                 }
             }
             ctc.EndNormalMap();
+            SetGenerationStage("Land textures: writing world normal map");
             wtc.FinishUncompressed(Statics.fn_worldn, false);
+            SetGenerationStage("Land textures: releasing world normal map");
             wtc.Dispose();
 
+            SetGenerationStage("Land textures: releasing cell renderer");
             ctc.Dispose();
 
-            // --- Per-cell composite bake (Composite_Baker) -------------------------------------------
-            // Additive stage (Req 1.5, 1.6, 9.3). The province atlas (world.dds / world_n.dds) above is
-            // the primary output and has already been written and disposed; this stage only emits the
-            // extra composite.index / composite.data pair alongside it. When the toggle is off the whole
-            // block is skipped, so the worker's observable output is bit-identical to stock (Req 6.2).
             if (args.Composite) {
+                SetGenerationStage("Land textures: preparing composite set");
                 BakeCompositeSet(args.CompositeRes);
+                SetGenerationStage("Land textures: reclaiming composite buffers");
+                CompactReleasedGenerationState();
             }
+
+            SetGenerationStage("Land textures: completed");
         }
 
         // Bakes one dedicated DXT1 composite per exterior cell and writes the additive Composite_Set
         // (composite.index + composite.data) into the distantland directory next to the unchanged
         // world / world.dds / world_n.dds outputs. Reuses the same per-cell LandMap walk the atlas bake
         // uses (every non-null, non-default cell the generator processes), so one composite entry is
-        // produced per processed cell (Req 1.1). Per-cell failures are absorbed by CompositeBaker's
-        // placeholder path and never abort the run (Req 1.7); a whole-stage failure is logged and the
-        // already-written atlas outputs remain valid for the Single_Atlas_Path.
+        // produced per processed cell (Req 1.1). Recoverable per-cell failures use CompositeBaker's
+        // placeholder path; address-space exhaustion propagates because a replacement allocation cannot
+        // recover it. Other whole-stage failures are logged and the completed atlas outputs remain valid.
         private void BakeCompositeSet(int edgeTexels) {
             if (edgeTexels <= 0) {
                 edgeTexels = CompositeBaker.DefaultEdgeTexels;
@@ -808,31 +953,22 @@ namespace MGEgui.DistantLand {
             try {
                 backgroundWorker.ReportProgress(0, strings["LandTextureCreate"]);
 
-                // Per-cell [0,1] UVs are pure CPU math (no GPU) and small, and CompositeSetWriter pairs
-                // every bake to its UVs by CellId, so it needs the full UV set up front. Emit eagerly.
-                int cellCount;
-                List<PerCellUV> uvs = EmitCompositeUVs(out cellCount);
-
+                IEnumerable<PerCellUV> uvs = EmitCompositeUVs();
+                var writer = new CompositeSetWriter();
+                SetGenerationStage("Land textures: allocating composite baker");
                 using (var baker = new CompositeBaker(edgeTexels)) {
-                    // Stream the bake into composite.index + composite.data under Data Files\distantland
-                    // (Req 1.6, 3.1). CompositeSetWriter writes each cell's DXT1 to composite.data as it
-                    // is produced (one cell resident at a time) rather than materializing every
-                    // CompositeBakeResult first: the map's composites total ~1 GB of DXT1, and
-                    // accumulating them exhausted the 32-bit generator's address space, throwing an
-                    // OutOfMemoryException that aborted the whole stage with zero files written. The
-                    // writer's data pass is single-pass, so a lazy enumerable suffices and the baker
-                    // stays alive for the Write call. The existing world / world.dds / world_n.dds files
-                    // are never read or rewritten.
-                    var writer = new CompositeSetWriter();
+                    SetGenerationStage("Land textures: spooling composite UVs");
                     writer.Write(Statics.fn_dl, BakeCellsStreaming(baker, edgeTexels), uvs, edgeTexels);
                 }
+                SetGenerationStage("Land textures: composite set written");
 
                 if (DEBUG) {
-                    allWarnings.Add("Per-cell composites baked: " + cellCount + " cells at " + edgeTexels + "px");
+                    allWarnings.Add("Per-cell composites baked: " + writer.CellCount + " cells at " + edgeTexels + "px");
                 }
+            } catch (OutOfMemoryException) {
+                throw;
             } catch (Exception ex) {
-                // Never fail the run on the additive composite stage: the atlas outputs are already
-                // written, so distant land still loads via the Single_Atlas_Path. Log and continue.
+                // Preserve completed atlas outputs when a recoverable additive-stage failure occurs.
                 try {
                     File.AppendAllText(Statics.fn_dlLog,
                         "Composite_Set bake failed (atlas outputs retained, Single_Atlas_Path used): " + ex + "\r\n");
@@ -846,8 +982,7 @@ namespace MGEgui.DistantLand {
         // chunkId. CompositeSetWriter pairs each bake to its UVs by CellId, so the two walks only need to
         // agree on which cells are occupied and on the chunkId each cell gets - both of which this shared
         // ordering guarantees. cellCount returns the number of occupied cells emitted.
-        private List<PerCellUV> EmitCompositeUVs(out int cellCount) {
-            var uvs = new List<PerCellUV>();
+        private IEnumerable<PerCellUV> EmitCompositeUVs() {
             var uvEmitter = new CompositeUVEmitter();
             int chunkId = 0;
             for (int y = MapMinY; y <= MapMaxY; y++) {
@@ -856,21 +991,20 @@ namespace MGEgui.DistantLand {
                     if (land == null || land == DefaultLand) {
                         continue;
                     }
-                    uvs.Add(uvEmitter.EmitCellGrid(land, chunkId, CompositeUVEmitter.DefaultCellSubdivisions));
+                    yield return uvEmitter.EmitCellGrid(land, chunkId, CompositeUVEmitter.DefaultCellSubdivisions);
                     chunkId++;
                 }
             }
-            cellCount = chunkId;
-            return uvs;
         }
 
         // Lazily bakes one composite per occupied exterior cell, yielding each CompositeBakeResult as it
         // is produced so CompositeSetWriter can stream it to composite.data and let it be collected
         // before the next cell is baked. This keeps only one cell's DXT1 (~0.7 MB at 1024) resident at a
         // time instead of the whole ~1 GB set, which is what overflowed the 32-bit generator. The walk
-        // order matches EmitCompositeUVs exactly so chunkId/UV pairing stays consistent. Per-cell
-        // failures are absorbed inside BakeCell (placeholder emitted), so this never throws per cell.
+        // order matches EmitCompositeUVs exactly so chunkId/UV pairing stays consistent. Recoverable
+        // per-cell failures are absorbed inside BakeCell; address-space exhaustion is propagated.
         private IEnumerable<CompositeBakeResult> BakeCellsStreaming(CompositeBaker baker, int edgeTexels) {
+            SetGenerationStage("Land textures: baking and writing composite textures");
             int progress = 0;
             for (int y = MapMinY; y <= MapMaxY; y++) {
                 backgroundWorker.ReportProgress(Math.Min(++progress, statusProgress.Maximum));
@@ -1044,6 +1178,7 @@ namespace MGEgui.DistantLand {
 
         void workerFCreateTextures(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e.Error != null) {
+                ReleaseLandGenerationState();
                 DumpError(e.Error);
                 MessageBox.Show(strings["LandTextureError"] + "\n\n" + e.Error.ToString());
                 ChangingPage = true;
@@ -1086,20 +1221,30 @@ namespace MGEgui.DistantLand {
 
         void workerCreateMeshes(object sender, System.ComponentModel.DoWorkEventArgs e) {
             var cma = (CreateMeshArgs)e.Argument;
+            SetGenerationStage("Land mesh: starting");
             backgroundWorker.ReportProgress(0, strings["LandMeshCreate"]);
             GenerateWorldMesh(cma.MeshDetail, Statics.fn_world);
-            // Dispose of map object, high memory use
+            SetGenerationStage("Land mesh: reclaiming source data");
             LandMap = null;
+            CompactReleasedGenerationState();
+            SetGenerationStage("Land mesh: completed");
         }
 
         void workerFCreateMeshes(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e != null) {
-                LTEX.ReleaseCache();
+                ReleaseLandGenerationState();
                 if (e.Error != null) {
                     DumpError(e.Error);
-                    MessageBox.Show(strings["LandMeshError"] + "\n\n" + e.Error.ToString());
+                    try {
+                        MessageBox.Show(strings["LandMeshError"] + "\n\n" + ErrorSummary(e.Error));
+                    } catch {
+                        // DistantLand.log remains authoritative if the low-memory UI cannot render.
+                    }
                     ChangingPage = true;
-                    Close();
+                    try {
+                        Close();
+                    } catch {
+                    }
                     return;
                 }
                 statusProgress.Value = 0;
@@ -1161,6 +1306,7 @@ namespace MGEgui.DistantLand {
 
         private void ParseOverrideFiles(List<string> overrideFiles, Dictionary<string, StaticOverride> overrideList, Dictionary<string, bool> namedObjectDisables, Dictionary<string, bool> interiorEnables, DynamicVisDataSet dynamicVisDataSet, List<string> staticsWarnings) {
             foreach (string filename in overrideFiles) {
+                lastFileProcessed = filename;
                 if (DEBUG) {
                     allWarnings.Add("Loading override: " + filename);
                 }
@@ -1282,6 +1428,8 @@ namespace MGEgui.DistantLand {
                             }
                         }
                     }
+                } catch (OutOfMemoryException) {
+                    throw;
                 } catch (Exception ex) {
                     staticsWarnings.Add("Error: Could not import statics override list '" + filename + "'\r\n" + ex.Message);
                 }
@@ -1305,44 +1453,55 @@ namespace MGEgui.DistantLand {
             StaticsList.Clear();
             UsedStaticsList.Clear();
             StaticMap.Clear();
+            DisableScripts.Clear();
 
+            SetGenerationStage("Statics: reading overrides");
             if (args.UseOverrideList && args.OverrideFiles.Count > 0) {
                 ParseOverrideFiles(args.OverrideFiles, overrideList, namedObjectDisables, interiorEnables, dynamicVisDataSet, staticsWarnings);
             }
 
+            SetGenerationStage("Statics: reading definitions");
             Directory.CreateDirectory(Statics.fn_statics);
             foreach (string file in files) {
+                lastFileProcessed = file;
                 if (DEBUG) {
                     allWarnings.Add("Parsing for statics definitions: " + file);
                 }
-                var br = new BinaryReader(File.OpenRead(file), Statics.ESPEncoding);
-                try {
-                    ParseFileForStatics(br, overrideList, args.Activators, args.Misc, namedObjectDisables, null, dynamicVisDataSet);
-                } catch (Exception ex) {
-                    staticsWarnings.Add("Parse statics failed on \"" + file + "\"\n\n" + ex.ToString());
+                using (var br = new BinaryReader(File.OpenRead(file), Statics.ESPEncoding)) {
+                    try {
+                        ParseFileForStatics(br, overrideList, args.Activators, args.Misc, namedObjectDisables, null, dynamicVisDataSet);
+                    } catch (OutOfMemoryException) {
+                        throw;
+                    } catch (Exception ex) {
+                        staticsWarnings.Add("Parse statics failed on \"" + file + "\"\n\n" + ex.ToString());
+                    }
                 }
-                br.Close();
             }
 
+            SetGenerationStage("Statics: reading placed references");
             backgroundWorker.ReportProgress(1, strings["StaticsGenerate1"]);
             UsedStaticsList.Add("", new Dictionary<string, StaticReference>());
             foreach (string file in files) {
+                lastFileProcessed = file;
                 if (DEBUG) {
                     allWarnings.Add("Parsing for used statics: " + file);
                 }
-                var br = new BinaryReader(File.OpenRead(file), Statics.ESPEncoding);
                 var fi = new FileInfo(file);
-                try {
-                    ParseFileForInteriors(br, interiorEnables);
-                    br.BaseStream.Position = 0;
-                    ParseFileForCells(br, fi.Name, namedObjectDisables, interiorEnables);
-                } catch (Exception ex) {
-                    staticsWarnings.Add("Parsing cells failed on \"" + file + "\"\n\n" + ex.ToString());
+                using (var br = new BinaryReader(File.OpenRead(file), Statics.ESPEncoding)) {
+                    try {
+                        ParseFileForInteriors(br, interiorEnables);
+                        br.BaseStream.Position = 0;
+                        ParseFileForCells(br, fi.Name, namedObjectDisables, interiorEnables);
+                    } catch (OutOfMemoryException) {
+                        throw;
+                    } catch (Exception ex) {
+                        staticsWarnings.Add("Parsing cells failed on \"" + file + "\"\n\n" + ex.ToString());
+                    }
                 }
-                br.Close();
             }
 
             // Generate a list of the NIF files we need to load
+            SetGenerationStage("Statics: indexing referenced NIFs");
             backgroundWorker.ReportProgress(2, strings["StaticsGenerate2"]);
             var UsedNifList = new List<string>();
             foreach (KeyValuePair<string, Dictionary<string, StaticReference>> cellStatics in UsedStaticsList) {
@@ -1354,15 +1513,18 @@ namespace MGEgui.DistantLand {
                 }
             }
 
+            SetGenerationStage("Statics: converting NIFs");
             backgroundWorker.ReportProgress(3, strings["StaticsGenerate3"]);
             unsafe {
                 NativeMethods.BeginStaticCreation((IntPtr)DXMain.device.ComPointer, Statics.fn_statmesh);
             }
             var rnd = new Random();
+            Exception conversionFailure = null;
             try {
                 // Try to load the NIFs and remove any from the list that fail or are too small
                 for (int i = 0; i < UsedNifList.Count; i++) {
                     string name = UsedNifList[i];
+                    lastFileProcessed = name;
                     byte[] data;
 
                     // Set default simplification level to None until the simplifier code is fixed.
@@ -1383,11 +1545,15 @@ namespace MGEgui.DistantLand {
                         data = BSA.GetNif(dist_name);
                         // Do not simplify '_dist' NIFs.
                         simplify = 1.0f;
+                    } catch (OutOfMemoryException) {
+                        throw;
                     } catch {
                         // We didn't find a NIF file with '_dist' in its name,
                         // so search for the normal NIF file now.
                         try {
                             data = BSA.GetNif(name);
+                        } catch (OutOfMemoryException) {
+                            throw;
                         } catch {
                             data = null;
                         }
@@ -1428,14 +1594,25 @@ namespace MGEgui.DistantLand {
                                 // Remove entry if processing failed
                                 UsedNifList.RemoveAt(i--);
                             }
+                        } catch (OutOfMemoryException) {
+                            throw;
                         } catch (Exception ex) {
                             staticsWarnings.Add("Failed to process NIF " + name + "\n    " + ex.ToString());
                             UsedNifList.RemoveAt(i--);
                         }
                     }
                 }
+            } catch (Exception ex) {
+                conversionFailure = ex;
+                throw;
             } finally {
-                NativeMethods.EndStaticCreation();
+                try {
+                    NativeMethods.EndStaticCreation();
+                } catch {
+                    if (conversionFailure == null) {
+                        throw;
+                    }
+                }
             }
 
             // Reset used distant static ID numbers to match NIF list order
@@ -1474,7 +1651,10 @@ namespace MGEgui.DistantLand {
                 UsedStaticsList[key.Worldspace].Remove(key.Reference);
             }
 
+            lastFileProcessed = "";
+            SetGenerationStage("Statics: writing usage data");
             backgroundWorker.ReportProgress(4, strings["StaticsGenerate4"]);
+            var serializedStaticReferences = new List<StaticReference>();
             using (var bw = new BinaryWriter(File.Create(Statics.fn_usagedata), Statics.ESPEncoding)) {
                 bw.Write(UsedNifList.Count);
 
@@ -1488,6 +1668,7 @@ namespace MGEgui.DistantLand {
                 var mainWorldspace = UsedStaticsList[""];
                 bw.Write(mainWorldspace.Count);
                 foreach (KeyValuePair<string, StaticReference> pair in mainWorldspace) {
+                    serializedStaticReferences.Add(pair.Value);
                     pair.Value.Write(bw);
                 }
 
@@ -1505,6 +1686,7 @@ namespace MGEgui.DistantLand {
                     bw.Write(cellStaticsCount);
                     bw.Write(cellStatics.Key.PadRight(64, '\0').ToCharArray());
                     foreach (var pair in cellStatics.Value) {
+                        serializedStaticReferences.Add(pair.Value);
                         pair.Value.Write(bw);
                     }
                 }
@@ -1515,10 +1697,144 @@ namespace MGEgui.DistantLand {
             }
 
             if (!File.Exists(Statics.fn_statmesh)) {
+                if (File.Exists(Statics.fn_staticsource)) {
+                    File.Delete(Statics.fn_staticsource);
+                }
                 return;
             }
 
+            // Preserve prototype MODL paths and per-placement base records in one
+            // generation-bound sidecar. Placement order exactly matches usage.data.
+            SetGenerationStage("Statics: writing source identities");
+            var sourceRecords = new MemoryStream();
+            var placementRecords = new MemoryStream();
+            var sourceBlob = new MemoryStream();
+            const ulong hashSeed = 1469598103934665603UL;
+            Func<byte[], ulong, ulong> hashBuffer = delegate(byte[] bytes, ulong seed) {
+                ulong hash = seed;
+                for (int i = 0; i < bytes.Length; ++i) {
+                    hash ^= bytes[i];
+                    hash *= 1099511628211UL;
+                }
+                return hash;
+            };
+
+            using (var recordWriter = new BinaryWriter(sourceRecords, Statics.UTF8NoPreamble, true)) {
+                for (int staticId = 0; staticId < UsedNifList.Count; ++staticId) {
+                    string sourceNif = UsedNifList[staticId].Trim().Replace('/', '\\').ToLowerInvariant();
+                    while (sourceNif.StartsWith(".\\")) {
+                        sourceNif = sourceNif.Substring(2);
+                    }
+                    if (sourceNif.StartsWith("data files\\meshes\\")) {
+                        sourceNif = sourceNif.Substring("data files\\meshes\\".Length);
+                    } else if (sourceNif.StartsWith("meshes\\")) {
+                        sourceNif = sourceNif.Substring("meshes\\".Length);
+                    }
+                    byte[] pathBytes = Statics.UTF8NoPreamble.GetBytes(sourceNif);
+                    if (pathBytes.Length == 0 || sourceBlob.Length > UInt32.MaxValue - pathBytes.Length) {
+                        throw new InvalidDataException("Static source identity is empty or too large: " + UsedNifList[staticId]);
+                    }
+                    recordWriter.Write((uint)staticId);
+                    recordWriter.Write((uint)sourceBlob.Length);
+                    recordWriter.Write((uint)pathBytes.Length);
+                    recordWriter.Write((uint)0);
+                    sourceBlob.Write(pathBytes, 0, pathBytes.Length);
+                }
+            }
+
+            var recordSpans = new Dictionary<string, Tuple<uint, uint>>();
+            var recordIdentityOwners = new Dictionary<ulong, string>();
+            using (var placementWriter = new BinaryWriter(placementRecords, Statics.UTF8NoPreamble, true)) {
+                foreach (var reference in serializedStaticReferences) {
+                    string sourceRecord = (reference.Name ?? "").Trim().ToLowerInvariant();
+                    byte[] sourceRecordBytes = Statics.UTF8NoPreamble.GetBytes(sourceRecord);
+                    if (sourceRecordBytes.Length == 0) {
+                        throw new InvalidDataException("Static placement source record is empty");
+                    }
+
+                    Tuple<uint, uint> span;
+                    if (!recordSpans.TryGetValue(sourceRecord, out span)) {
+                        if (sourceBlob.Length > UInt32.MaxValue - sourceRecordBytes.Length) {
+                            throw new InvalidDataException("Static placement source records are too large");
+                        }
+                        span = Tuple.Create((uint)sourceBlob.Length, (uint)sourceRecordBytes.Length);
+                        recordSpans.Add(sourceRecord, span);
+                        sourceBlob.Write(sourceRecordBytes, 0, sourceRecordBytes.Length);
+                    }
+
+                    ulong recordIdentity = hashBuffer(sourceRecordBytes, hashSeed);
+                    string identityOwner;
+                    if (recordIdentity == 0 ||
+                        (recordIdentityOwners.TryGetValue(recordIdentity, out identityOwner) &&
+                         identityOwner != sourceRecord)) {
+                        throw new InvalidDataException("Static placement source-record identity collision");
+                    }
+                    recordIdentityOwners[recordIdentity] = sourceRecord;
+                    placementWriter.Write(span.Item1);
+                    placementWriter.Write(span.Item2);
+                    placementWriter.Write(recordIdentity);
+                }
+            }
+
+            byte[] staticRecordBytes = sourceRecords.ToArray();
+            byte[] placementRecordBytes = placementRecords.ToArray();
+            byte[] blobBytes = sourceBlob.ToArray();
+            ulong contentHash = hashBuffer(
+                blobBytes,
+                hashBuffer(
+                    placementRecordBytes,
+                    hashBuffer(staticRecordBytes, hashSeed)));
+            Func<string, ulong> hashFile = delegate(string path) {
+                ulong hash = hashSeed;
+                byte[] hashChunk = new byte[1024 * 1024];
+                using (var input = File.OpenRead(path)) {
+                    int bytesRead;
+                    while ((bytesRead = input.Read(hashChunk, 0, hashChunk.Length)) > 0) {
+                        for (int i = 0; i < bytesRead; ++i) {
+                            hash ^= hashChunk[i];
+                            hash *= 1099511628211UL;
+                        }
+                    }
+                }
+                return hash;
+            };
+            ulong staticMeshesHash = hashFile(Statics.fn_statmesh);
+            ulong usageDataHash = hashFile(Statics.fn_usagedata);
+
+            string sourceTemp = Statics.fn_staticsource + ".tmp";
+            try {
+                using (var sourceFile = new BinaryWriter(File.Create(sourceTemp), Statics.UTF8NoPreamble)) {
+                    sourceFile.Write(0x4352534Du); // "MSRC"
+                    sourceFile.Write(2u);
+                    sourceFile.Write(56u);
+                    sourceFile.Write(16u);
+                    sourceFile.Write((uint)UsedNifList.Count);
+                    sourceFile.Write(16u);
+                    sourceFile.Write((uint)serializedStaticReferences.Count);
+                    sourceFile.Write((uint)blobBytes.Length);
+                    sourceFile.Write(contentHash);
+                    sourceFile.Write(staticMeshesHash);
+                    sourceFile.Write(usageDataHash);
+                    sourceFile.Write(staticRecordBytes);
+                    sourceFile.Write(placementRecordBytes);
+                    sourceFile.Write(blobBytes);
+                }
+                if (File.Exists(Statics.fn_staticsource)) {
+                    File.Replace(sourceTemp, Statics.fn_staticsource, null);
+                } else {
+                    File.Move(sourceTemp, Statics.fn_staticsource);
+                }
+            } finally {
+                if (File.Exists(sourceTemp)) {
+                    File.Delete(sourceTemp);
+                }
+                sourceRecords.Dispose();
+                placementRecords.Dispose();
+                sourceBlob.Dispose();
+            }
+
             setFinishDesc(4);
+            SetGenerationStage("Statics: writing static textures");
             backgroundWorker.ReportProgress(5, strings["StaticsGenerate5"]);
             {
                 var stc = new StaticTexCreator(args.MipSkip);
@@ -1565,12 +1881,16 @@ namespace MGEgui.DistantLand {
         void workerFCreateStatics(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e != null) {
                 if (e.Error != null) {
-                    DumpError(e.Error);
-                    MessageBox.Show(strings["StaticsError"] + "\n\n" + e.Error.ToString());
-                    ChangingPage = true;
-                    Close();
+                    try {
+                        ReleaseStaticsGenerationState(true);
+                    } catch {
+                        // Cleanup is best-effort; preserve and report the worker exception.
+                    }
+                    HandleStaticsError(e.Error);
                     return;
                 }
+                ReleaseStaticsGenerationState(false);
+                SetGenerationStage("Statics: completed");
                 statusProgress.Value = 0;
                 if (e.Result != null) {
                     warnings = (List<string>)e.Result;
@@ -2247,6 +2567,7 @@ namespace MGEgui.DistantLand {
         }
 
         private void bTexRun_Click(object sender, EventArgs e) {
+            progressUiFailed = false;
             if ((128 << cmbTexWorldResolution.SelectedIndex > DXMain.mCaps.MaxTexSize) || (128 << cmbTexWorldNormalRes.SelectedIndex > DXMain.mCaps.MaxTexSize)) {
                 MessageBox.Show(strings["TexResError"], Statics.strings["Error"]);
                 return;
@@ -2333,7 +2654,7 @@ namespace MGEgui.DistantLand {
                 MessageBox.Show(strings["CantSkipMesh"], Statics.strings["Error"]);
                 return;
             }
-            LTEX.ReleaseCache();
+            ReleaseLandGenerationState();
             statusText.Text = strings["LandMeshSkip"];
             if (SetupFlags["AutoRun"]) {
                 setFinishDesc(3);
@@ -2391,6 +2712,7 @@ namespace MGEgui.DistantLand {
         /* Land mesh methods */
 
         private void GenerateWorldMesh(int detail, string path) {
+            SetGenerationStage("Land mesh: building atlas metadata");
             // Landscape detail selection
             float tolerance = 125.0f;
             if (detail >= 0 && detail <= 5) {
@@ -2440,12 +2762,28 @@ namespace MGEgui.DistantLand {
                 int RegionSpanY = r.MaxY - r.MinY + 1;
                 int DataSpanX = RegionSpanX * 64 + 1;
                 int DataSpanY = RegionSpanY * 64 + 1;
+                string regionDescription = RegionSpanX + "x" + RegionSpanY + " cells, " +
+                    DataSpanX + "x" + DataSpanY + " samples";
+                SetGenerationStage("Land mesh: allocating region buffers (" + regionDescription + ")");
                 var height_data = new float[DataSpanX * DataSpanY];
                 // Parallel surface-normal field, xyz per height sample (same inclusive grid layout
                 // as height_data). Sourced from LAND.Normals with the identical inclusive seam
                 // extension so the per-vertex normals the tessellator (task 5.1) carries into the
                 // land vertex are seamless across cell boundaries too.
                 var normal_data = new float[DataSpanX * DataSpanY * 3];
+                SetGenerationStage("Land mesh: populating region buffers (" + regionDescription + ")");
+
+                // Native patches cover the atlas region's rectangular extent, including holes. Keep
+                // ownership separate from height: a valid LAND cell remains serializable even when
+                // every sample is the -2048 world-floor value, while null/default holes stay absent.
+                var patch_validity = new byte[RegionSpanX * RegionSpanY];
+                for (int patchY = 0; patchY < RegionSpanY; patchY++) {
+                    for (int patchX = 0; patchX < RegionSpanX; patchX++) {
+                        LAND land = LandMap[r.MinX + patchX, r.MinY + patchY];
+                        patch_validity[patchY * RegionSpanX + patchX] =
+                            land != null && land != DefaultLand ? (byte)1 : (byte)0;
+                    }
+                }
     
                 // Walk the region grid by destination sample index. Each index maps to a source
                 // cell and an inclusive within-cell index (0..64): cell = idx / 64, sub = idx % 64.
@@ -2466,11 +2804,12 @@ namespace MGEgui.DistantLand {
                         if (cx >= RegionSpanX) { cx = RegionSpanX - 1; x2 = 64; }
                         int x1 = r.MinX + cx;
                         int n = (y * DataSpanX + x) * 3;
-                        if (LandMap[x1, y1] != null) {
-                            height_data[y * DataSpanX + x] = (float)LandMap[x1, y1].Heights[x2, y2] * 8.0f;
-                            normal_data[n + 0] = LandMap[x1, y1].Normals[x2, y2].X;
-                            normal_data[n + 1] = LandMap[x1, y1].Normals[x2, y2].Y;
-                            normal_data[n + 2] = LandMap[x1, y1].Normals[x2, y2].Z;
+                        LAND land = LandMap[x1, y1];
+                        if (land != null && land != DefaultLand) {
+                            height_data[y * DataSpanX + x] = (float)land.Heights[x2, y2] * 8.0f;
+                            normal_data[n + 0] = land.Normals[x2, y2].X;
+                            normal_data[n + 1] = land.Normals[x2, y2].Y;
+                            normal_data[n + 2] = land.Normals[x2, y2].Z;
                         } else {
                             height_data[y * DataSpanX + x] = -2048.0f;
                             normal_data[n + 0] = 0.0f;
@@ -2485,8 +2824,27 @@ namespace MGEgui.DistantLand {
                 float minY = (float)r.MinY * 8192.0f;
                 float maxY = (float)(r.MaxY + 1) * 8192.0f;
     
+                SetGenerationStage("Land mesh: tessellating region (" + regionDescription +
+                    "; detail=" + detail + "; depth=" + tree_depth + ")");
                 backgroundWorker.ReportProgress(10, strings["LandTessellating"]);
-                NativeMethods.TessellateLandscapeAtlased(path, height_data, normal_data, (uint)DataSpanX, (uint)DataSpanY, atlas_data, (uint)Atlas.Count, minX, minY, maxX, maxY, tolerance, tree_depth);
+                bool tessellated = NativeMethods.TessellateLandscapeAtlased(
+                    path, height_data, normal_data, (uint)DataSpanX, (uint)DataSpanY,
+                    atlas_data, (uint)Atlas.Count, minX, minY, maxX, maxY, tolerance, tree_depth,
+                    patch_validity);
+                if (!tessellated) {
+                    int nativeError = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    var nativeException = new System.ComponentModel.Win32Exception(nativeError);
+                    throw new IOException("Native world-mesh generation failed for " + regionDescription +
+                        " (Win32 error " + nativeError + ": " + nativeException.Message + ").",
+                        nativeException);
+                }
+
+                SetGenerationStage("Land mesh: reclaiming region buffers (" + regionDescription + ")");
+                height_data = null;
+                normal_data = null;
+                patch_validity = null;
+                CompactReleasedGenerationState();
+                SetGenerationStage("Land mesh: region completed (" + regionDescription + ")");
             }
         }
 
@@ -2793,6 +3151,9 @@ namespace MGEgui.DistantLand {
             if (saveStaticListDialog.ShowDialog() != DialogResult.OK) {
                 return;
             }
+            SetGenerationStage("Statics export: releasing land generation state");
+            ReleaseLandGenerationState();
+            lastFileProcessed = "";
             bStatExportStatics.Enabled = false;
             bStatSkip.Enabled = false;
             bStatRun.Enabled = false;
@@ -2819,6 +3180,9 @@ namespace MGEgui.DistantLand {
                 ChangingPage = true;
                 tabControl.SelectedIndex = 4;
             }
+            SetGenerationStage("Statics: skipped; releasing land generation state");
+            ReleaseLandGenerationState();
+            lastFileProcessed = "";
             statusText.Text = strings["StaticsSkip"];
             statusWarnings.Text = strings["NoWarnings"];
             statusWarnings.Enabled = false;
@@ -2826,6 +3190,11 @@ namespace MGEgui.DistantLand {
         }
 
         private void bStatRun_Click(object sender, EventArgs e) {
+            SetGenerationStage("Statics: releasing land generation state");
+            ReleaseLandGenerationState();
+            lastFileProcessed = "";
+            SetGenerationStage("Statics: starting");
+
             if (StaticsExist) {
                 Directory.Delete(Statics.fn_statics, true);
             }

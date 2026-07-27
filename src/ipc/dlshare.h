@@ -63,6 +63,8 @@ public:
     static std::vector<std::uint8_t> retainedStaticBlob;
     static std::vector<std::uint8_t> retainedTerrainBlob;
     static std::vector<std::uint64_t> retainedStaticPrototypeIds;
+    static std::vector<std::uint64_t> retainedStaticPlacementRecordIds;
+    static std::unordered_map<std::uint64_t, std::string> retainedStaticRecordNames;
     static std::uint64_t retainedCatalogGeneration;
 
     static bool initDistantStaticsServer(IPC::Vec<DistantStatic>& distantStatics, IPC::Vec<DistantSubset>& distantSubsets);
@@ -80,6 +82,7 @@ public:
         auto UsedDistantStaticData = std::make_unique<char[]>(UsedDistantStaticChunkCount * UsedDistantStaticRecordSize);
 
         mapWorldSpaces.clear();
+        std::size_t retainedPlacementIndex = 0;
         for (DWORD nWorldSpace = 0; true; ++nWorldSpace) {
             std::vector<UsedDistantStatic> worldSpaceStatics;
             WorldSpace* currentWorldSpace;
@@ -128,6 +131,11 @@ public:
                     NewUsedStatic.retainedIdentitySeed =
                         (static_cast<std::uint64_t>(nWorldSpace + 1) << 32) |
                         static_cast<std::uint64_t>(worldSpaceStatics.size() + 1);
+                    if (retainedPlacementIndex < retainedStaticPlacementRecordIds.size()) {
+                        NewUsedStatic.sourceRecordIdentity =
+                            retainedStaticPlacementRecordIds[retainedPlacementIndex];
+                    }
+                    ++retainedPlacementIndex;
 
                     D3DXMATRIX transmat, rotmatx, rotmaty, rotmatz, scalemat;
                     D3DXMatrixTranslation(&transmat, NewUsedStatic.pos.x, NewUsedStatic.pos.y, NewUsedStatic.pos.z);
@@ -274,7 +282,12 @@ public:
                     placementIdentity *= 1099511628211ull;
                     placementIdentity ^= mesh->retainedPrototypeIdentity;
                     placementIdentity *= 1099511628211ull;
+                    if (i.sourceRecordIdentity != 0) {
+                        placementIdentity ^= i.sourceRecordIdentity;
+                        placementIdentity *= 1099511628211ull;
+                    }
                     mesh->retainedPlacementIdentity = placementIdentity ? placementIdentity : 1;
+                    mesh->sourceRecordIdentity = i.sourceRecordIdentity;
                     mesh->cellX = static_cast<std::int32_t>(std::floor(i.transform._41 / 8192.0f));
                     mesh->cellY = static_cast<std::int32_t>(std::floor(i.transform._42 / 8192.0f));
                     mesh->cellValid = true;

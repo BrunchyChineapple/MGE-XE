@@ -260,17 +260,20 @@ namespace IPC {
         bool takeCompositeStreamResult(CompositeBatchStatus& result);
 
         /**
-         * @brief Populate a complete terrain/non-grass-static retained-world catalog.
+         * @brief Populate a terrain/non-grass-static retained-world catalog when changed.
          *
          * All output vectors are caller-allocated. The call blocks until the host has
-         * written a fully validated snapshot; false means no active worldspace/catalog.
+         * compared generations. When @p unchanged is true the host did not rewrite the
+         * vectors, avoiding a periodic full catalog rebuild/copy/hash on the render thread.
          */
         bool getRetainedWorldCatalogBlocking(
             VecId header,
             VecId cells,
             VecId meshes,
             VecId placements,
-            VecId blob);
+            VecId blob,
+            std::uint64_t knownGeneration,
+            bool& unchanged);
 
 		/**
 		* @brief Update the current worldspace by informing the server of the player's current cell.

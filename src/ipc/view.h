@@ -129,6 +129,10 @@ namespace IPC {
 		T& back();
 		void truncate(std::uint32_t numElements);
 
+		// Copies a bounded range while remapping the fixed client window as needed.
+		// No pointer into shared storage escapes this call.
+		bool copy_out(std::uint32_t first, std::uint32_t count, T* destination);
+
 		bool push_back(const T& value);
 		std::optional<T> pop_back();
 

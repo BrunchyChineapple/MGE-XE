@@ -748,7 +748,8 @@ void DistantLand::renderStage0() {
         mwView,
         mwProj,
         kDistantNearPlane,
-        Configuration.DL.DrawDist * kCellSize);
+        Configuration.DL.DrawDist * kCellSize,
+        mwBridge->IsExterior());
     if (mwBridge->IsExterior()) {
         RetainedWorld::prepareCompositeTransition(eyePos, mwView, compositeCache);
     }
@@ -795,6 +796,13 @@ void DistantLand::renderStage0() {
 
             if (!mwBridge->IsUnderwater(eyePos.z)) {
 #ifdef MGE_RTX
+                // Resolve retained activity before either FFP path can suppress
+                // legacy cell draws. Present remains the fallback for frames that
+                // do not reach distant rendering.
+                if (drawDistantVisibility) {
+                    RetainedWorld::prepareActivityForSuppression();
+                }
+
                 // RTX Remix: Use fixed-function pipeline for distant land rendering.
                 // Remix can't extract proper textures from D3DX effect shaders.
                 if (mwBridge->IsExterior() && drawDistantVisibility) {
@@ -1525,13 +1533,41 @@ bool DistantLand::selectDistantCell() {
         }
 
         if (Configuration.UseSharedMemory) {
-            DistantLandShare::hasCurrentWorldSpace = ipcClient.setWorldSpaceBlocking(cellname);
 #ifdef MGE_RTX
+            // SetWorldSpace is a blocking host round-trip, but exterior cell transitions keep
+            // the same empty worldspace key. Cache a successful selection per IPC session so
+            // ordinary frames and exterior boundaries do not repeat an invariant RPC.
+            static std::uint64_t selectedWorldspaceSession = 0;
+            static string selectedWorldspaceKey;
+            static bool selectedWorldspaceValid = false;
+            const std::uint64_t session = ipcClient.sessionGeneration();
+            const bool selectionChanged =
+                !selectedWorldspaceValid ||
+                selectedWorldspaceSession != session ||
+                selectedWorldspaceKey != cellname;
+            if (selectionChanged) {
+                // Failed selections leave the host without a current worldspace. Invalidate
+                // the successful-selection cache before the RPC so exterior re-entry must
+                // reselect even when it uses the same empty key as the previous exterior.
+                selectedWorldspaceValid = false;
+                DistantLandShare::hasCurrentWorldSpace =
+                    ipcClient.setWorldSpaceBlocking(cellname);
+                if (DistantLandShare::hasCurrentWorldSpace) {
+                    selectedWorldspaceSession = session;
+                    selectedWorldspaceKey = cellname;
+                    selectedWorldspaceValid = true;
+                }
+            } else {
+                DistantLandShare::hasCurrentWorldSpace = true;
+            }
             RetainedWorld::selectWorldspace(
                 ipcClient,
                 cellname,
                 DistantLandShare::hasCurrentWorldSpace,
                 mwBridge->IsExterior());
+#else
+            DistantLandShare::hasCurrentWorldSpace =
+                ipcClient.setWorldSpaceBlocking(cellname);
 #endif
             if (DistantLandShare::hasCurrentWorldSpace) {
                 return true;

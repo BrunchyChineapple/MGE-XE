@@ -432,29 +432,38 @@ namespace IPC {
         return true;
     }
 
-    bool Client::getRetainedWorldCatalogBlocking(
-        VecId header,
-        VecId cells,
-        VecId meshes,
-        VecId placements,
-        VecId blob) {
-        WAIT_FOR_PREVIOUS_COMMAND;
+	bool Client::getRetainedWorldCatalogBlocking(
+		VecId header,
+		VecId cells,
+		VecId meshes,
+		VecId placements,
+		VecId blob,
+		std::uint64_t knownGeneration,
+		bool& unchanged) {
+		unchanged = false;
+		WAIT_FOR_PREVIOUS_COMMAND;
 
-        auto& params = m_ipcParameters->params.retainedCatalogParams;
-        params.header = header;
-        params.cells = cells;
-        params.meshes = meshes;
-        params.placements = placements;
-        params.blob = blob;
-        params.available = false;
+		auto& params = m_ipcParameters->params.retainedCatalogParams;
+		params.header = header;
+		params.cells = cells;
+		params.meshes = meshes;
+		params.placements = placements;
+		params.blob = blob;
+		params.knownGeneration = knownGeneration;
+		params.generation = 0;
+		params.available = false;
+		params.unchanged = false;
 
-        if (!beginRpc(Command::GetRetainedWorldCatalog) ||
-            waitForCompletion() != WakeReason::Complete) {
-            return false;
-        }
+		if (!beginRpc(Command::GetRetainedWorldCatalog) ||
+			waitForCompletion() != WakeReason::Complete) {
+			return false;
+		}
 
-        return params.available;
-    }
+		unchanged = params.unchanged;
+		return params.available &&
+			(!unchanged ||
+			 (knownGeneration != 0 && params.generation == knownGeneration));
+	}
 
 	bool Client::setWorldSpaceBlocking(const std::string& cellname) {
 		WAIT_FOR_PREVIOUS_COMMAND;
